@@ -49,6 +49,14 @@ except ImportError:
     eventbus = None
     PatternDisable = None
     PatternEnable = None
+try:
+    from system.scheduler.events import (
+        RequestForegroundPushEvent,
+        RequestForegroundPopEvent,
+    )
+except ImportError:
+    RequestForegroundPushEvent = None
+    RequestForegroundPopEvent = None
 
 # Relative imports against the internal nocturnation/ package: the
 # Tildagon launcher loads this module as apps.nocturnation.app and does
@@ -102,6 +110,53 @@ class NocturNationApp(app.App):
         # idle animation resumes once the operator backs out.
         self._patterns_inhibited = False
         self._inhibit_patterns()
+        # Foreground state. The app starts foreground (the launcher push
+        # that brought us here happens before __init__ in some firmware
+        # versions). The scheduler events below keep this in sync.
+        self._is_foreground = True
+        # Subscribe to the scheduler's foreground push / pop events so
+        # we can pause receive and release LED control while the app is
+        # not in the foreground. The Tildagon launcher caches the app
+        # instance, so __init__ runs only once - we cannot rely on it
+        # for entry/exit lifecycle. The eventbus broadcasts these
+        # events; we filter by event.app is self to ignore transitions
+        # affecting other apps.
+        if (
+            eventbus is not None
+            and RequestForegroundPushEvent is not None
+            and RequestForegroundPopEvent is not None
+        ):
+            eventbus.on(RequestForegroundPushEvent, self._on_foreground_push, self)
+            eventbus.on(RequestForegroundPopEvent, self._on_foreground_pop, self)
+
+    def _on_foreground_push(self, event) -> None:
+        """Scheduler is bringing this app to the foreground.
+
+        Re-acquire the perimeter LED ring from the badge's patterndisplay
+        service (which may have been re-enabled while we were minimised)
+        and clear any stale envelope state so the ring starts dark.
+        """
+        if event.app is not self:
+            return
+        self._is_foreground = True
+        self._inhibit_patterns()
+        self._renderer.clear()
+        print("[nocturnation] foreground push - resuming receive + LEDs")
+
+    def _on_foreground_pop(self, event) -> None:
+        """Scheduler is taking this app out of the foreground.
+
+        Release the perimeter LED ring back to the badge's patterndisplay
+        service. The async background_task keeps running (per Tildagon OS
+        contract) but our _receive_loop checks _is_foreground and stops
+        processing inbound frames until we are foregrounded again.
+        """
+        if event.app is not self:
+            return
+        self._is_foreground = False
+        self._resume_patterns()
+        self._renderer.clear()
+        print("[nocturnation] foreground pop - paused receive, released LEDs")
 
     def _inhibit_patterns(self) -> None:
         if eventbus is None or PatternDisable is None:
@@ -120,47 +175,6 @@ class NocturNationApp(app.App):
             self._patterns_inhibited = False
         except Exception as exc:
             print("[nocturnation] PatternEnable emit failed: %s" % exc)
-
-    async def run(self, render_update):
-        """Override of App.run to re-inhibit patterns on regained focus.
-
-        The Tildagon launcher caches App instances after first creation;
-        on subsequent re-entry, __init__ does NOT run again, so the
-        PatternDisable emit there is one-shot only. Meanwhile the badge
-        may re-enable the patterndisplay service whenever we lose
-        foreground (CANCEL minimise, a notification taking focus, an
-        OTA-update flow, etc.). Without re-inhibiting on re-entry we get
-        the system pattern animation flickering through our LED writes.
-
-        The base App.run discards render_update's return value, but the
-        scheduler returns True from it when the app has just regained
-        focus after a foreground-pop. We capture that and re-inhibit.
-        """
-        if time is None:
-            # Host environment: no time module, nothing to do.
-            return
-        last_time = time.ticks_ms()
-        while True:
-            cur_time = time.ticks_ms()
-            delta_ticks = time.ticks_diff(cur_time, last_time)
-            if self.update(delta_ticks) is not False:
-                regained_focus = await render_update()
-                if regained_focus:
-                    self._on_regained_focus()
-            else:
-                import asyncio as _asyncio
-                await _asyncio.sleep(0.05)
-            last_time = cur_time
-
-    def _on_regained_focus(self) -> None:
-        """Called when render_update reports a foreground-pop -> push.
-
-        Re-inhibits the patterndisplay service and clears any stale
-        envelope state so the ring starts dark instead of part-way
-        through an old envelope from before the minimise.
-        """
-        self._inhibit_patterns()
-        self._renderer.clear()
 
     def update(self, delta: float) -> None:
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
@@ -305,8 +319,18 @@ class NocturNationApp(app.App):
         return True
 
     async def _receive_loop(self) -> None:
-        poll_ms = 5
+        # Poll cadence: fast when foreground (responsive to incoming
+        # LIGHT_COMMAND), idle when backgrounded (we are not driving
+        # LEDs anyway, so we conserve CPU).
+        poll_ms_fg = 5
+        poll_ms_bg = 100
         while True:
+            if not self._is_foreground:
+                # Drain the espnow buffer so it does not fill while
+                # we're backgrounded, but do not act on the contents.
+                self._try_recv()
+                await asyncio.sleep_ms(poll_ms_bg)
+                continue
             buf = self._try_recv()
             if buf is not None:
                 frame = process_frame(buf, self._dedup)
@@ -323,7 +347,7 @@ class NocturNationApp(app.App):
                                 frame.target_group,
                             )
                         )
-            await asyncio.sleep_ms(poll_ms)
+            await asyncio.sleep_ms(poll_ms_fg)
 
     def _try_recv(self):
         """Non-blocking ESP-NOW recv. Returns the message bytes or None."""
