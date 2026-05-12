@@ -59,6 +59,11 @@ class NocturNationApp(app.App):
         self._last_frame = None
         self._status = "starting"
         self._esp = None
+        # Last channel for which wlan.config(channel=N) succeeded. None
+        # if we never managed to set the radio channel at all. Shown on
+        # the LCD so the operator knows which channel to align the
+        # master Stick to when auto-scan is disabled.
+        self._receive_channel = None
 
     def update(self, delta: float) -> None:
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
@@ -114,8 +119,18 @@ class NocturNationApp(app.App):
         self._esp.active(True)
 
         if not await self._scan_until_locked(wlan):
-            self._status = "no-scan"
-            print("[nocturnation] auto-scan unavailable; listening on default channel")
+            # Auto-scan bailed because channel-set failed mid-scan. The
+            # radio is on whichever channel was last successfully set,
+            # or on the platform default if none succeeded.
+            if self._receive_channel is not None:
+                self._status = "ch %d (no-scan)" % self._receive_channel
+                print(
+                    "[nocturnation] auto-scan unavailable; listening on channel %d "
+                    "(align master Stick to this channel)" % self._receive_channel
+                )
+            else:
+                self._status = "no-scan"
+                print("[nocturnation] auto-scan unavailable; listening on default channel")
 
         await self._receive_loop()
 
@@ -140,10 +155,15 @@ class NocturNationApp(app.App):
                 # on STA_IF with a non-OSError exception (observed:
                 # RuntimeError: Wifi Unknown Error 0xffffffff). Treat any
                 # failure as "this badge does not let us steer the radio"
-                # and fall back to listening on the default channel.
+                # and fall back to receive on whichever channel was last
+                # successfully set (often the first scan target).
                 self._status = "ch %d err" % ch
                 print("[nocturnation] wlan.config(channel=%d) failed: %s" % (ch, exc))
                 return False
+
+            # Channel set succeeded - remember it so the fallback path
+            # can tell the operator which channel to align to.
+            self._receive_channel = ch
 
             print("[nocturnation] scanning channel %d for %d ms" % (ch, listen_ms))
             elapsed = 0
