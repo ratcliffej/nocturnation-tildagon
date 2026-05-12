@@ -31,9 +31,16 @@ try:
 except ImportError:
     espnow = None
 
-from nocturnation.channel_scan import ChannelScanner
-from nocturnation.protocol import DedupRing, MessageType
-from nocturnation.receive import process_frame
+# Relative imports against the internal nocturnation/ package: the
+# Tildagon launcher loads this module as apps.nocturnation.app and does
+# not add apps/nocturnation/ to sys.path, so absolute `from
+# nocturnation.X import Y` fails on the badge. Relative imports resolve
+# via the parent package (apps.nocturnation) and work on both runtimes.
+# Host-side pytest never imports this file (only the nocturnation/
+# package below), so the dot prefix is invisible to the test suite.
+from .nocturnation.channel_scan import ChannelScanner
+from .nocturnation.protocol import DedupRing, MessageType
+from .nocturnation.receive import process_frame
 
 
 class NocturNationApp(app.App):
