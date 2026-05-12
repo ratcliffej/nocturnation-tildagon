@@ -3,10 +3,14 @@
 Block 1 (shipped): minimal Tildagon OS app draws the brand-mark and
 exits cleanly on CANCEL.
 
-Block 2 (current): async background_task drives ESP-NOW receive with
+Block 2 (shipped): async background_task drives ESP-NOW receive with
 channel auto-scan, deduplication, and hop-count enforcement per the
-protocol manual. Received frames are counted and logged to serial;
-rendering on the perimeter LEDs and LCD lands at Block 3.
+protocol manual.
+
+Block 3 (current): each accepted LIGHT_COMMAND is dispatched to the
+PerimeterRenderer which arms per-LED envelopes; the update() tick
+advances envelopes and pushes the resulting (r, g, b) per LED via
+tildagonos.leds[i].
 
 Reference: https://tildagon.badge.emfcamp.org/tildagon-apps/development/
 Block plan: nocturnation-m5 docs/epics/epic-05-tildagon.md
@@ -30,6 +34,14 @@ try:
     import espnow
 except ImportError:
     espnow = None
+try:
+    import time
+except ImportError:
+    time = None
+try:
+    from tildagonos import tildagonos
+except ImportError:
+    tildagonos = None
 
 # Relative imports against the internal nocturnation/ package: the
 # Tildagon launcher loads this module as apps.nocturnation.app and does
@@ -41,6 +53,7 @@ except ImportError:
 from .nocturnation.channel_scan import ChannelScanner
 from .nocturnation.protocol import DedupRing, MessageType
 from .nocturnation.receive import process_frame
+from .nocturnation.render import PerimeterRenderer
 
 
 class NocturNationApp(app.App):
@@ -64,11 +77,45 @@ class NocturNationApp(app.App):
         # the LCD so the operator knows which channel to align the
         # master Stick to when auto-scan is disabled.
         self._receive_channel = None
+        # Perimeter LED renderer. Calm Mode default-on per architecture
+        # spec section 15. The operator opts into full mode via the
+        # in-app settings (Block 5).
+        self._renderer = PerimeterRenderer(calm_mode=True)
+        # Bring the perimeter LEDs out of low-power before the first
+        # tick. Harmless if tildagonos is None (host environment).
+        if tildagonos is not None:
+            try:
+                tildagonos.set_led_power(True)
+            except Exception as exc:
+                print("[nocturnation] tildagonos.set_led_power failed: %s" % exc)
 
     def update(self, delta: float) -> None:
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
             self.minimise()
+            return
+        self._render_perimeter()
+
+    def _render_perimeter(self) -> None:
+        """Advance perimeter LED envelopes and push to hardware.
+
+        Called every UI frame (~20 Hz). The renderer.tick() callback fans
+        out to tildagonos.leds[i] = (r, g, b); we then commit with a
+        single tildagonos.leds.write() rather than after each set, so the
+        ring updates atomically.
+        """
+        if tildagonos is None or time is None:
+            return
+        now_ms = time.ticks_ms()
+        leds = tildagonos.leds
+        def set_led(i, r, g, b):
+            leds[i] = (r, g, b)
+        try:
+            self._renderer.tick(now_ms, set_led)
+            leds.write()
+        except Exception as exc:
+            # Don't let a hardware glitch take down the app's update loop.
+            print("[nocturnation] perimeter render failed: %s" % exc)
 
     def draw(self, ctx) -> None:
         ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
@@ -221,6 +268,10 @@ class NocturNationApp(app.App):
     def _observe_frame(self, frame) -> None:
         self._frame_count += 1
         self._last_frame = frame
+        # Light commands arm perimeter LED envelopes. Other message types
+        # (heartbeat, music_event, ...) just bump the counter.
+        if frame.message_type == MessageType.LIGHT_COMMAND and time is not None:
+            self._renderer.dispatch(frame, time.ticks_ms())
 
 
 __app_export__ = NocturNationApp

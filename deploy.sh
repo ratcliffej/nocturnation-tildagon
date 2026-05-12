@@ -53,5 +53,5 @@ fi
 
 echo "[deploy] listing :apps/nocturnation"
 mpremote ls :apps/nocturnation
-
+mpremote reset
 echo "[deploy] done. Launch 'NocturNation' from the badge UI."
