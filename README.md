@@ -34,28 +34,42 @@ The NocturNation manuals live in the [nocturnation-m5](https://github.com/ratcli
 
 ### Test on real hardware
 
-The repo mirrors the Tildagon's on-badge `/apps/<owner_appname>/` layout. Deploy is a copy-and-reset cycle:
+The repo mirrors the Tildagon's on-badge `/apps/<owner_appname>/` layout. Deploy is a wipe-and-copy cycle:
 
 ```sh
 # From the repo root, with the badge plugged in via USB.
 
-# 1. Copy the app into the badge's /apps/ directory.
-mpremote cp -r apps/nocturnation :apps/nocturnation
+# 1. Remove any previous deployment. (Gotcha: mpremote cp -r src dest
+#    nests src INSIDE dest when dest already exists as a directory,
+#    producing apps/nocturnation/nocturnation/. Wiping first avoids it.)
+mpremote rm -r :apps/nocturnation
 
-# 2. Reset the badge so the launcher re-scans /apps/.
+# 2. Copy the app to the badge. The :apps/ destination (trailing slash)
+#    means "place nocturnation inside apps".
+mpremote cp -r apps/nocturnation :apps/
+
+# 3. Reset the badge so the launcher discards the cached App class.
 mpremote reset
 
-# 3. Scroll to "NocturNation" in the launcher and tap to run.
+# 4. Scroll to "NocturNation" in the launcher and tap to run.
 ```
 
-For fast iteration after the first deploy, re-copy just the file you changed and re-launch from the badge UI:
+Verify what landed:
+
+```sh
+mpremote ls :apps/nocturnation
+mpremote ls :apps/nocturnation/nocturnation
+```
+
+For fast iteration after a successful first deploy, re-copy individual files in place. Writing over an existing file does NOT have the nesting problem:
 
 ```sh
 mpremote cp apps/nocturnation/app.py :apps/nocturnation/app.py
+mpremote reset
 # Back out of the app on the badge, then re-launch from the launcher.
 ```
 
-`mpremote mount apps` is also available - it mounts the local `apps/` folder at `/remote` on the badge for ad-hoc REPL scripting. It does NOT deploy the app to the launcher: the launcher only scans `/apps/`, so calling `NocturNationApp()` from the mounted REPL doesn't run the app the way the launcher does (instantiate + register with scheduler + drive update/draw). Use `mount` for poking at modules from the REPL; use `cp` + `reset` to actually launch the app.
+`mpremote mount apps` is also available - it mounts the local `apps/` folder at `/remote` on the badge for ad-hoc REPL scripting. It does NOT deploy the app to the launcher: the launcher only scans `/apps/`, so calling `NocturNationApp()` from the mounted REPL doesn't run the app the way the launcher does (instantiate + register with scheduler + drive update/draw). Use `mount` for poking at modules from the REPL; use `rm` + `cp` + `reset` to actually launch the app.
 
 ### Native unit tests
 
