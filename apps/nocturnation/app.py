@@ -400,6 +400,14 @@ class NocturNationApp(app.App):
             f = self._last_frame
             ctx.move_to(0, 45).text("rgb %02x%02x%02x" % (f.r, f.g, f.b))
 
+        # Button-hint footer. Tildagon convention: C = select (CONFIRM),
+        # F = back (CANCEL). The mapping is fixed by the frontboard and
+        # apps don't override it; printing the hint inline so the
+        # operator doesn't have to remember which physical button does
+        # what.
+        ctx.font_size = 10
+        ctx.move_to(0, 85).text("C: settings   F: exit")
+
     async def background_task(self) -> None:
         """ESP-NOW receive loop: auto-scan, lock, then receive forever.
 
