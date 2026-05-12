@@ -30,21 +30,28 @@ The NocturNation manuals live in the [nocturnation-m5](https://github.com/ratcli
 
 ### Test on real hardware
 
-The repo mirrors the Tildagon's on-badge `/apps/<owner_appname>/` layout, so the canonical iteration loop is `mpremote mount` rather than file-by-file copy. From the repo root:
+The repo mirrors the Tildagon's on-badge `/apps/<owner_appname>/` layout. Deploy is a copy-and-reset cycle:
 
 ```sh
-# Reset the badge into a fresh REPL, then mount this repo's apps/ folder
-# as the badge's apps/ folder. Edits to local files appear on the badge
-# instantly; no reflashing required.
-mpremote reset
-mpremote mount apps
-```
+# From the repo root, with the badge plugged in via USB.
 
-The app then appears in the badge's launcher under "NocturNation". For a one-shot copy (e.g. preparing a release artefact):
-
-```sh
+# 1. Copy the app into the badge's /apps/ directory.
 mpremote cp -r apps/nocturnation :apps/nocturnation
+
+# 2. Reset the badge so the launcher re-scans /apps/.
+mpremote reset
+
+# 3. Scroll to "NocturNation" in the launcher and tap to run.
 ```
+
+For fast iteration after the first deploy, re-copy just the file you changed and re-launch from the badge UI:
+
+```sh
+mpremote cp apps/nocturnation/app.py :apps/nocturnation/app.py
+# Back out of the app on the badge, then re-launch from the launcher.
+```
+
+`mpremote mount apps` is also available - it mounts the local `apps/` folder at `/remote` on the badge for ad-hoc REPL scripting. It does NOT deploy the app to the launcher: the launcher only scans `/apps/`, so calling `NocturNationApp()` from the mounted REPL doesn't run the app the way the launcher does (instantiate + register with scheduler + drive update/draw). Use `mount` for poking at modules from the REPL; use `cp` + `reset` to actually launch the app.
 
 ### Native unit tests
 
