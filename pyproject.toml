@@ -1,0 +1,23 @@
+[project]
+name = "nocturnation-tildagon"
+version = "0.1.0"
+description = "NocturNation Tildagon receiver app"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Jason Ratcliffe" }]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers"
+
+# Host-side tests run on standard CPython. The MicroPython runtime on the
+# Tildagon has a subset of stdlib; protocol code under nocturnation/protocol
+# is deliberately written to work under both runtimes.

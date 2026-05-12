@@ -1,0 +1,27 @@
+# MicroPython bytecode
+*.mpy
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python development
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.DS_Store
+
+# OS
+Thumbs.db
+
+# Tildagon simulator state
+.tildagon-sim/
