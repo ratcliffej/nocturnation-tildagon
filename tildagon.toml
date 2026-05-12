@@ -1,0 +1,32 @@
+# Tildagon app-store submission manifest.
+#
+# Read by the EMF app-store crawler when this repo is public and tagged
+# with the `tildagon-app` GitHub topic; the crawler builds and installs
+# the app at https://apps.badge.emfcamp.org/. Reference format:
+# https://tildagon.badge.emfcamp.org/tildagon-apps/publish/
+#
+# Distinct from apps/nocturnation/metadata.json - that is the on-badge
+# runtime artefact (used by the launcher to enumerate installed apps);
+# this file is the source-repo manifest used at submission time.
+
+name = "NocturNation"
+category = "Music"
+author = "ratcliffej"
+license = "MIT"
+url = "https://github.com/ratcliffej/nocturnation-tildagon"
+description = "Music-reactive crowd lighting. Pulses badge LEDs and screen in time with a master Stick over ESP-NOW."
+version = 1
+
+# Fallback category for older firmware that pre-dates the Music
+# category. "Apps" is the catch-all bucket.
+menu = "Apps"
+
+# The app talks to ESP-NOW peers but does not need station-mode WiFi
+# (the badge's own networking layer keeps STA_IF up for ESP-NOW
+# regardless). false signals to the OS that no associate-to-AP step is
+# wanted on launch.
+wifi_preference = false
+
+# Entry point. The badge's launcher also accepts __app_export__ at the
+# bottom of app.py; both are wired so either loader path works.
+class = "NocturNationApp"

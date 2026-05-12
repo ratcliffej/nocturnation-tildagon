@@ -15,8 +15,14 @@ Epic 5 (Tildagon receiver app):
 - **Block 3 (perimeter LED rendering)**: shipped. `PerimeterRenderer` arms per-LED envelopes from each accepted LIGHT_COMMAND (chance-gated independently per LED, then ramped through attack/sustain/release per the protocol's Time and Chance enums). Frequency cap and 50 % brightness cap enforce Calm Mode default-on per architecture spec section 15. The app's `update()` tick advances envelopes and commits via `tildagonos.leds.write()`. Bench-verified 2026-05-12: master kicks fire the ring in sync, no flicker (after emitting `PatternDisable` to suppress the badge's system patterndisplay service).
 - **Block 4 (LCD pulse rendering)**: shipped at the protocol layer. `LcdRenderer` renders an accepted LIGHT_COMMAND as a soft full-screen colour wash on the round 240×240 LCD. Calm Mode default-on disables LCD pulsing entirely per architecture spec section 15.3 ("screen flashing disabled"); Full mode arms an envelope at peak brightness capped at 60 % (an uncapped full-screen wash at face distance is uncomfortably bright). Frequency cap matches the perimeter renderer's Full mode (4 Hz). Bench verification of the wash needs Block 5's settings UI to flip into Full mode.
 - **Block 5 (configuration UI)**: shipped at the protocol layer. Persistent `Settings` (Calm Mode toggle, group 0..3 cycle, channel auto/1/11 cycle) stored as JSON at `/nocturnation_settings.json` outside the app dir so deploys don't clobber operator preferences. In-app menu via `app_components.Menu`: CONFIRM (button C) opens, CANCEL (button F) backs out, selecting a line cycles its value. Class + group filter on inbound LIGHT_COMMAND per protocol manual section 4.2 and Epic 5 Q1/Q2.
-- **Block 6 (NO SIGNAL + backgrounded + MUSIC_EVENT)**: shipped at the protocol layer. `SignalTracker` records every accepted frame's timestamp; the draw loop overlays NO SIGNAL after a 3 s gap per protocol manual section 6.2 (initial state on launch counts as lost until the first frame arrives). MUSIC_EVENT frames (message_type 0x06) trigger local synthetic fires: DROP → bright whiteout, BREAKDOWN → slow dim blue (Build is reserved). Backgrounded operation per architecture spec section 7.3 - the perimeter LED ring keeps animating when the operator switches to another badge app (the receive + render loop runs in `background_task` regardless of foreground state); only the LCD goes idle (the OS routes draw() calls to whichever app is foregrounded). 21 new host-side tests; total 120/120 passing.
-- **Block 7**: not started. See the [Epic 5 plan](https://github.com/ratcliffej/nocturnation-m5/blob/main/docs/epics/epic-05-tildagon.md) for the full block plan.
+- **Block 6 (NO SIGNAL + backgrounded + MUSIC_EVENT)**: shipped at the protocol layer. `SignalTracker` records every accepted frame's timestamp; the draw loop overlays NO SIGNAL after a 3 s gap per protocol manual section 6.2. MUSIC_EVENT frames trigger local synthetic fires: DROP → bright whiteout, BREAKDOWN → slow dim blue. Backgrounded operation per architecture spec section 7.3 - the perimeter LED ring keeps animating when the operator switches to another badge app.
+- **Block 7 (submission readiness)**: shipped at the protocol layer. `tildagon.toml` manifest written per EMF app-store schema; `CHANGELOG.md` tracks the release. **120/120 host tests passing.** Remaining Block 7 acceptance is hardware-side and gated on operator workflow:
+  - M5↔Tildagon interop bench session with bracelets.
+  - Battery drain measurement (idle vs receiver-app over 2 h).
+  - Flipping the repo to **public** (required for the EMF crawler at <https://apps.badge.emfcamp.org> to find it).
+  - Adding the `tildagon-app` GitHub topic.
+  - Creating a release tag (e.g. `v1`).
+  - Submitting via the EMF app store and tracking review.
 
 Both repositories are currently private; access is granted on request.
 
@@ -98,6 +104,8 @@ The tests run on the host Python; no hardware required. `pyproject.toml` adds `a
 ## Project layout
 
 ```
+tildagon.toml                          EMF app-store submission manifest (Block 7)
+CHANGELOG.md                           Per-release release notes (Block 7)
 apps/                                  Mirrors the badge's /apps/ filesystem
   nocturnation/                        owner_appname (single dir per app)
     app.py                             App class + __app_export__
@@ -139,6 +147,19 @@ The on-badge import path for the app is `apps.nocturnation.app`; the internal pa
 - **Transmit (manual-master mode, if implemented)** - hard rule, channel 1 only. Channel 11 is reserved for the official master.
 - **Group ID** defaults to a random value in {1, 2, 3} at first boot (Block 5; matches the M5 Stick behaviour).
 - **Calm Mode** default-on: 2 Hz frequency cap, 50 % brightness cap, LCD flash disabled. Operator opt-in to full-effect mode via in-app settings.
+
+## EMF app-store submission
+
+When ready to publish (Block 7 close-out):
+
+1. **Flip the repo to public.** The EMF app-store crawler at <https://apps.badge.emfcamp.org/> only sees public GitHub repos. There is no private submission path; publishing means going public.
+2. **Add the `tildagon-app` GitHub topic** to the repo (Settings → Topics on the repo page, or `gh repo edit ratcliffej/nocturnation-tildagon --add-topic tildagon-app`).
+3. **Verify `tildagon.toml`** matches your intended release: `name`, `description` (≤ 140 chars), `version` (integer, monotonic), `author`, `category`, `license` (SPDX), `url`.
+4. **Create a release tag**: `git tag v1 && git push --tags`, then create the release on GitHub from that tag (or `gh release create v1 --notes-file CHANGELOG.md`).
+5. **Wait ~15 minutes**: the crawler picks up the release and the app appears in the app store. Track listing at <https://apps.badge.emfcamp.org/>.
+6. **Iterate via new releases** for fixes. Bump `version` in `tildagon.toml` and create a new release tag; the crawler reads each release in turn.
+
+The `tildagon.toml` schema reference is at <https://tildagon.badge.emfcamp.org/tildagon-apps/publish/>.
 
 ## Contributing
 
