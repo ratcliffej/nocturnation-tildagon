@@ -96,6 +96,12 @@ class NocturNationApp(app.App):
         (suggested show channel) then channel 1 (hobby), each for ~2 s,
         repeating until a valid frame arrives. After lock, receive runs
         on the locked channel until the app is killed.
+
+        Fallback: if the badge's networking layer rejects channel
+        changes on STA_IF (observed: RuntimeError 0xffffffff), we skip
+        auto-scan and listen on whichever channel the radio is already
+        on. The operator must align master + Tildagon channels manually
+        in that case.
         """
         if espnow is None or network is None or asyncio is None:
             self._status = "no radio module"
@@ -107,10 +113,20 @@ class NocturNationApp(app.App):
         self._esp = espnow.ESPNow()
         self._esp.active(True)
 
-        await self._scan_until_locked(wlan)
+        if not await self._scan_until_locked(wlan):
+            self._status = "no-scan"
+            print("[nocturnation] auto-scan unavailable; listening on default channel")
+
         await self._receive_loop()
 
-    async def _scan_until_locked(self, wlan) -> None:
+    async def _scan_until_locked(self, wlan) -> bool:
+        """Run the auto-scan state machine.
+
+        Returns True if a channel was locked normally (a valid frame
+        arrived). Returns False if channel-set is rejected by the
+        platform - the caller should then drop into receive without
+        having locked a specific channel.
+        """
         listen_ms = self._scanner.listen_ms
         poll_ms = 50
         self._status = "scanning"
@@ -119,10 +135,15 @@ class NocturNationApp(app.App):
             ch = self._scanner.current_channel
             try:
                 wlan.config(channel=ch)
-            except OSError as exc:
-                self._status = "channel %d err" % ch
+            except Exception as exc:
+                # Tildagon's networking layer can reject channel changes
+                # on STA_IF with a non-OSError exception (observed:
+                # RuntimeError: Wifi Unknown Error 0xffffffff). Treat any
+                # failure as "this badge does not let us steer the radio"
+                # and fall back to listening on the default channel.
+                self._status = "ch %d err" % ch
                 print("[nocturnation] wlan.config(channel=%d) failed: %s" % (ch, exc))
-                return
+                return False
 
             print("[nocturnation] scanning channel %d for %d ms" % (ch, listen_ms))
             elapsed = 0
@@ -135,11 +156,12 @@ class NocturNationApp(app.App):
                         print("[nocturnation] locking channel %d" % ch)
                         self._scanner.lock()
                         self._status = "locked"
-                        return
+                        return True
                 await asyncio.sleep_ms(poll_ms)
                 elapsed += poll_ms
 
             self._scanner.advance()
+        return True
 
     async def _receive_loop(self) -> None:
         poll_ms = 5
