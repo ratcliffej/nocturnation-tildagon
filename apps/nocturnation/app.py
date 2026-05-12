@@ -68,7 +68,7 @@ except ImportError:
 from .nocturnation.channel_scan import ChannelScanner
 from .nocturnation.protocol import DedupRing, MessageType
 from .nocturnation.receive import process_frame
-from .nocturnation.render import PerimeterRenderer
+from .nocturnation.render import LcdRenderer, PerimeterRenderer
 
 
 class NocturNationApp(app.App):
@@ -96,6 +96,10 @@ class NocturNationApp(app.App):
         # spec section 15. The operator opts into full mode via the
         # in-app settings (Block 5).
         self._renderer = PerimeterRenderer(calm_mode=True)
+        # LCD pulse renderer. Calm Mode disables the LCD wash entirely
+        # per architecture spec section 15.3; the operator opts in via
+        # the same Calm Mode toggle when ready (Block 5).
+        self._lcd_renderer = LcdRenderer(calm_mode=True)
         # Bring the perimeter LEDs out of low-power before the first
         # tick. Harmless if tildagonos is None (host environment).
         if tildagonos is not None:
@@ -141,6 +145,7 @@ class NocturNationApp(app.App):
         self._is_foreground = True
         self._inhibit_patterns()
         self._renderer.clear()
+        self._lcd_renderer.clear()
         print("[nocturnation] foreground push - resuming receive + LEDs")
 
     def _on_foreground_pop(self, event) -> None:
@@ -156,6 +161,7 @@ class NocturNationApp(app.App):
         self._is_foreground = False
         self._resume_patterns()
         self._renderer.clear()
+        self._lcd_renderer.clear()
         print("[nocturnation] foreground pop - paused receive, released LEDs")
 
     def _inhibit_patterns(self) -> None:
@@ -206,7 +212,11 @@ class NocturNationApp(app.App):
             print("[nocturnation] perimeter render failed: %s" % exc)
 
     def draw(self, ctx) -> None:
-        ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
+        # Background: LCD pulse wash if Full mode is on and there's an
+        # active envelope; otherwise black (Calm Mode keeps the LCD
+        # quiet so the badge stays comfortable face-distance).
+        bg_r, bg_g, bg_b = self._lcd_background_rgb01()
+        ctx.rgb(bg_r, bg_g, bg_b).rectangle(-120, -120, 240, 240).fill()
         ctx.rgb(1, 1, 1)
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
@@ -366,10 +376,29 @@ class NocturNationApp(app.App):
     def _observe_frame(self, frame) -> None:
         self._frame_count += 1
         self._last_frame = frame
-        # Light commands arm perimeter LED envelopes. Other message types
-        # (heartbeat, music_event, ...) just bump the counter.
+        # Light commands arm both render surfaces (perimeter LEDs and
+        # the LCD pulse wash). The LCD renderer is a silent no-op in
+        # Calm Mode but receives the dispatches anyway so toggling to
+        # Full mode mid-deployment picks up the next fire cleanly.
+        # Other message types (heartbeat, music_event, ...) just bump
+        # the counter.
         if frame.message_type == MessageType.LIGHT_COMMAND and time is not None:
-            self._renderer.dispatch(frame, time.ticks_ms())
+            now_ms = time.ticks_ms()
+            self._renderer.dispatch(frame, now_ms)
+            self._lcd_renderer.dispatch(frame, now_ms)
+
+    def _lcd_background_rgb01(self):
+        """Return (r, g, b) in 0..1 floats for ctx.rgb() to paint as the
+        screen background. Falls back to black if no wash is active or
+        the runtime time module isn't available (host tests).
+        """
+        if time is None:
+            return (0.0, 0.0, 0.0)
+        wash = self._lcd_renderer.current_colour(time.ticks_ms())
+        if wash is None:
+            return (0.0, 0.0, 0.0)
+        r, g, b = wash
+        return (r / 255.0, g / 255.0, b / 255.0)
 
 
 __app_export__ = NocturNationApp

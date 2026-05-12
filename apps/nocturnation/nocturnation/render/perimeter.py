@@ -16,9 +16,7 @@ Reference manuals:
 - Epic 5 Block 3
 """
 
-# Map the protocol's Time enum (0..7) to milliseconds.
-# Mirrors include/pixmob_protocol.h Time in the M5 firmware.
-TIME_MS = (0, 32, 96, 192, 480, 960, 2400, 3840)
+from .envelope import TIME_MS, envelope_brightness  # noqa: F401 (re-exported)
 
 # Map the protocol's Chance enum (0..7) to a probability 0..1.
 # Mirrors include/pixmob_protocol.h Chance in the M5 firmware.
@@ -159,7 +157,7 @@ class PerimeterRenderer:
                 set_led(i, 0, 0, 0)
                 continue
 
-            level = _envelope_brightness(elapsed, atk, sus, rel) * cap
+            level = envelope_brightness(elapsed, atk, sus, rel) * cap
             set_led(i, int(r * level), int(g * level), int(b * level))
 
     def clear(self):
@@ -170,27 +168,3 @@ class PerimeterRenderer:
             self._envelopes[i] = None
 
 
-def _envelope_brightness(t, attack_ms, sustain_ms, release_ms):
-    """Linear ASR envelope returning 0..1.
-
-    0..attack_ms      -> ramp up from 0 to 1
-    attack..attack+sustain -> hold at 1
-    sustain..total    -> ramp down from 1 to 0
-
-    attack_ms == 0 snaps to 1 immediately. release_ms == 0 snaps to 0
-    after sustain ends. Callers must guarantee total > 0; ticked-out
-    envelopes are cleared in tick() before this is called.
-    """
-    if t < attack_ms:
-        if attack_ms == 0:
-            return 1.0
-        return t / attack_ms
-    t -= attack_ms
-    if t < sustain_ms:
-        return 1.0
-    t -= sustain_ms
-    if release_ms == 0:
-        return 0.0
-    if t < release_ms:
-        return 1.0 - (t / release_ms)
-    return 0.0

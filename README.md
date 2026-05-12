@@ -12,8 +12,9 @@ Epic 5 (Tildagon receiver app):
 
 - **Block 1 (platform familiarisation)**: shipped. App installs via `mpremote cp` + reset, appears in the badge launcher, draws the brand-mark, exits cleanly on CANCEL. Bench-verified on real hardware 2026-05-12.
 - **Block 2 (ESP-NOW receive)**: shipped. Frame parser, deduplication ring, hop-count enforcement, and channel auto-scan state machine all landed with host-side parity tests against protocol manual annex C. The async `background_task` wires these together for ESP-NOW receive on real hardware. Bench-verified 2026-05-12: real LIGHT_COMMAND frames from a master Stick on channel 11 parse correctly and increment the on-screen counter. Channel auto-scan-across-channels couldn't be implemented as written (the badge's networking layer rejects a second `wlan.config(channel=...)` call); tracked as Epic 5 open design question Q6 for Block 5.
-- **Block 3 (perimeter LED rendering)**: shipped at the protocol layer. `PerimeterRenderer` arms per-LED envelopes from each accepted LIGHT_COMMAND (chance-gated independently per LED, then ramped through attack/sustain/release per the protocol's Time and Chance enums). Frequency cap and 50 % brightness cap enforce Calm Mode default-on per architecture spec section 15. 19 host-side tests cover envelope shape, chance gating, rate limiting, brightness cap, and edge cases (primer-as-no-op, zero-duration envelope). The app's `update()` tick advances envelopes and commits via `tildagonos.leds.write()`. Hardware verification (real Tildagon's twelve-LED ring fires in sync with a master Stick) is the remaining Block 3 acceptance.
-- **Block 4-7**: not started. See the [Epic 5 plan](https://github.com/ratcliffej/nocturnation-m5/blob/main/docs/epics/epic-05-tildagon.md) for the full block plan.
+- **Block 3 (perimeter LED rendering)**: shipped. `PerimeterRenderer` arms per-LED envelopes from each accepted LIGHT_COMMAND (chance-gated independently per LED, then ramped through attack/sustain/release per the protocol's Time and Chance enums). Frequency cap and 50 % brightness cap enforce Calm Mode default-on per architecture spec section 15. The app's `update()` tick advances envelopes and commits via `tildagonos.leds.write()`. Bench-verified 2026-05-12: master kicks fire the ring in sync, no flicker (after emitting `PatternDisable` to suppress the badge's system patterndisplay service).
+- **Block 4 (LCD pulse rendering)**: shipped at the protocol layer. `LcdRenderer` renders an accepted LIGHT_COMMAND as a soft full-screen colour wash on the round 240×240 LCD. Calm Mode default-on disables LCD pulsing entirely per architecture spec section 15.3 ("screen flashing disabled"); Full mode arms an envelope at peak brightness capped at 60 % (an uncapped full-screen wash at face distance is uncomfortably bright). Frequency cap matches the perimeter renderer's Full mode (4 Hz). 17 host-side tests cover Calm/Full toggle, dispatch acceptance, envelope shape, brightness cap, frequency cap, and clear-on-foreground-transition. Hardware verification (LCD pulses in sync with the perimeter ring in Full mode; LCD stays as the static UI in Calm Mode) needs the Block 5 settings UI to toggle into Full mode - until then the LCD shows the static UI in Calm Mode by default.
+- **Block 5-7**: not started. See the [Epic 5 plan](https://github.com/ratcliffej/nocturnation-m5/blob/main/docs/epics/epic-05-tildagon.md) for the full block plan.
 
 Both repositories are currently private; access is granted on request.
 
@@ -107,14 +108,17 @@ apps/                                  Mirrors the badge's /apps/ filesystem
       receive.py                       parse + dedup + hop-count pipeline (Block 2)
       channel_scan.py                  Auto-scan state machine (Block 2)
       render/
-        perimeter.py                   Six-LED perimeter renderer (Block 3)
-        lcd.py                         Round-LCD renderer (Block 4)
+        envelope.py                    Shared ASR brightness math + Time enum
+        perimeter.py                   Twelve-LED perimeter renderer (Block 3)
+        lcd.py                         Round-LCD pulse renderer (Block 4)
       config.py                        In-app settings (Block 5)
 tests/                                 Host-side pytest suite (not deployed to badge)
   test_frame.py                        Header + payload parser tests (Block 1/2)
   test_dedup.py                        Dedup ring tests (Block 2)
   test_receive.py                      Receive pipeline tests (Block 2)
   test_channel_scan.py                 Channel scanner state-machine tests (Block 2)
+  test_perimeter.py                    Perimeter LED renderer tests (Block 3)
+  test_lcd.py                          LCD pulse renderer tests (Block 4)
 pyproject.toml                         Dev environment + pytest config
 ```
 
