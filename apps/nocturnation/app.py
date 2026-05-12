@@ -42,6 +42,13 @@ try:
     from tildagonos import tildagonos
 except ImportError:
     tildagonos = None
+try:
+    from system.eventbus import eventbus
+    from system.patterndisplay.events import PatternDisable, PatternEnable
+except ImportError:
+    eventbus = None
+    PatternDisable = None
+    PatternEnable = None
 
 # Relative imports against the internal nocturnation/ package: the
 # Tildagon launcher loads this module as apps.nocturnation.app and does
@@ -88,10 +95,36 @@ class NocturNationApp(app.App):
                 tildagonos.set_led_power(True)
             except Exception as exc:
                 print("[nocturnation] tildagonos.set_led_power failed: %s" % exc)
+        # Tell the badge's system patterndisplay service to stop driving
+        # the perimeter LEDs while this app is running. Without this the
+        # system pattern and our renderer.tick() both write the LED ring
+        # and the result flickers. We re-enable on minimise so the badge
+        # idle animation resumes once the operator backs out.
+        self._patterns_inhibited = False
+        self._inhibit_patterns()
+
+    def _inhibit_patterns(self) -> None:
+        if eventbus is None or PatternDisable is None:
+            return
+        try:
+            eventbus.emit(PatternDisable())
+            self._patterns_inhibited = True
+        except Exception as exc:
+            print("[nocturnation] PatternDisable emit failed: %s" % exc)
+
+    def _resume_patterns(self) -> None:
+        if eventbus is None or PatternEnable is None or not self._patterns_inhibited:
+            return
+        try:
+            eventbus.emit(PatternEnable())
+            self._patterns_inhibited = False
+        except Exception as exc:
+            print("[nocturnation] PatternEnable emit failed: %s" % exc)
 
     def update(self, delta: float) -> None:
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
+            self._resume_patterns()
             self.minimise()
             return
         self._render_perimeter()
