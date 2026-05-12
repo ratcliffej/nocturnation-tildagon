@@ -8,7 +8,11 @@ This repository is the MicroPython implementation of the NocturNation receiver p
 
 ## Status
 
-Epic 5 (Tildagon receiver app), Block 1 (platform familiarisation). See the [Epic 5 plan](https://github.com/ratcliffej/nocturnation-m5/blob/main/docs/epics/epic-05-tildagon.md) in the M5 firmware repo for the full block plan, scope, and design decisions.
+Epic 5 (Tildagon receiver app):
+
+- **Block 1 (platform familiarisation)**: shipped. App installs via `mpremote cp` + reset, appears in the badge launcher, draws the brand-mark, exits cleanly on CANCEL. Bench-verified on real hardware 2026-05-12.
+- **Block 2 (ESP-NOW receive)**: shipped at the protocol layer. Frame parser, deduplication ring, hop-count enforcement, and channel auto-scan state machine all landed with 44 host-side parity tests against protocol manual annex C. The async `background_task` in `app.py` wires these together for ESP-NOW receive on real hardware, with the operating channel and frame count displayed on the LCD. Hardware verification (master-Stick to Tildagon frame delivery, on-screen frame counter incrementing) is the remaining acceptance criterion.
+- **Block 3-7**: not started. See the [Epic 5 plan](https://github.com/ratcliffej/nocturnation-m5/blob/main/docs/epics/epic-05-tildagon.md) for the full block plan.
 
 Both repositories are currently private; access is granted on request.
 
@@ -75,12 +79,18 @@ apps/                                  Mirrors the badge's /apps/ filesystem
       protocol/
         constants.py                   Message types, device classes, enum values
         frame.py                       ESP-NOW frame parser + validator
+        dedup.py                       Sixteen-deep dedup ring (Block 2)
+      receive.py                       parse + dedup + hop-count pipeline (Block 2)
+      channel_scan.py                  Auto-scan state machine (Block 2)
       render/
         perimeter.py                   Six-LED perimeter renderer (Block 3)
         lcd.py                         Round-LCD renderer (Block 4)
       config.py                        In-app settings (Block 5)
 tests/                                 Host-side pytest suite (not deployed to badge)
-  test_frame.py                        Protocol parity tests
+  test_frame.py                        Header + payload parser tests (Block 1/2)
+  test_dedup.py                        Dedup ring tests (Block 2)
+  test_receive.py                      Receive pipeline tests (Block 2)
+  test_channel_scan.py                 Channel scanner state-machine tests (Block 2)
 pyproject.toml                         Dev environment + pytest config
 ```
 

@@ -12,6 +12,7 @@ from .constants import (
     DeviceClass,
     MusicEventType,
 )
+from .dedup import DedupRing
 from .frame import Frame, parse_frame, FrameError
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "MessageType",
     "DeviceClass",
     "MusicEventType",
+    "DedupRing",
     "Frame",
     "parse_frame",
     "FrameError",
