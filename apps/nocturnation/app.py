@@ -7,10 +7,19 @@ Block 2 (shipped): async background_task drives ESP-NOW receive with
 channel auto-scan, deduplication, and hop-count enforcement per the
 protocol manual.
 
-Block 3 (current): each accepted LIGHT_COMMAND is dispatched to the
+Block 3 (shipped): each accepted LIGHT_COMMAND is dispatched to the
 PerimeterRenderer which arms per-LED envelopes; the update() tick
 advances envelopes and pushes the resulting (r, g, b) per LED via
 tildagonos.leds[i].
+
+Block 4 (shipped): the LCD pulse renderer arms a full-screen colour
+wash on each accepted dispatch; draw() paints it as the background
+beneath the UI text. Calm Mode disables LCD pulsing entirely.
+
+Block 5 (current): persistent settings (Calm Mode, group, channel) +
+in-app menu via app_components.Menu. CONFIRM opens the menu; CANCEL
+backs out. Class + group filter on inbound LIGHT_COMMAND per protocol
+manual section 4.2 and Epic 5 Q1 / Q2.
 
 Reference: https://tildagon.badge.emfcamp.org/tildagon-apps/development/
 Block plan: nocturnation-m5 docs/epics/epic-05-tildagon.md
@@ -57,6 +66,11 @@ try:
 except ImportError:
     RequestForegroundPushEvent = None
     RequestForegroundPopEvent = None
+try:
+    from app_components import Menu, clear_background
+except ImportError:
+    Menu = None
+    clear_background = None
 
 # Relative imports against the internal nocturnation/ package: the
 # Tildagon launcher loads this module as apps.nocturnation.app and does
@@ -69,6 +83,19 @@ from .nocturnation.channel_scan import ChannelScanner
 from .nocturnation.protocol import DedupRing, MessageType
 from .nocturnation.receive import process_frame
 from .nocturnation.render import LcdRenderer, PerimeterRenderer
+from .nocturnation.settings import Settings
+
+
+# Cycle order for the settings menu.
+_GROUP_CYCLE = (0, 1, 2, 3)
+_CHANNEL_CYCLE = ("auto", "1", "11")
+
+# Class-to-surface routing per Epic 5 Q1. The Tildagon advertises as
+# MultiLedScreen (0x03) but renders Light-class commands (0x01) on the
+# perimeter too because the LED ring is a wristband-analogue. Screen
+# (0x02) targets the LCD only; All (0x00) targets both surfaces.
+_PERIMETER_CLASSES = (0x00, 0x01, 0x03)
+_LCD_CLASSES = (0x00, 0x02, 0x03)
 
 
 class NocturNationApp(app.App):
@@ -92,14 +119,18 @@ class NocturNationApp(app.App):
         # the LCD so the operator knows which channel to align the
         # master Stick to when auto-scan is disabled.
         self._receive_channel = None
-        # Perimeter LED renderer. Calm Mode default-on per architecture
-        # spec section 15. The operator opts into full mode via the
-        # in-app settings (Block 5).
-        self._renderer = PerimeterRenderer(calm_mode=True)
+        # Load persisted settings before constructing renderers so the
+        # initial Calm Mode state matches what the operator last chose.
+        self._settings = Settings.load()
+        # Perimeter LED renderer. Calm Mode default per persisted
+        # settings (default True). Architecture spec section 15.
+        self._renderer = PerimeterRenderer(calm_mode=self._settings.calm_mode)
         # LCD pulse renderer. Calm Mode disables the LCD wash entirely
-        # per architecture spec section 15.3; the operator opts in via
-        # the same Calm Mode toggle when ready (Block 5).
-        self._lcd_renderer = LcdRenderer(calm_mode=True)
+        # per architecture spec section 15.3.
+        self._lcd_renderer = LcdRenderer(calm_mode=self._settings.calm_mode)
+        # In-app settings menu state.
+        self._settings_open = False
+        self._settings_menu = None
         # Bring the perimeter LEDs out of low-power before the first
         # tick. Harmless if tildagonos is None (host environment).
         if tildagonos is not None:
@@ -183,12 +214,133 @@ class NocturNationApp(app.App):
             print("[nocturnation] PatternEnable emit failed: %s" % exc)
 
     def update(self, delta: float) -> None:
+        # Settings menu has its own update path - delegate to it.
+        if self._settings_open and self._settings_menu is not None:
+            self._settings_menu.update(delta)
+            return
+
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
             self._resume_patterns()
             self.minimise()
             return
+        if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+            self.button_states.clear()
+            self._open_settings()
+            return
         self._render_perimeter()
+
+    def _open_settings(self) -> None:
+        """Open the in-app settings menu (Block 5).
+
+        Darkens the perimeter ring and clears any in-flight envelopes
+        so the LEDs don't hold a stale brightness while update() is
+        delegated to the menu and _render_perimeter() stops ticking.
+        """
+        if Menu is None:
+            print("[nocturnation] Menu component unavailable; cannot open settings")
+            return
+        self._settings_open = True
+        self._renderer.clear()
+        self._lcd_renderer.clear()
+        self._dark_perimeter()
+        self._settings_menu = Menu(
+            self,
+            self._settings_menu_items(),
+            select_handler=self._settings_select,
+            back_handler=self._settings_back,
+        )
+
+    def _dark_perimeter(self) -> None:
+        """Force every perimeter LED to (0, 0, 0) and commit immediately."""
+        if tildagonos is None:
+            return
+        try:
+            leds = tildagonos.leds
+            for i in range(1, 13):
+                leds[i] = (0, 0, 0)
+            leds.write()
+        except Exception as exc:
+            print("[nocturnation] dark_perimeter failed: %s" % exc)
+
+    def _close_settings(self) -> None:
+        if self._settings_menu is not None:
+            try:
+                self._settings_menu._cleanup()
+            except Exception:
+                pass
+        self._settings_open = False
+        self._settings_menu = None
+
+    def _settings_menu_items(self):
+        """Compose the menu line labels from current settings values."""
+        return [
+            "Calm Mode: %s" % ("ON" if self._settings.calm_mode else "OFF"),
+            "Group: %d" % self._settings.group,
+            "Channel: %s" % self._settings.channel,
+            "Back",
+        ]
+
+    def _rebuild_settings_menu(self) -> None:
+        """Rebuild the menu after a value cycle so the labels refresh."""
+        if not self._settings_open or Menu is None:
+            return
+        try:
+            self._settings_menu._cleanup()
+        except Exception:
+            pass
+        self._settings_menu = Menu(
+            self,
+            self._settings_menu_items(),
+            select_handler=self._settings_select,
+            back_handler=self._settings_back,
+        )
+
+    def _settings_select(self, item, idx) -> None:
+        """Menu select handler. Cycles the value of the selected line."""
+        if idx == 0:
+            self._settings.calm_mode = not self._settings.calm_mode
+            self._apply_calm_mode()
+        elif idx == 1:
+            cur = self._settings.group
+            try:
+                pos = _GROUP_CYCLE.index(cur)
+            except ValueError:
+                pos = -1
+            self._settings.group = _GROUP_CYCLE[(pos + 1) % len(_GROUP_CYCLE)]
+        elif idx == 2:
+            cur = self._settings.channel
+            try:
+                pos = _CHANNEL_CYCLE.index(cur)
+            except ValueError:
+                pos = -1
+            self._settings.channel = _CHANNEL_CYCLE[(pos + 1) % len(_CHANNEL_CYCLE)]
+        elif idx == 3:
+            self._close_settings()
+            return
+        # Persist after every change. If the save fails we keep the
+        # in-memory change so the UI is consistent; the next save
+        # attempt (next change) tries again.
+        try:
+            self._settings.save()
+        except Exception as exc:
+            print("[nocturnation] settings save failed: %s" % exc)
+        self._rebuild_settings_menu()
+
+    def _settings_back(self) -> None:
+        """Menu back handler - CANCEL while menu is open."""
+        self._close_settings()
+
+    def _apply_calm_mode(self) -> None:
+        """Push the current Calm Mode setting to both renderers."""
+        on = self._settings.calm_mode
+        self._renderer.set_calm_mode(on)
+        self._lcd_renderer.set_calm_mode(on)
+        if not on:
+            # Switching into Full mode - clear the LCD wash so it
+            # starts from black at the next dispatch rather than
+            # holding any stale envelope.
+            self._lcd_renderer.clear()
 
     def _render_perimeter(self) -> None:
         """Advance perimeter LED envelopes and push to hardware.
@@ -212,6 +364,15 @@ class NocturNationApp(app.App):
             print("[nocturnation] perimeter render failed: %s" % exc)
 
     def draw(self, ctx) -> None:
+        # Settings menu owns the entire screen when it is open.
+        if self._settings_open and self._settings_menu is not None:
+            if clear_background is not None:
+                clear_background(ctx)
+            else:
+                ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
+            self._settings_menu.draw(ctx)
+            return
+
         # Background: LCD pulse wash if Full mode is on and there's an
         # active envelope; otherwise black (Calm Mode keeps the LCD
         # quiet so the badge stays comfortable face-distance).
@@ -376,15 +537,26 @@ class NocturNationApp(app.App):
     def _observe_frame(self, frame) -> None:
         self._frame_count += 1
         self._last_frame = frame
-        # Light commands arm both render surfaces (perimeter LEDs and
-        # the LCD pulse wash). The LCD renderer is a silent no-op in
-        # Calm Mode but receives the dispatches anyway so toggling to
-        # Full mode mid-deployment picks up the next fire cleanly.
-        # Other message types (heartbeat, music_event, ...) just bump
-        # the counter.
-        if frame.message_type == MessageType.LIGHT_COMMAND and time is not None:
-            now_ms = time.ticks_ms()
+        # Non-light-command frames just bump the counter (they reach
+        # us so the radio is alive, but there's nothing to render).
+        if frame.message_type != MessageType.LIGHT_COMMAND or time is None:
+            return
+        # Group filter per protocol manual section 4.2: target_group == 0
+        # is broadcast (every receiver fires); otherwise must match the
+        # operator-configured group exactly. A device whose own group is
+        # 0 only accepts broadcasts, which is what the default settings
+        # produce.
+        if frame.target_group != 0 and frame.target_group != self._settings.group:
+            return
+        # Per-surface class routing per Epic 5 Q1. Light-class commands
+        # arm the perimeter (wristband analogue); Screen-class arm the
+        # LCD; MultiLedScreen arms both; All targets both. Other
+        # classes (reserved) are silently dropped.
+        now_ms = time.ticks_ms()
+        cls = frame.target_class
+        if cls in _PERIMETER_CLASSES:
             self._renderer.dispatch(frame, now_ms)
+        if cls in _LCD_CLASSES:
             self._lcd_renderer.dispatch(frame, now_ms)
 
     def _lcd_background_rgb01(self):
