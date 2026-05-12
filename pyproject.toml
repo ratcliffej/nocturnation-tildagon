@@ -17,7 +17,12 @@ dev = [
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-ra --strict-markers"
+# apps/nocturnation/ is the badge-deployable directory. Adding it to
+# pythonpath lets the host-side pytest suite import the nocturnation
+# package the same way the app does on the badge (`from nocturnation
+# .protocol import ...`).
+pythonpath = ["apps/nocturnation"]
 
 # Host-side tests run on standard CPython. The MicroPython runtime on the
-# Tildagon has a subset of stdlib; protocol code under nocturnation/protocol
-# is deliberately written to work under both runtimes.
+# Tildagon has a subset of stdlib; protocol code under apps/nocturnation/
+# nocturnation/protocol is deliberately written to work under both runtimes.

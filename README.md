@@ -30,14 +30,21 @@ The NocturNation manuals live in the [nocturnation-m5](https://github.com/ratcli
 
 ### Test on real hardware
 
-Connect the Tildagon via USB:
+The repo mirrors the Tildagon's on-badge `/apps/<owner_appname>/` layout, so the canonical iteration loop is `mpremote mount` rather than file-by-file copy. From the repo root:
 
 ```sh
-mpremote cp -r app.py app.yml nocturnation :
-mpremote run app.py
+# Reset the badge into a fresh REPL, then mount this repo's apps/ folder
+# as the badge's apps/ folder. Edits to local files appear on the badge
+# instantly; no reflashing required.
+mpremote reset
+mpremote mount apps
 ```
 
-Or use the dev workflow from the Tildagon docs: copy files to the badge, then launch the app from the badge's app menu.
+The app then appears in the badge's launcher under "NocturNation". For a one-shot copy (e.g. preparing a release artefact):
+
+```sh
+mpremote cp -r apps/nocturnation :apps/nocturnation
+```
 
 ### Native unit tests
 
@@ -48,24 +55,29 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The tests run on the host Python; no hardware required.
+The tests run on the host Python; no hardware required. `pyproject.toml` adds `apps/nocturnation/` to the pytest `pythonpath` so imports like `from nocturnation.protocol import parse_frame` resolve identically on host and badge.
 
 ## Project layout
 
 ```
-app.py                   Tildagon OS app entry point (App class + __app_export__)
-app.yml                  Tildagon OS app manifest
-nocturnation/
-  protocol/
-    constants.py         Message types, device classes, enum values
-    frame.py             ESP-NOW frame parser + validator
-  render/
-    perimeter.py         Six-LED perimeter renderer (Block 3)
-    lcd.py               Round-LCD renderer (Block 4)
-  config.py              In-app settings (group, channel, Calm Mode, brightness)
-tests/
-  test_frame.py          Protocol parity tests against reference vectors
+apps/                                  Mirrors the badge's /apps/ filesystem
+  nocturnation/                        owner_appname (single dir per app)
+    app.py                             App class + __app_export__
+    metadata.json                      Tildagon OS manifest (name / hidden / version)
+    nocturnation/                      Internal package
+      protocol/
+        constants.py                   Message types, device classes, enum values
+        frame.py                       ESP-NOW frame parser + validator
+      render/
+        perimeter.py                   Six-LED perimeter renderer (Block 3)
+        lcd.py                         Round-LCD renderer (Block 4)
+      config.py                        In-app settings (Block 5)
+tests/                                 Host-side pytest suite (not deployed to badge)
+  test_frame.py                        Protocol parity tests
+pyproject.toml                         Dev environment + pytest config
 ```
+
+The on-badge import path for the app is `apps.nocturnation.app`; the internal package imports as `nocturnation.protocol`, `nocturnation.render`, etc. (the app dir is on sys.path when the app loads).
 
 ## Architecture notes
 
