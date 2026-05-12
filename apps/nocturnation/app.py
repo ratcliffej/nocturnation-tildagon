@@ -121,6 +121,47 @@ class NocturNationApp(app.App):
         except Exception as exc:
             print("[nocturnation] PatternEnable emit failed: %s" % exc)
 
+    async def run(self, render_update):
+        """Override of App.run to re-inhibit patterns on regained focus.
+
+        The Tildagon launcher caches App instances after first creation;
+        on subsequent re-entry, __init__ does NOT run again, so the
+        PatternDisable emit there is one-shot only. Meanwhile the badge
+        may re-enable the patterndisplay service whenever we lose
+        foreground (CANCEL minimise, a notification taking focus, an
+        OTA-update flow, etc.). Without re-inhibiting on re-entry we get
+        the system pattern animation flickering through our LED writes.
+
+        The base App.run discards render_update's return value, but the
+        scheduler returns True from it when the app has just regained
+        focus after a foreground-pop. We capture that and re-inhibit.
+        """
+        if time is None:
+            # Host environment: no time module, nothing to do.
+            return
+        last_time = time.ticks_ms()
+        while True:
+            cur_time = time.ticks_ms()
+            delta_ticks = time.ticks_diff(cur_time, last_time)
+            if self.update(delta_ticks) is not False:
+                regained_focus = await render_update()
+                if regained_focus:
+                    self._on_regained_focus()
+            else:
+                import asyncio as _asyncio
+                await _asyncio.sleep(0.05)
+            last_time = cur_time
+
+    def _on_regained_focus(self) -> None:
+        """Called when render_update reports a foreground-pop -> push.
+
+        Re-inhibits the patterndisplay service and clears any stale
+        envelope state so the ring starts dark instead of part-way
+        through an old envelope from before the minimise.
+        """
+        self._inhibit_patterns()
+        self._renderer.clear()
+
     def update(self, delta: float) -> None:
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
