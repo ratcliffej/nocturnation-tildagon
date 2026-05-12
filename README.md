@@ -34,24 +34,33 @@ The NocturNation manuals live in the [nocturnation-m5](https://github.com/ratcli
 
 ### Test on real hardware
 
-The repo mirrors the Tildagon's on-badge `/apps/<owner_appname>/` layout. Deploy is a wipe-and-copy cycle:
+The repo mirrors the Tildagon's on-badge `/apps/<owner_appname>/` layout. The wipe-and-copy deploy is wrapped in `deploy.sh`:
 
 ```sh
-# From the repo root, with the badge plugged in via USB.
+./deploy.sh
+```
 
-# 1. Remove any previous deployment. (Gotcha: mpremote cp -r src dest
-#    nests src INSIDE dest when dest already exists as a directory,
-#    producing apps/nocturnation/nocturnation/. Wiping first avoids it.)
-mpremote rm -r :apps/nocturnation
+That handles two mpremote gotchas: `cp -r src dest` nests src inside dest when dest already exists, and `rm -r` is not honoured recursively on some mpremote versions (errors with `OSError: 39` / `ENOTEMPTY` when `__pycache__/` is present). The script wipes via `mpremote exec` using a MicroPython recursive delete, then copies, then resets.
 
-# 2. Copy the app to the badge. The :apps/ destination (trailing slash)
-#    means "place nocturnation inside apps".
+After `deploy.sh` finishes, scroll to "NocturNation" in the badge launcher and tap to run. To inspect the badge filesystem without re-launching, run `./deploy.sh --no-reset` then `mpremote repl`.
+
+Equivalent manual sequence if you'd rather not use the script:
+
+```sh
+mpremote exec "
+import os
+def rmtree(p):
+    for e in os.ilistdir(p):
+        path = p + '/' + e[0]
+        if e[1] & 0x4000:
+            rmtree(path)
+        else:
+            os.remove(path)
+    os.rmdir(p)
+rmtree('/apps/nocturnation')
+"
 mpremote cp -r apps/nocturnation :apps/
-
-# 3. Reset the badge so the launcher discards the cached App class.
 mpremote reset
-
-# 4. Scroll to "NocturNation" in the launcher and tap to run.
 ```
 
 Verify what landed:
