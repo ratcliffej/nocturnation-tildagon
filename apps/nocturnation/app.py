@@ -16,10 +16,16 @@ Block 4 (shipped): the LCD pulse renderer arms a full-screen colour
 wash on each accepted dispatch; draw() paints it as the background
 beneath the UI text. Calm Mode disables LCD pulsing entirely.
 
-Block 5 (current): persistent settings (Calm Mode, group, channel) +
+Block 5 (shipped): persistent settings (Calm Mode, group, channel) +
 in-app menu via app_components.Menu. CONFIRM opens the menu; CANCEL
 backs out. Class + group filter on inbound LIGHT_COMMAND per protocol
 manual section 4.2 and Epic 5 Q1 / Q2.
+
+Block 6 (current): NO SIGNAL indication after a 3 s frame gap
+(protocol manual section 6.2); backgrounded operation per
+architecture spec section 7.3 (perimeter LEDs continue, LCD reverts
+to foreground app); MUSIC_EVENT DROP / BREAKDOWN synthesise
+local fires.
 
 Reference: https://tildagon.badge.emfcamp.org/tildagon-apps/development/
 Block plan: nocturnation-m5 docs/epics/epic-05-tildagon.md
@@ -80,10 +86,12 @@ except ImportError:
 # Host-side pytest never imports this file (only the nocturnation/
 # package below), so the dot prefix is invisible to the test suite.
 from .nocturnation.channel_scan import ChannelScanner
+from .nocturnation.music_event import synthesize_for as synthesize_music_event
 from .nocturnation.protocol import DedupRing, MessageType
 from .nocturnation.receive import process_frame
 from .nocturnation.render import LcdRenderer, PerimeterRenderer
 from .nocturnation.settings import Settings
+from .nocturnation.signal_tracker import SignalTracker
 
 
 # Cycle order for the settings menu.
@@ -131,6 +139,10 @@ class NocturNationApp(app.App):
         # In-app settings menu state.
         self._settings_open = False
         self._settings_menu = None
+        # Block 6: master-liveness tracker. Records every accepted
+        # frame; the draw loop overlays NO SIGNAL when the gap exceeds
+        # 3 s per protocol manual section 6.2.
+        self._signal_tracker = SignalTracker()
         # Bring the perimeter LEDs out of low-power before the first
         # tick. Harmless if tildagonos is None (host environment).
         if tildagonos is not None:
@@ -167,33 +179,35 @@ class NocturNationApp(app.App):
     def _on_foreground_push(self, event) -> None:
         """Scheduler is bringing this app to the foreground.
 
-        Re-acquire the perimeter LED ring from the badge's patterndisplay
-        service (which may have been re-enabled while we were minimised)
-        and clear any stale envelope state so the ring starts dark.
+        Per Block 6 spec the perimeter ring continued animating in the
+        background, so the renderer state is fresh - we keep it. The
+        LCD renderer's envelope was being dispatched but not drawn;
+        clear it so the wash starts cleanly with the next fire rather
+        than mid-envelope. Re-inhibit patterns defensively in case
+        another app emitted PatternEnable while we were away.
         """
         if event.app is not self:
             return
         self._is_foreground = True
         self._inhibit_patterns()
-        self._renderer.clear()
         self._lcd_renderer.clear()
-        print("[nocturnation] foreground push - resuming receive + LEDs")
+        print("[nocturnation] foreground push - LCD wash resumed")
 
     def _on_foreground_pop(self, event) -> None:
         """Scheduler is taking this app out of the foreground.
 
-        Release the perimeter LED ring back to the badge's patterndisplay
-        service. The async background_task keeps running (per Tildagon OS
-        contract) but our _receive_loop checks _is_foreground and stops
-        processing inbound frames until we are foregrounded again.
+        Per Block 6 spec the perimeter LEDs continue animating while
+        the app is backgrounded (architecture spec section 7.3). We
+        keep PatternDisable in effect (so the badge's patterndisplay
+        service doesn't fight us for the LED ring) and let the
+        receive + render loop keep running. The LCD goes idle
+        automatically - the OS routes draw() calls to the new
+        foreground app.
         """
         if event.app is not self:
             return
         self._is_foreground = False
-        self._resume_patterns()
-        self._renderer.clear()
-        self._lcd_renderer.clear()
-        print("[nocturnation] foreground pop - paused receive, released LEDs")
+        print("[nocturnation] foreground pop - LEDs continue in background")
 
     def _inhibit_patterns(self) -> None:
         if eventbus is None or PatternDisable is None:
@@ -221,14 +235,18 @@ class NocturNationApp(app.App):
 
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
-            self._resume_patterns()
+            # Block 6: do NOT release patterns - the perimeter LEDs
+            # keep animating in the background per architecture spec
+            # section 7.3. The patterndisplay service stays inhibited
+            # for the lifetime of the app instance.
             self.minimise()
             return
         if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
             self.button_states.clear()
             self._open_settings()
             return
-        self._render_perimeter()
+        # Perimeter LED ticking happens in the background_task receive
+        # loop (Block 6) so it runs whether we're foregrounded or not.
 
     def _open_settings(self) -> None:
         """Open the in-app settings menu (Block 5).
@@ -393,7 +411,17 @@ class NocturNationApp(app.App):
         )
         ctx.move_to(0, 20).text("frames: %d" % self._frame_count)
 
-        if (
+        # NO SIGNAL overlay (Block 6) takes precedence over the RGB
+        # triplet line: it answers the more important "is the master
+        # alive?" question. Shown in dimmed red so it doesn't compete
+        # with the brand mark at the top.
+        if time is not None and self._signal_tracker.is_lost(time.ticks_ms()):
+            ctx.rgb(0.6, 0.1, 0.1)
+            ctx.font_size = 18
+            ctx.move_to(0, 50).text("NO SIGNAL")
+            ctx.rgb(1, 1, 1)
+            ctx.font_size = 12
+        elif (
             self._last_frame is not None
             and self._last_frame.message_type == MessageType.LIGHT_COMMAND
         ):
@@ -498,18 +526,15 @@ class NocturNationApp(app.App):
         return True
 
     async def _receive_loop(self) -> None:
-        # Poll cadence: fast when foreground (responsive to incoming
-        # LIGHT_COMMAND), idle when backgrounded (we are not driving
-        # LEDs anyway, so we conserve CPU).
-        poll_ms_fg = 5
-        poll_ms_bg = 100
+        # Block 6: perimeter LEDs continue animating when the app is
+        # backgrounded (architecture spec section 7.3). We tick the
+        # renderer from this loop rather than from update() so the
+        # cadence is the same in both states. update() is foreground-
+        # only by Tildagon contract; this loop runs always.
+        poll_ms = 5
+        render_interval_ms = 50  # ~20 Hz perimeter tick
+        last_render_ms = 0 if time is None else time.ticks_ms()
         while True:
-            if not self._is_foreground:
-                # Drain the espnow buffer so it does not fill while
-                # we're backgrounded, but do not act on the contents.
-                self._try_recv()
-                await asyncio.sleep_ms(poll_ms_bg)
-                continue
             buf = self._try_recv()
             if buf is not None:
                 frame = process_frame(buf, self._dedup)
@@ -526,7 +551,15 @@ class NocturNationApp(app.App):
                                 frame.target_group,
                             )
                         )
-            await asyncio.sleep_ms(poll_ms_fg)
+            # Tick the perimeter at ~20 Hz independent of foreground
+            # state. The settings menu, if open, skips this tick (the
+            # menu owns the screen visually and our LEDs stay dark).
+            if time is not None and not self._settings_open:
+                now = time.ticks_ms()
+                if now - last_render_ms >= render_interval_ms:
+                    self._render_perimeter()
+                    last_render_ms = now
+            await asyncio.sleep_ms(poll_ms)
 
     def _try_recv(self):
         """Non-blocking ESP-NOW recv. Returns the message bytes or None."""
@@ -545,10 +578,37 @@ class NocturNationApp(app.App):
     def _observe_frame(self, frame) -> None:
         self._frame_count += 1
         self._last_frame = frame
-        # Non-light-command frames just bump the counter (they reach
-        # us so the radio is alive, but there's nothing to render).
-        if frame.message_type != MessageType.LIGHT_COMMAND or time is None:
+        # Every accepted frame counts as master-alive proof for the
+        # NO SIGNAL detector, regardless of message type. Heartbeats
+        # and MUSIC_EVENTs are just as good as LIGHT_COMMANDs here.
+        if time is not None:
+            self._signal_tracker.record_frame(time.ticks_ms())
+
+        if time is None:
             return
+
+        now_ms = time.ticks_ms()
+
+        # MUSIC_EVENT (Block 6): synthesise a local high-level fire to
+        # give the operator song-structure feedback beyond raw beats.
+        # The synthesised Frame is local-only (not on the wire); it is
+        # shaped as a LIGHT_COMMAND so the renderers can dispatch it.
+        if frame.message_type == MessageType.MUSIC_EVENT:
+            if frame.payload and len(frame.payload) >= 1:
+                synth = synthesize_music_event(frame.payload[0])
+                if synth is not None:
+                    self._renderer.dispatch(synth, now_ms)
+                    self._lcd_renderer.dispatch(synth, now_ms)
+                    print(
+                        "[nocturnation] MUSIC_EVENT type=%d - synthetic fire"
+                        % frame.payload[0]
+                    )
+            return
+
+        # Non-light-command frames otherwise just bump the counter.
+        if frame.message_type != MessageType.LIGHT_COMMAND:
+            return
+
         # Group filter per protocol manual section 4.2: target_group == 0
         # is broadcast (every receiver fires); otherwise must match the
         # operator-configured group exactly. A device whose own group is
@@ -560,7 +620,6 @@ class NocturNationApp(app.App):
         # arm the perimeter (wristband analogue); Screen-class arm the
         # LCD; MultiLedScreen arms both; All targets both. Other
         # classes (reserved) are silently dropped.
-        now_ms = time.ticks_ms()
         cls = frame.target_class
         if cls in _PERIMETER_CLASSES:
             self._renderer.dispatch(frame, now_ms)

@@ -14,8 +14,9 @@ Epic 5 (Tildagon receiver app):
 - **Block 2 (ESP-NOW receive)**: shipped. Frame parser, deduplication ring, hop-count enforcement, and channel auto-scan state machine all landed with host-side parity tests against protocol manual annex C. The async `background_task` wires these together for ESP-NOW receive on real hardware. Bench-verified 2026-05-12: real LIGHT_COMMAND frames from a master Stick on channel 11 parse correctly and increment the on-screen counter. Channel auto-scan-across-channels couldn't be implemented as written (the badge's networking layer rejects a second `wlan.config(channel=...)` call); tracked as Epic 5 open design question Q6 for Block 5.
 - **Block 3 (perimeter LED rendering)**: shipped. `PerimeterRenderer` arms per-LED envelopes from each accepted LIGHT_COMMAND (chance-gated independently per LED, then ramped through attack/sustain/release per the protocol's Time and Chance enums). Frequency cap and 50 % brightness cap enforce Calm Mode default-on per architecture spec section 15. The app's `update()` tick advances envelopes and commits via `tildagonos.leds.write()`. Bench-verified 2026-05-12: master kicks fire the ring in sync, no flicker (after emitting `PatternDisable` to suppress the badge's system patterndisplay service).
 - **Block 4 (LCD pulse rendering)**: shipped at the protocol layer. `LcdRenderer` renders an accepted LIGHT_COMMAND as a soft full-screen colour wash on the round 240×240 LCD. Calm Mode default-on disables LCD pulsing entirely per architecture spec section 15.3 ("screen flashing disabled"); Full mode arms an envelope at peak brightness capped at 60 % (an uncapped full-screen wash at face distance is uncomfortably bright). Frequency cap matches the perimeter renderer's Full mode (4 Hz). Bench verification of the wash needs Block 5's settings UI to flip into Full mode.
-- **Block 5 (configuration UI)**: shipped at the protocol layer. Persistent `Settings` (Calm Mode toggle, group 0..3 cycle, channel auto/1/11 cycle) stored as JSON at `/nocturnation_settings.json` outside the app dir so deploys don't clobber operator preferences. In-app menu via `app_components.Menu`: CONFIRM opens, CANCEL backs out, selecting a line cycles its value. Class + group filter on inbound LIGHT_COMMAND per protocol manual section 4.2 and Epic 5 Q1/Q2: target_class 0 (All) routes to both surfaces; 1 (Light) → perimeter only; 2 (Screen) → LCD only; 3 (MultiLedScreen) → both. 19 host-side tests cover settings model coercion, JSON round-trip, and corrupt-file fallback. Hardware verification (Calm Mode toggle flips LCD wash + perimeter brightness, group filter accepts/rejects correctly, settings survive reboot) is the remaining Block 5 acceptance.
-- **Block 6-7**: not started. See the [Epic 5 plan](https://github.com/ratcliffej/nocturnation-m5/blob/main/docs/epics/epic-05-tildagon.md) for the full block plan.
+- **Block 5 (configuration UI)**: shipped at the protocol layer. Persistent `Settings` (Calm Mode toggle, group 0..3 cycle, channel auto/1/11 cycle) stored as JSON at `/nocturnation_settings.json` outside the app dir so deploys don't clobber operator preferences. In-app menu via `app_components.Menu`: CONFIRM (button C) opens, CANCEL (button F) backs out, selecting a line cycles its value. Class + group filter on inbound LIGHT_COMMAND per protocol manual section 4.2 and Epic 5 Q1/Q2.
+- **Block 6 (NO SIGNAL + backgrounded + MUSIC_EVENT)**: shipped at the protocol layer. `SignalTracker` records every accepted frame's timestamp; the draw loop overlays NO SIGNAL after a 3 s gap per protocol manual section 6.2 (initial state on launch counts as lost until the first frame arrives). MUSIC_EVENT frames (message_type 0x06) trigger local synthetic fires: DROP → bright whiteout, BREAKDOWN → slow dim blue (Build is reserved). Backgrounded operation per architecture spec section 7.3 - the perimeter LED ring keeps animating when the operator switches to another badge app (the receive + render loop runs in `background_task` regardless of foreground state); only the LCD goes idle (the OS routes draw() calls to whichever app is foregrounded). 21 new host-side tests; total 120/120 passing.
+- **Block 7**: not started. See the [Epic 5 plan](https://github.com/ratcliffej/nocturnation-m5/blob/main/docs/epics/epic-05-tildagon.md) for the full block plan.
 
 Both repositories are currently private; access is granted on request.
 
@@ -113,6 +114,8 @@ apps/                                  Mirrors the badge's /apps/ filesystem
         perimeter.py                   Twelve-LED perimeter renderer (Block 3)
         lcd.py                         Round-LCD pulse renderer (Block 4)
       settings.py                      Persistent settings model (Block 5)
+      signal_tracker.py                NO SIGNAL gap detector (Block 6)
+      music_event.py                   MUSIC_EVENT synthetic-fire factory (Block 6)
 tests/                                 Host-side pytest suite (not deployed to badge)
   test_frame.py                        Header + payload parser tests (Block 1/2)
   test_dedup.py                        Dedup ring tests (Block 2)
@@ -121,6 +124,8 @@ tests/                                 Host-side pytest suite (not deployed to b
   test_perimeter.py                    Perimeter LED renderer tests (Block 3)
   test_lcd.py                          LCD pulse renderer tests (Block 4)
   test_settings.py                     Settings model tests (Block 5)
+  test_signal_tracker.py               NO SIGNAL detector tests (Block 6)
+  test_music_event.py                  MUSIC_EVENT synthesis tests (Block 6)
 pyproject.toml                         Dev environment + pytest config
 ```
 
