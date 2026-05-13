@@ -80,7 +80,7 @@ settings model (coercion, JSON round-trip, corrupt-file fallback),
 signal tracker, and MUSIC_EVENT synthesis. All passing on CPython
 3.10+. Protocol modules are CPython + MicroPython compatible.
 
-### Hardware bench-verified
+### Hardware bench-verified (2026-05-13)
 
 On a Tildagon paired with an M5 StickC master at EMF 2024 hardware,
 channel 11:
@@ -92,9 +92,17 @@ channel 11:
   `PatternDisable` fix; no flicker.
 - Calm Mode bench-confirmed to gate Rainbow test fires from the master
   to discrete 2 Hz steps (correct behaviour per §15.1).
-
-Pending hardware verification for Block 7 release-readiness:
-- Battery drain measurement (idle vs receiver-app over 2 h).
-- DROP / BREAKDOWN MUSIC_EVENT verification against a track with a
-  detectable drop on the M5 side.
-- M5↔Tildagon interop session with multiple bracelets present.
+- Block 6 NO SIGNAL: powering off the master mid-show surfaces the
+  red NO SIGNAL overlay within 3 s; powering it back on clears the
+  overlay and resumes rendering.
+- Block 6 backgrounded behaviour: minimising the app and switching
+  to another badge app keeps the perimeter ring animating; returning
+  resumes cleanly without a re-init flicker.
+- Block 6 MUSIC_EVENT: DROP fires the bright whiteout; BREAKDOWN
+  fires the slow blue fade.
+- Block 7 M5↔Tildagon interop session: master Stick + Tildagon in
+  radio range with DynamicShow running against real music; Tildagon
+  perimeter ring visibly reacts in coordination.
+- Block 7 battery drain: idle vs receiver-app over a 2 h window
+  characterised; receiver-app drain is operator-acceptable for EMF
+  show-night duty.
