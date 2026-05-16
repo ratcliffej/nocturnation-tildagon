@@ -1,6 +1,6 @@
-"""Master-liveness tracker per protocol manual section 6.2.
+"""Director-liveness tracker per protocol manual section 6.2.
 
-A receiver considers the master alive whenever any frame has arrived
+A receiver considers the Director alive whenever any frame has arrived
 within the last kNoSignalGapMs milliseconds. The SignalTracker holds
 the most-recent-frame timestamp and reports lost vs alive based on the
 current clock value. The caller is responsible for the clock source
@@ -8,7 +8,7 @@ current clock value. The caller is responsible for the clock source
 """
 
 # Protocol manual section 6.2: three missed heartbeats at 1 Hz, or
-# three seconds with no other traffic, signal master loss. Matches the
+# three seconds with no other traffic, signal Director loss. Matches the
 # M5 StickC's kNoSignalGapMs constant.
 NO_SIGNAL_GAP_MS = 3000
 
@@ -18,7 +18,7 @@ class SignalTracker:
     answers ``is_lost(now_ms)`` based on the configurable gap.
 
     Initial state (no frame ever seen) reports lost: this is the
-    truthful state on app launch before any master traffic arrives.
+    truthful state on app launch before any Director traffic arrives.
     """
 
     __slots__ = ("_last_frame_ms", "_gap_ms")
@@ -30,7 +30,7 @@ class SignalTracker:
     def record_frame(self, now_ms):
         """Note that a frame arrived. Call from every accepted frame
         (LIGHT_COMMAND, HEARTBEAT, MUSIC_EVENT alike - all count as
-        proof the master is alive)."""
+        proof the Director is alive)."""
         self._last_frame_ms = now_ms
 
     def is_lost(self, now_ms):

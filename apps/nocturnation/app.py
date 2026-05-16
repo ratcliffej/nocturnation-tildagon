@@ -125,7 +125,7 @@ class NocturNationApp(app.App):
         # Last channel for which wlan.config(channel=N) succeeded. None
         # if we never managed to set the radio channel at all. Shown on
         # the LCD so the operator knows which channel to align the
-        # master Stick to when auto-scan is disabled.
+        # Director Stick to when auto-scan is disabled.
         self._receive_channel = None
         # Load persisted settings before constructing renderers so the
         # initial Calm Mode state matches what the operator last chose.
@@ -139,7 +139,7 @@ class NocturNationApp(app.App):
         # In-app settings menu state.
         self._settings_open = False
         self._settings_menu = None
-        # Block 6: master-liveness tracker. Records every accepted
+        # Block 6: Director-liveness tracker. Records every accepted
         # frame; the draw loop overlays NO SIGNAL when the gap exceeds
         # 3 s per protocol manual section 6.2.
         self._signal_tracker = SignalTracker()
@@ -412,7 +412,7 @@ class NocturNationApp(app.App):
         ctx.move_to(0, 20).text("frames: %d" % self._frame_count)
 
         # NO SIGNAL overlay (Block 6) takes precedence over the RGB
-        # triplet line: it answers the more important "is the master
+        # triplet line: it answers the more important "is the Director
         # alive?" question. Shown in dimmed red so it doesn't compete
         # with the brand mark at the top.
         if time is not None and self._signal_tracker.is_lost(time.ticks_ms()):
@@ -439,7 +439,7 @@ class NocturNationApp(app.App):
     async def background_task(self) -> None:
         """ESP-NOW receive loop: auto-scan, lock, then receive forever.
 
-        Per protocol manual section 5.3 the slave tries channel 11 first
+        Per protocol manual section 5.3 the Lume tries channel 11 first
         (suggested show channel) then channel 1 (hobby), each for ~2 s,
         repeating until a valid frame arrives. After lock, receive runs
         on the locked channel until the app is killed.
@@ -447,7 +447,7 @@ class NocturNationApp(app.App):
         Fallback: if the badge's networking layer rejects channel
         changes on STA_IF (observed: RuntimeError 0xffffffff), we skip
         auto-scan and listen on whichever channel the radio is already
-        on. The operator must align master + Tildagon channels manually
+        on. The operator must align Director + Tildagon channels manually
         in that case.
         """
         if espnow is None or network is None or asyncio is None:
@@ -468,7 +468,7 @@ class NocturNationApp(app.App):
                 self._status = "ch %d (no-scan)" % self._receive_channel
                 print(
                     "[nocturnation] auto-scan unavailable; listening on channel %d "
-                    "(align master Stick to this channel)" % self._receive_channel
+                    "(align Director Stick to this channel)" % self._receive_channel
                 )
             else:
                 self._status = "no-scan"
@@ -578,7 +578,7 @@ class NocturNationApp(app.App):
     def _observe_frame(self, frame) -> None:
         self._frame_count += 1
         self._last_frame = frame
-        # Every accepted frame counts as master-alive proof for the
+        # Every accepted frame counts as Director-alive proof for the
         # NO SIGNAL detector, regardless of message type. Heartbeats
         # and MUSIC_EVENTs are just as good as LIGHT_COMMANDs here.
         if time is not None:

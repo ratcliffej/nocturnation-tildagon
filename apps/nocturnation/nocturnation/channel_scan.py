@@ -4,7 +4,7 @@ Implements the scan-order and lock semantics from protocol manual section
 5.3. Channel 11 (show) is tried first, then channel 1 (hobby), each for
 ``listen_ms`` milliseconds; the first channel that produces a valid
 NocturNation frame is locked and receive proceeds there. Channel 6 is
-NOT auto-scanned per the protocol - a slave on channel 6 must be locked
+NOT auto-scanned per the protocol - a Lume on channel 6 must be locked
 explicitly.
 
 This module is the state machine only. Actual radio operations (set
@@ -89,7 +89,7 @@ class ChannelScanner:
     def unlock(self):
         """Drop the lock and resume scanning from the head of scan_order.
 
-        Called on a NO-SIGNAL timeout (master traffic absent for > 3 s
+        Called on a NO-SIGNAL timeout (Director traffic absent for > 3 s
         per protocol manual section 6.2) when the operator originally
         wanted auto-scan. A locked-by-config channel (set explicitly via
         operator preference rather than auto-scan) should not be unlocked

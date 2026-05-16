@@ -1,6 +1,6 @@
 """Sixteen-deep dedup ring on (source_id, sequence_number).
 
-Receivers MUST deduplicate per protocol manual section 2.3. The master
+Receivers MUST deduplicate per protocol manual section 2.3. The Director
 transmits every frame three times in quick succession with the same
 sequence number; the ring absorbs the redundancy so a frame is rendered
 exactly once.
@@ -20,7 +20,7 @@ class DedupRing:
 
     Capacity is the number of distinct pairs retained; the oldest entry
     is evicted when capacity is exceeded. The default of 16 absorbs the
-    master's 3x redundancy comfortably even when several sources are
+    Director's 3x redundancy comfortably even when several sources are
     interleaving fires.
     """
 

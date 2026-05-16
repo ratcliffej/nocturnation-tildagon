@@ -3,8 +3,8 @@
 MUSIC_EVENT frames (protocol message_type 0x06) carry a one-byte event
 type per protocol manual section 3.3.7:
   0  Unknown
-  1  Drop       - master detected a beat drop
-  2  Breakdown  - master detected a breakdown
+  1  Drop       - Director detected a beat drop
+  2  Breakdown  - Director detected a breakdown
   3  Build      - reserved; not currently emitted
 
 The Tildagon turns these into synthetic LIGHT_COMMAND-shaped objects
