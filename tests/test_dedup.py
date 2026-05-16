@@ -1,6 +1,6 @@
 """Dedup ring tests.
 
-The ring exists to absorb the master's 3x redundant transmission per
+The ring exists to absorb the Director's 3x redundant transmission per
 protocol manual section 2.3 (every frame goes out three times with the
 same sequence number).
 """
@@ -19,7 +19,7 @@ class TestFreshness:
         assert d.seen(1, 42) is True
 
     def test_three_consecutive_calls_match_master_3x_redundancy(self):
-        # Master sends the same (source_id, seq) three times.
+        # Director sends the same (source_id, seq) three times.
         d = DedupRing()
         assert d.seen(1, 100) is False  # first copy: fresh
         assert d.seen(1, 100) is True   # second copy: drop
