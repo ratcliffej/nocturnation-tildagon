@@ -14,7 +14,7 @@ category = "Music"
 author = "ratcliffej"
 license = "MIT"
 url = "https://github.com/ratcliffej/nocturnation-tildagon"
-description = "Music-reactive crowd lighting. Pulses badge LEDs and screen in time with a master Stick over ESP-NOW."
+description = "Music-reactive crowd lighting. Pulses badge LEDs and screen in time with a Director Stick over ESP-NOW."
 version = 1
 
 # Fallback category for older firmware that pre-dates the Music
