@@ -10,8 +10,11 @@ from nocturnation.receive import process_frame, MAX_HOP_COUNT
 
 
 # Manual annex C.1 reference vector. Modified per-test with helpers.
+# Spec v2: 2-byte "NN" magic prefix + protocol_version 0x02.
 LIGHT_COMMAND_VECTOR = bytes([
-    0x01,  # protocol_version
+    0x4E,  # magic byte 0 ('N')
+    0x4E,  # magic byte 1 ('N')
+    0x02,  # protocol_version
     0x01,  # source_id
     0x2A,  # sequence (42)
     0x00,  # hop_count
@@ -31,9 +34,9 @@ LIGHT_COMMAND_VECTOR = bytes([
 
 def make_frame(seq=42, hop=0, source=1):
     b = bytearray(LIGHT_COMMAND_VECTOR)
-    b[1] = source
-    b[2] = seq
-    b[3] = hop
+    b[3] = source           # offsets shifted +2 by the magic prefix
+    b[4] = seq
+    b[5] = hop
     return bytes(b)
 
 

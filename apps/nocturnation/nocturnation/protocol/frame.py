@@ -7,6 +7,8 @@ payload bytes so receive-side handlers can deal with them as they land.
 
 from .constants import (
     HEADER_SIZE,
+    MAGIC_0,
+    MAGIC_1,
     MAX_FRAME_SIZE,
     PROTOCOL_VERSION,
     PAYLOAD_LENGTHS,
@@ -82,13 +84,20 @@ def parse_frame(buf):
     if len(buf) > MAX_FRAME_SIZE:
         raise FrameError("frame longer than max_frame_size")
 
+    # Magic check first - cheapest rejection path for non-NocturNation
+    # ESP-NOW chatter sharing the channel. Bytes 0-1 must be "NN" or the
+    # frame is from a different sender entirely and we drop without
+    # touching any other field.
+    if buf[0] != MAGIC_0 or buf[1] != MAGIC_1:
+        raise FrameError("not a NocturNation frame (magic mismatch)")
+
     f = Frame()
-    f.protocol_version = buf[0]
-    f.source_id = buf[1]
-    f.sequence_number = buf[2]
-    f.hop_count = buf[3]
-    f.message_type = buf[4]
-    f.payload_len = buf[5]
+    f.protocol_version = buf[2]
+    f.source_id = buf[3]
+    f.sequence_number = buf[4]
+    f.hop_count = buf[5]
+    f.message_type = buf[6]
+    f.payload_len = buf[7]
 
     if f.protocol_version != PROTOCOL_VERSION:
         raise FrameError("unrecognised protocol version")

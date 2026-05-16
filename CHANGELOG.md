@@ -4,6 +4,29 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-05-16 — Protocol v2: magic prefix for ESP-NOW disambiguation
+
+Wire-incompatible bump from protocol version `0x01` to `0x02`.
+
+- Inbound frames now require a two-byte magic prefix `0x4E 0x4E`
+  (ASCII "NN") at offset 0..1 before any other validation;
+  `parse_frame` rejects with `FrameError` if absent.
+- `HEADER_SIZE` grew from 6 to 8; all other field offsets shift +2.
+  Constants `MAGIC_0`, `MAGIC_1` added to the protocol module.
+
+Motivation: NocturNation shares the 2.4 GHz band with anything else
+running ESP-NOW vendor action frames on the same channel - a real
+concern at event-density deployments like EMF Camp. The previous
+`protocol_version`-only check passed roughly one in a few million
+random ESP-NOW frames as if they were NocturNation, which read on
+the badge as occasional stray flashes in busy RF environments. The
+two-byte magic drops the false-positive rate by three orders of
+magnitude.
+
+v1 and v2 receivers cannot interoperate. Tildagon + M5 Director
+firmware must be on the same version. The companion change on the
+M5 firmware side is in `ratcliffej/nocturnation-m5`.
+
 ## 2026-05-16 — Spec v0.29 protocol trim + Lume power optimisation
 
 Aligns the Tildagon receiver with the spec v0.29 §4.3 trimmed

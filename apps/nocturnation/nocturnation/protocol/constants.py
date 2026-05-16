@@ -4,9 +4,18 @@ Implemented as plain integer constants rather than IntEnum so the module runs
 unchanged under MicroPython, which doesn't ship enum in its trimmed stdlib.
 """
 
-PROTOCOL_VERSION = 0x01
+# 2-byte magic prefix that discriminates NocturNation traffic from other
+# ESP-NOW users sharing the channel (a real concern at events like EMF).
+# Receivers MUST reject any frame whose first two bytes are not "NN"
+# before doing any further header validation.
+MAGIC_0 = 0x4E  # 'N'
+MAGIC_1 = 0x4E  # 'N'
 
-HEADER_SIZE = 6
+PROTOCOL_VERSION = 0x02  # bumped from 0x01 for the magic-prefix wire change
+
+# 2 magic + 1 version + 5 metadata fields (source_id, sequence_number,
+# hop_count, message_type, payload_len).
+HEADER_SIZE = 8
 MAX_FRAME_SIZE = 32
 MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE - HEADER_SIZE
 
