@@ -28,10 +28,13 @@ class TestAdvance:
         assert s.advance() == 1
         assert s.current_channel == 1
 
-    def test_advance_wraps_back_to_11(self):
+    def test_advance_rotates_through_full_order(self):
+        # SCAN_ORDER = (11, 1, 6). Each advance moves to the next; the
+        # third wraps back to 11.
         s = ChannelScanner()
-        s.advance()  # -> 1
-        s.advance()  # wraps -> 11
+        assert s.advance() == 1
+        assert s.advance() == 6
+        assert s.advance() == 11   # wrapped
         assert s.current_channel == 11
 
     def test_advance_after_lock_raises(self):
@@ -58,10 +61,12 @@ class TestLock:
         assert s.current_channel == 11
 
     def test_lock_rejects_channel_not_in_scan_order(self):
-        # Channel 6 is not in SCAN_ORDER per protocol manual section 5.3.
+        # Channel 3 (or any non-{1, 6, 11}) is not in SCAN_ORDER per
+        # protocol manual section 5.3. Channels 11, 1, 6 are the only
+        # valid auto-scan targets.
         s = ChannelScanner()
         with pytest.raises(ValueError):
-            s.lock(6)
+            s.lock(3)
 
 
 class TestUnlock:

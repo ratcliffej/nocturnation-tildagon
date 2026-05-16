@@ -4,6 +4,25 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-05-16 — Auto-scan now includes channel 6 (design intent)
+
+`SCAN_ORDER` in `nocturnation.channel_scan` extended from `(11, 1)`
+to `(11, 1, 6)` per spec v0.29 §5.3. Channel 6 was previously
+operator-locked-only; it now appears as the third (last-priority)
+auto-scan target so a default-config Lume can find a Director on
+any of the three configured channels without operator intervention.
+
+**Tildagon-specific caveat:** per Epic 5 Q6 the badge's STA_IF
+networking layer only honours the first `wlan.config(channel=N)`
+call after bringing the radio up; subsequent calls raise
+`RuntimeError 0xffffffff`. So the runtime is single-channel in
+practice - the Tildagon scans the first channel, falls back to it
+on the second call's failure, and asks the operator to align the
+Director Stick manually. The 3-channel `SCAN_ORDER` is the design
+intent for when Q6 is resolved; the immediate code change is a
+constant update + test update only, no behavioural change on
+hardware.
+
 ## 2026-05-16 — Protocol v2: magic prefix for ESP-NOW disambiguation
 
 Wire-incompatible bump from protocol version `0x01` to `0x02`.

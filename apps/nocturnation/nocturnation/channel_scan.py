@@ -1,23 +1,32 @@
 """Channel auto-scan state machine.
 
 Implements the scan-order and lock semantics from protocol manual section
-5.3. Channel 11 (show) is tried first, then channel 1 (hobby), each for
-``listen_ms`` milliseconds; the first channel that produces a valid
-NocturNation frame is locked and receive proceeds there. Channel 6 is
-NOT auto-scanned per the protocol - a Lume on channel 6 must be locked
-explicitly.
+5.3. Channel 11 (show) is tried first, then channel 1 (hobby), then
+channel 6 (advanced operator override), each for ``listen_ms``
+milliseconds; the first channel that produces a valid NocturNation
+frame is locked and receive proceeds there.
 
 This module is the state machine only. Actual radio operations (set
 channel, attempt receive) are caller responsibilities and differ between
 real hardware, the Tildagon simulator, and host tests.
+
+Tildagon-specific caveat: per Epic 5 Q6 the badge's STA_IF networking
+layer only honours the first ``wlan.config(channel=N)`` call after
+bringing the radio up; subsequent calls raise
+``RuntimeError 0xffffffff``. So in practice the Tildagon scans the
+first channel, falls back to it on the second call's failure, and
+asks the operator to align the Director Stick manually. The scan-
+order list below is the design intent; the runtime is currently
+single-channel pending a fix to Q6.
 """
 
 # Default listen window per channel during scan.
 DEFAULT_LISTEN_MS = 2000
 
 # Channel priority order. Channel 11 first because it is the suggested
-# show channel and presumed higher priority.
-SCAN_ORDER = (11, 1)
+# show channel and presumed higher priority; channel 6 third because it
+# is the advanced operator override and least likely to carry traffic.
+SCAN_ORDER = (11, 1, 6)
 
 
 class ChannelScanner:
