@@ -20,13 +20,13 @@ safety constraints from architecture spec §15.
 ### Block 2: ESP-NOW receive
 
 - Sixteen-deep dedup ring on `(source_id, sequence_number)` per
-  protocol manual §2.3 (absorbs the master's 3× redundant TX).
+  protocol manual §2.3 (absorbs the Director's 3× redundant TX).
 - `hop_count > 3` drop per §2.3.
 - Channel auto-scan state machine per §5.3 (channel 11 first, then 1).
   Known limitation captured as Epic 5 Q6: `wlan.config(channel=N)`
   rejects a second channel-change attempt with `RuntimeError 0xffffffff`
   on STA_IF; the app falls back to receiving on the first channel that
-  succeeded and tells the operator to align the master Stick to it
+  succeeded and tells the operator to align the Director Stick to it
   manually.
 
 ### Block 3: Perimeter LED rendering
@@ -62,7 +62,7 @@ safety constraints from architecture spec §15.
 
 - `SignalTracker` overlays `NO SIGNAL` in red after a 3 s frame gap per
   protocol manual §6.2. Initial state counts as lost until the first
-  master frame arrives.
+  Director frame arrives.
 - Perimeter LED tick moved into `background_task` so the ring keeps
   animating when the operator switches to another badge app
   (architecture spec §7.3). LCD goes idle automatically when
@@ -82,17 +82,17 @@ signal tracker, and MUSIC_EVENT synthesis. All passing on CPython
 
 ### Hardware bench-verified (2026-05-13)
 
-On a Tildagon paired with an M5 StickC master at EMF 2024 hardware,
+On a Tildagon paired with an M5 StickC Director at EMF 2024 hardware,
 channel 11:
 
 - Block 1 hello-world app loads from the launcher.
-- Block 2 ESP-NOW receive: master kicks increment the frame counter
+- Block 2 ESP-NOW receive: Director kicks increment the frame counter
   and log the RGB triplet to serial.
-- Block 3 perimeter ring pulses in sync with master beats after the
+- Block 3 perimeter ring pulses in sync with Director beats after the
   `PatternDisable` fix; no flicker.
-- Calm Mode bench-confirmed to gate Rainbow test fires from the master
+- Calm Mode bench-confirmed to gate Rainbow test fires from the Director
   to discrete 2 Hz steps (correct behaviour per §15.1).
-- Block 6 NO SIGNAL: powering off the master mid-show surfaces the
+- Block 6 NO SIGNAL: powering off the Director mid-show surfaces the
   red NO SIGNAL overlay within 3 s; powering it back on clears the
   overlay and resumes rendering.
 - Block 6 backgrounded behaviour: minimising the app and switching
@@ -100,7 +100,7 @@ channel 11:
   resumes cleanly without a re-init flicker.
 - Block 6 MUSIC_EVENT: DROP fires the bright whiteout; BREAKDOWN
   fires the slow blue fade.
-- Block 7 M5↔Tildagon interop session: master Stick + Tildagon in
+- Block 7 M5↔Tildagon interop session: Director Stick + Tildagon in
   radio range with DynamicShow running against real music; Tildagon
   perimeter ring visibly reacts in coordination.
 - Block 7 battery drain: idle vs receiver-app over a 2 h window
