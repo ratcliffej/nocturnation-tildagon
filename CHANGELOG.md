@@ -4,6 +4,60 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-05-16 — Spec v0.29 protocol trim + Lume power optimisation
+
+Aligns the Tildagon receiver with the spec v0.29 §4.3 trimmed
+protocol — two active wire-format message types only (HEARTBEAT
+and LIGHT_COMMAND) — and removes the local DROP / BREAKDOWN
+synthetic-fire rendering that consumed the now-deleted MUSIC_EVENT
+frames.
+
+Wire-format changes:
+- HEARTBEAT payload grows from 0 to 9 bytes: `tick: u32` +
+  `days_since_2026: u16` + `centiseconds_today: u24`, all
+  little-endian per spec v0.29 §3.3.1. Tier 0/1/2 Lumes consume
+  only `tick`; the Tildagon's `Frame` now exposes all three fields
+  on inbound HEARTBEAT frames for any future consumer.
+- BEAT_DETECTED (0x01), MODE_CHANGE (0x02), CLOCK_SYNC (0x04),
+  TIME_SYNC (0x05), MUSIC_EVENT (0x06) removed from the
+  `MessageType` enum and `PAYLOAD_LENGTHS` table. Numeric IDs are
+  RESERVED (do not reuse) per spec §4.3 rationale.
+- Inbound frames carrying a removed or unassigned `message_type`
+  are silently dropped by `parse_frame` raising `FrameError` (the
+  `PAYLOAD_LENGTHS` lookup returns `None`, but the protocol-version
+  / payload-length validation still runs and a reserved-ID frame
+  will typically fail the latter; either way `_receive_loop`
+  catches and discards).
+
+Receiver-side changes:
+- `nocturnation/music_event.py` deleted. The DROP whiteout and
+  BREAKDOWN blue fade are no longer rendered locally; the Director
+  no longer emits the MUSIC_EVENT frames that triggered them.
+- `app.py` `_observe_frame` simplified: HEARTBEAT and any
+  reserved-id frame just bump the frame counter for NO-SIGNAL
+  liveness; only LIGHT_COMMAND drives renderer dispatch.
+- `MusicEventType` enum removed from the protocol package's public
+  exports.
+
+Power optimisation:
+- The Tildagon's async receive loop already yields cleanly to the
+  scheduler via `await asyncio.sleep_ms(5)`; structurally equivalent
+  to the M5 firmware's new main-loop `delay(1)` yield. No code
+  change needed in this Epic.
+
+Tests:
+- `tests/test_music_event.py` deleted (13 tests for the removed
+  synthetic-fire module).
+- `tests/test_frame.py` HEARTBEAT vector rewritten for the new
+  9-byte payload; new `TestHeartbeatPayload::test_heartbeat_unpacks_tick_and_date_fields`
+  asserts the LE byte-order unpacking. MUSIC_EVENT vector / tests
+  removed. The remaining `test_wrong_payload_len_for_known_type_rejected`
+  now exercises HEARTBEAT (which has a payload to mis-claim
+  against; in the pre-trim world it was zero-payload, so the
+  test had to construct a different malformed frame).
+
+107 / 107 host-side pytest tests pass on CPython 3.10+.
+
 ## 2026-05-16 — Director / Lume vocabulary rename
 
 Comments, log strings, README, CHANGELOG, and the `tildagon.toml`

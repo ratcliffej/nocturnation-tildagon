@@ -21,11 +21,11 @@ in-app menu via app_components.Menu. CONFIRM opens the menu; CANCEL
 backs out. Class + group filter on inbound LIGHT_COMMAND per protocol
 manual section 4.2 and Epic 5 Q1 / Q2.
 
-Block 6 (current): NO SIGNAL indication after a 3 s frame gap
-(protocol manual section 6.2); backgrounded operation per
-architecture spec section 7.3 (perimeter LEDs continue, LCD reverts
-to foreground app); MUSIC_EVENT DROP / BREAKDOWN synthesise
-local fires.
+Block 6: NO SIGNAL indication after a 3 s frame gap (protocol
+manual section 6.2); backgrounded operation per architecture spec
+section 7.3 (perimeter LEDs continue, LCD reverts to foreground
+app). Local DROP / BREAKDOWN synthetic fires from MUSIC_EVENT were
+removed in the spec v0.29 protocol trim.
 
 Reference: https://tildagon.badge.emfcamp.org/tildagon-apps/development/
 Block plan: nocturnation-m5 docs/epics/epic-05-tildagon.md
@@ -86,7 +86,6 @@ except ImportError:
 # Host-side pytest never imports this file (only the nocturnation/
 # package below), so the dot prefix is invisible to the test suite.
 from .nocturnation.channel_scan import ChannelScanner
-from .nocturnation.music_event import synthesize_for as synthesize_music_event
 from .nocturnation.protocol import DedupRing, MessageType
 from .nocturnation.receive import process_frame
 from .nocturnation.render import LcdRenderer, PerimeterRenderer
@@ -580,7 +579,7 @@ class NocturNationApp(app.App):
         self._last_frame = frame
         # Every accepted frame counts as Director-alive proof for the
         # NO SIGNAL detector, regardless of message type. Heartbeats
-        # and MUSIC_EVENTs are just as good as LIGHT_COMMANDs here.
+        # are just as good as LIGHT_COMMANDs here.
         if time is not None:
             self._signal_tracker.record_frame(time.ticks_ms())
 
@@ -589,23 +588,11 @@ class NocturNationApp(app.App):
 
         now_ms = time.ticks_ms()
 
-        # MUSIC_EVENT (Block 6): synthesise a local high-level fire to
-        # give the operator song-structure feedback beyond raw beats.
-        # The synthesised Frame is local-only (not on the wire); it is
-        # shaped as a LIGHT_COMMAND so the renderers can dispatch it.
-        if frame.message_type == MessageType.MUSIC_EVENT:
-            if frame.payload and len(frame.payload) >= 1:
-                synth = synthesize_music_event(frame.payload[0])
-                if synth is not None:
-                    self._renderer.dispatch(synth, now_ms)
-                    self._lcd_renderer.dispatch(synth, now_ms)
-                    print(
-                        "[nocturnation] MUSIC_EVENT type=%d - synthetic fire"
-                        % frame.payload[0]
-                    )
-            return
-
-        # Non-light-command frames otherwise just bump the counter.
+        # MUSIC_EVENT (0x06) was removed in the spec v0.29 protocol
+        # trim; the Director no longer emits DROP / BREAKDOWN / BUILD
+        # and the Tildagon-side synthetic-fire rendering is gone with
+        # it. Inbound HEARTBEAT and any reserved-id frame just bump
+        # the frame counter without further per-surface dispatch.
         if frame.message_type != MessageType.LIGHT_COMMAND:
             return
 

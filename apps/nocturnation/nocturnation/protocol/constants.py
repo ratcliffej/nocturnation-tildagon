@@ -12,27 +12,24 @@ MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE - HEADER_SIZE
 
 
 class MessageType:
+    # Spec v0.29 §4.3: two active types plus the EXTENSION slot. IDs
+    # 0x01 (BEAT_DETECTED), 0x02 (MODE_CHANGE), 0x04 (CLOCK_SYNC),
+    # 0x05 (TIME_SYNC), 0x06 (MUSIC_EVENT) are RESERVED - they were
+    # removed in the protocol trim and MUST NOT be reused. Inbound
+    # frames carrying a reserved or unassigned message_type are
+    # silently dropped per the spec forward-compat note.
     HEARTBEAT = 0x00
-    BEAT_DETECTED = 0x01
-    MODE_CHANGE = 0x02
     LIGHT_COMMAND = 0x03
-    CLOCK_SYNC = 0x04
-    TIME_SYNC = 0x05
-    MUSIC_EVENT = 0x06
     EXTENSION = 0xFF
 
 
 # Payload lengths per message type. Used to validate inbound frames before
 # unpacking; mismatches MUST be dropped silently per protocol manual section
-# 3.1.
+# 3.1. HEARTBEAT carries tick (u32 LE) + days_since_2026 (u16 LE) +
+# centiseconds_today (u24 LE) = 9 bytes per spec v0.29 §3.3.1.
 PAYLOAD_LENGTHS = {
-    MessageType.HEARTBEAT: 0,
-    MessageType.BEAT_DETECTED: 3,
-    MessageType.MODE_CHANGE: 2,
+    MessageType.HEARTBEAT: 9,
     MessageType.LIGHT_COMMAND: 9,
-    MessageType.CLOCK_SYNC: 4,
-    MessageType.TIME_SYNC: 5,
-    MessageType.MUSIC_EVENT: 1,
 }
 
 
@@ -42,13 +39,6 @@ class DeviceClass:
     SCREEN = 0x02           # Stick LCD
     MULTI_LED_SCREEN = 0x03  # Tildagon (this device)
     # 0x04..0xFF reserved
-
-
-class MusicEventType:
-    UNKNOWN = 0
-    DROP = 1
-    BREAKDOWN = 2
-    BUILD = 3  # reserved
 
 
 # PixMob Time enum values; the LIGHT_COMMAND attack/sustain/release bytes

@@ -15,7 +15,6 @@ from nocturnation.protocol import (
     FrameError,
     MessageType,
     DeviceClass,
-    MusicEventType,
     parse_frame,
 )
 from nocturnation.protocol.constants import Time, Chance
@@ -42,24 +41,19 @@ LIGHT_COMMAND_VECTOR = bytes([
 ])
 
 # Manual annex C.2: HEARTBEAT from source_id 1, sequence 43.
+# Spec v0.29 §3.3.1 payload: tick (u32 LE) + days_since_2026 (u16 LE) +
+# centiseconds_today (u24 LE). Picked tick = 0x12345678 / days = 0x0123 /
+# centiseconds = 0xABCDEF to exercise each field's byte width.
 HEARTBEAT_VECTOR = bytes([
     0x01,  # protocol_version
     0x01,  # source_id
     0x2B,  # sequence (43)
     0x00,  # hop_count
     0x00,  # message_type HEARTBEAT
-    0x00,  # payload_len
-])
-
-# Manual annex C.3: MUSIC_EVENT carrying DROP from source_id 1, sequence 44.
-MUSIC_EVENT_DROP_VECTOR = bytes([
-    0x01,  # protocol_version
-    0x01,  # source_id
-    0x2C,  # sequence (44)
-    0x00,  # hop_count
-    0x06,  # message_type MUSIC_EVENT
-    0x01,  # payload_len
-    0x01,  # event_type DROP
+    0x09,  # payload_len
+    0x78, 0x56, 0x34, 0x12,   # tick LE
+    0x23, 0x01,               # days_since_2026 LE
+    0xEF, 0xCD, 0xAB,         # centiseconds_today LE u24
 ])
 
 
@@ -76,14 +70,15 @@ class TestHeaderParsing:
     def test_heartbeat_header_fields(self):
         f = parse_frame(HEARTBEAT_VECTOR)
         assert f.message_type == MessageType.HEARTBEAT
-        assert f.payload_len == 0
-        assert f.payload == b""
+        assert f.payload_len == 9
 
-    def test_music_event_header_fields(self):
-        f = parse_frame(MUSIC_EVENT_DROP_VECTOR)
-        assert f.message_type == MessageType.MUSIC_EVENT
-        assert f.payload_len == 1
-        assert f.payload == bytes([MusicEventType.DROP])
+
+class TestHeartbeatPayload:
+    def test_heartbeat_unpacks_tick_and_date_fields(self):
+        f = parse_frame(HEARTBEAT_VECTOR)
+        assert f.tick == 0x12345678
+        assert f.days_since_2026 == 0x0123
+        assert f.centiseconds_today == 0xABCDEF
 
 
 class TestLightCommandPayload:
@@ -123,8 +118,8 @@ class TestFrameRejection:
             parse_frame(bytes(bad))
 
     def test_wrong_payload_len_for_known_type_rejected(self):
-        # HEARTBEAT MUST be zero-payload per manual section 3.3.1.
-        bad = bytearray(HEARTBEAT_VECTOR) + b"\x00"
-        bad[5] = 0x01
+        # HEARTBEAT MUST be 9-byte payload per spec v0.29 §3.3.1.
+        bad = bytearray(HEARTBEAT_VECTOR)
+        bad[5] = 0x05  # claim 5-byte payload, actual is 9
         with pytest.raises(FrameError):
             parse_frame(bytes(bad))

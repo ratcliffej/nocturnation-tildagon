@@ -50,6 +50,10 @@ class Frame:
         "sustain",
         "release",
         "chance",
+        # HEARTBEAT-specific (spec v0.29 §3.3.1)
+        "tick",
+        "days_since_2026",
+        "centiseconds_today",
     )
 
     def __init__(self):
@@ -62,6 +66,9 @@ class Frame:
         self.sustain = None
         self.release = None
         self.chance = None
+        self.tick = None
+        self.days_since_2026 = None
+        self.centiseconds_today = None
 
 
 def parse_frame(buf):
@@ -106,5 +113,12 @@ def parse_frame(buf):
         f.sustain = p[6]
         f.release = p[7]
         f.chance = p[8]
+    elif f.message_type == MessageType.HEARTBEAT:
+        # Spec v0.29 §3.3.1: tick (u32 LE) + days_since_2026 (u16 LE)
+        # + centiseconds_today (u24 LE). All little-endian.
+        p = f.payload
+        f.tick = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)
+        f.days_since_2026 = p[4] | (p[5] << 8)
+        f.centiseconds_today = p[6] | (p[7] << 8) | (p[8] << 16)
 
     return f

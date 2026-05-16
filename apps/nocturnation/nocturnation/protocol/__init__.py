@@ -10,7 +10,6 @@ from .constants import (
     HEADER_SIZE,
     MessageType,
     DeviceClass,
-    MusicEventType,
 )
 from .dedup import DedupRing
 from .frame import Frame, parse_frame, FrameError
@@ -21,7 +20,6 @@ __all__ = [
     "HEADER_SIZE",
     "MessageType",
     "DeviceClass",
-    "MusicEventType",
     "DedupRing",
     "Frame",
     "parse_frame",
