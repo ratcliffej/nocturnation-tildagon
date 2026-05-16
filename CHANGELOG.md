@@ -4,6 +4,19 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-05-16 — Director / Lume vocabulary rename
+
+Comments, log strings, README, CHANGELOG, and the `tildagon.toml`
+app-store description migrated from the legacy *master* / *slave*
+role vocabulary to **Director** (upstream node) and **Lume**
+(downstream device). Shipped as branch
+`rename/director-lume-vocabulary` with the seven-block shape
+parallel to the M5 firmware repo; Blocks 1, 2, 4, and 5 are
+empty no-op commits because the Tildagon app has no role-class
+hierarchy, no role-encoding identifiers, no role-bearing UI
+strings, and no role-named tests. App name "NocturNation" is
+unchanged. 120/120 host-side pytest tests stay green.
+
 ## Version 1 (Epic 5 Blocks 1-6, May 2026)
 
 First app-store-submittable release. Implements the full receive
