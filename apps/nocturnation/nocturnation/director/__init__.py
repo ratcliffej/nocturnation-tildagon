@@ -15,6 +15,10 @@ block by block:
                     object into the send callable RenderDispatcher
                     needs. Not imported here (it touches the badge's
                     `espnow` module); B6 imports it when wiring app.py.
+  imu             - B4: ImuAdapter, the accelerometer -> tap / motion
+                    event adapter. Pure logic with the hardware read
+                    injected; the default badge read (`imu.acc_read`)
+                    is lazy-imported so host tests stay hardware-free.
 
 The render fan-out mirrors the M5 firmware's
 `dispatch_output_class_group`: one render_fx call goes to the wire
@@ -28,10 +32,22 @@ from .render_dispatch import (
     parse_target,
 )
 from .host import DirectorHost
+from .imu import (
+    ImuAdapter,
+    IMU_ADAPTER_CAPS,
+    SENSITIVITY_LOW,
+    SENSITIVITY_MEDIUM,
+    SENSITIVITY_HIGH,
+)
 
 __all__ = [
     "RenderDispatcher",
     "DispatchResult",
     "parse_target",
     "DirectorHost",
+    "ImuAdapter",
+    "IMU_ADAPTER_CAPS",
+    "SENSITIVITY_LOW",
+    "SENSITIVITY_MEDIUM",
+    "SENSITIVITY_HIGH",
 ]
