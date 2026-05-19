@@ -19,6 +19,9 @@ block by block:
                     event adapter. Pure logic with the hardware read
                     injected; the default badge read (`imu.acc_read`)
                     is lazy-imported so host tests stay hardware-free.
+  button_tap      - B5: ButtonTapSource, a button-as-tap fallback for
+                    show development when the IMU isn't tuned. Emits
+                    the same on_tap callback the ImuAdapter does.
 
 The render fan-out mirrors the M5 firmware's
 `dispatch_output_class_group`: one render_fx call goes to the wire
@@ -39,6 +42,7 @@ from .imu import (
     SENSITIVITY_MEDIUM,
     SENSITIVITY_HIGH,
 )
+from .button_tap import ButtonTapSource, DEFAULT_TAP_STRENGTH
 
 __all__ = [
     "RenderDispatcher",
@@ -50,4 +54,6 @@ __all__ = [
     "SENSITIVITY_LOW",
     "SENSITIVITY_MEDIUM",
     "SENSITIVITY_HIGH",
+    "ButtonTapSource",
+    "DEFAULT_TAP_STRENGTH",
 ]
