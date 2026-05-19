@@ -13,6 +13,7 @@ from .constants import (
 )
 from .dedup import DedupRing
 from .frame import Frame, parse_frame, FrameError
+from .source_id import SourceId, is_community_range, is_performance_range
 
 __all__ = [
     "PROTOCOL_VERSION",
@@ -24,4 +25,7 @@ __all__ = [
     "Frame",
     "parse_frame",
     "FrameError",
+    "SourceId",
+    "is_community_range",
+    "is_performance_range",
 ]
