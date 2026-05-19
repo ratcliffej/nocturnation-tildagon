@@ -24,6 +24,7 @@ from .lcd import (
     LCD_MIN_INTERVAL_MS,
     FULL_BRIGHTNESS_CAP,
 )
+from .pulse import RgbPulse
 
 __all__ = [
     "TIME_MS",
@@ -37,4 +38,5 @@ __all__ = [
     "LcdRenderer",
     "LCD_MIN_INTERVAL_MS",
     "FULL_BRIGHTNESS_CAP",
+    "RgbPulse",
 ]

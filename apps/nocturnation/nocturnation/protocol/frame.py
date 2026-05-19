@@ -1,8 +1,15 @@
-"""ESP-NOW frame parser. See protocol-manual.md section 3 for the byte spec.
+"""ESP-NOW frame parser + encoder. See protocol-manual.md section 3 for
+the byte spec.
 
 Block 2 first cut: parse the header + LIGHT_COMMAND payload. Other payload
 types are validated for size but not unpacked; the parser returns the raw
 payload bytes so receive-side handlers can deal with them as they land.
+
+Epic 6B B3 adds the encode side: the Director needs to *build* a
+LIGHT_COMMAND frame to broadcast (the Tildagon was receive-only until
+Director mode landed). `encode_light_command` produces the wire bytes;
+`make_light_command_frame` builds a Frame object directly for the
+Director's local loopback (no byte round-trip through the parser).
 """
 
 from .constants import (
@@ -130,4 +137,96 @@ def parse_frame(buf):
         f.days_since_2026 = p[4] | (p[5] << 8)
         f.centiseconds_today = p[6] | (p[7] << 8) | (p[8] << 16)
 
+    return f
+
+
+_LIGHT_COMMAND_PAYLOAD_LEN = PAYLOAD_LENGTHS[MessageType.LIGHT_COMMAND]
+
+
+def encode_light_command(
+    source_id,
+    sequence_number,
+    target_class,
+    target_group,
+    r,
+    g,
+    b,
+    attack,
+    sustain,
+    release,
+    chance,
+    hop_count=0,
+):
+    """Build the wire bytes for a LIGHT_COMMAND frame.
+
+    Inverse of the LIGHT_COMMAND branch in ``parse_frame``: 8-byte
+    header + 9-byte payload = 17 bytes. Every field is masked to a
+    byte so an out-of-range argument can't corrupt the frame length.
+
+    The Director originates frames at ``hop_count`` 0; relays increment
+    it. ``sequence_number`` wraps at 256 and the caller owns the
+    counter (see RenderDispatcher).
+    """
+    return bytes((
+        MAGIC_0,
+        MAGIC_1,
+        PROTOCOL_VERSION,
+        source_id & 0xFF,
+        sequence_number & 0xFF,
+        hop_count & 0xFF,
+        MessageType.LIGHT_COMMAND,
+        _LIGHT_COMMAND_PAYLOAD_LEN,
+        target_class & 0xFF,
+        target_group & 0xFF,
+        r & 0xFF,
+        g & 0xFF,
+        b & 0xFF,
+        attack & 0xFF,
+        sustain & 0xFF,
+        release & 0xFF,
+        chance & 0xFF,
+    ))
+
+
+def make_light_command_frame(
+    target_class,
+    target_group,
+    r,
+    g,
+    b,
+    attack,
+    sustain,
+    release,
+    chance,
+    source_id=0,
+    sequence_number=0,
+    hop_count=0,
+):
+    """Construct a LIGHT_COMMAND Frame directly, for local loopback.
+
+    The Director renders its own broadcasts on the perimeter LEDs and
+    LCD ("the Director is its own first Lume"). Rather than round-trip
+    through ``encode_light_command`` + ``parse_frame`` on every render,
+    this builds the Frame the renderers consume directly. The header
+    fields default to zero because the loopback path doesn't inspect
+    them - only the LIGHT_COMMAND payload attributes matter to the
+    perimeter / LCD renderers.
+    """
+    f = Frame()
+    f.protocol_version = PROTOCOL_VERSION
+    f.source_id = source_id
+    f.sequence_number = sequence_number
+    f.hop_count = hop_count
+    f.message_type = MessageType.LIGHT_COMMAND
+    f.payload_len = _LIGHT_COMMAND_PAYLOAD_LEN
+    f.payload = None
+    f.target_class = target_class
+    f.target_group = target_group
+    f.r = r
+    f.g = g
+    f.b = b
+    f.attack = attack
+    f.sustain = sustain
+    f.release = release
+    f.chance = chance
     return f
