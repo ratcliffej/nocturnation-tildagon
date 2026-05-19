@@ -53,6 +53,7 @@ from .controller import (
     RESULT_OPEN_PICKER,
     RESULT_OPEN_SETTINGS,
 )
+from .button_map import DirectorButtonMapper
 
 __all__ = [
     "RenderDispatcher",
@@ -70,4 +71,5 @@ __all__ = [
     "RESULT_HANDLED",
     "RESULT_OPEN_PICKER",
     "RESULT_OPEN_SETTINGS",
+    "DirectorButtonMapper",
 ]

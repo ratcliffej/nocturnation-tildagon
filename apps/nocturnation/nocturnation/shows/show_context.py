@@ -37,14 +37,19 @@ class ShowContext:
         "_host",
         "_paused",
         "_entered_at_ms",
+        "_display",
     )
 
-    def __init__(self, show, property_bag, host=None):
+    def __init__(self, show, property_bag, host=None, display=None):
         self._show          = show
         self._bag           = property_bag
         self._host          = host
         self._paused        = False
         self._entered_at_ms = 0
+        # Drawing surface for on_render(). The DirectorController/app
+        # owns a CtxDisplay and rebinds the live ctx each frame; here
+        # it's None until wired (host tests don't draw).
+        self._display       = display
 
     # -- Output -----------------------------------------------------------
 
@@ -90,6 +95,18 @@ class ShowContext:
         if self._host is None or not hasattr(self._host, "imu_caps"):
             return CapabilityMask()
         return self._host.imu_caps()
+
+    # -- Display ----------------------------------------------------------
+
+    def display(self):
+        """Return the Show's drawing surface (a CtxDisplay) for use in
+        on_render(). Returns None if no display is wired (host tests).
+        On the Tildagon the app rebinds the live draw ctx onto this
+        surface each frame before calling on_render."""
+        return self._display
+
+    def set_display(self, display):
+        self._display = display
 
     # -- Framework-managed state ------------------------------------------
 

@@ -25,6 +25,7 @@ from .lcd import (
     FULL_BRIGHTNESS_CAP,
 )
 from .pulse import RgbPulse
+from .display import CtxDisplay, SCREEN_W, SCREEN_H
 
 __all__ = [
     "TIME_MS",
@@ -39,4 +40,7 @@ __all__ = [
     "LCD_MIN_INTERVAL_MS",
     "FULL_BRIGHTNESS_CAP",
     "RgbPulse",
+    "CtxDisplay",
+    "SCREEN_W",
+    "SCREEN_H",
 ]

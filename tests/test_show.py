@@ -170,6 +170,25 @@ class TestShowContextCapabilityQueries:
         assert ctx.imu_caps().has(Capability.IMU_MOTION) is True
 
 
+class TestShowContextDisplay:
+    def test_display_none_by_default(self, tmp_path):
+        _show, ctx = _build_ctx(tmp_path)
+        assert ctx.display() is None
+
+    def test_set_display_returns_it(self, tmp_path):
+        _show, ctx = _build_ctx(tmp_path)
+        sentinel = object()
+        ctx.set_display(sentinel)
+        assert ctx.display() is sentinel
+
+    def test_display_passed_at_construction(self, tmp_path):
+        show = _StubShow()
+        bag = PropertyBag(show, path=str(tmp_path / "p.json"))
+        sentinel = object()
+        ctx = ShowContext(show, bag, host=None, display=sentinel)
+        assert ctx.display() is sentinel
+
+
 class TestShowContextPauseAndTime:
     def test_pause_toggles(self, tmp_path):
         _show, ctx = _build_ctx(tmp_path)

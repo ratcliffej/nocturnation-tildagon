@@ -21,6 +21,7 @@ class TestDefaults:
         assert s.group == 0
         assert s.channel == "auto"
         assert s.active_show == ""
+        assert s.mode == "lume"
 
 
 class TestGroupCoercion:
@@ -63,23 +64,27 @@ class TestChannelCoercion:
 
 class TestDictRoundTrip:
     def test_to_dict_has_all_fields(self):
-        s = Settings(calm_mode=False, group=3, channel="11", active_show="simple_tap")
+        s = Settings(calm_mode=False, group=3, channel="11",
+                     active_show="simple_tap", mode="director")
         d = s.to_dict()
         assert d == {
             "calm_mode": False,
             "group": 3,
             "channel": "11",
             "active_show": "simple_tap",
+            "mode": "director",
         }
 
     def test_from_dict_populates(self):
         s = Settings.from_dict({
-            "calm_mode": False, "group": 2, "channel": "1", "active_show": "motion_wave",
+            "calm_mode": False, "group": 2, "channel": "1",
+            "active_show": "motion_wave", "mode": "director",
         })
         assert s.calm_mode is False
         assert s.group == 2
         assert s.channel == "1"
         assert s.active_show == "motion_wave"
+        assert s.mode == "director"
 
     def test_from_dict_missing_keys_uses_defaults(self):
         s = Settings.from_dict({"calm_mode": False})
@@ -87,6 +92,7 @@ class TestDictRoundTrip:
         assert s.group == 0
         assert s.channel == "auto"
         assert s.active_show == ""
+        assert s.mode == "lume"
 
     def test_from_dict_non_dict_returns_defaults(self):
         # Corrupted JSON might decode to a list or string; fall back
@@ -155,6 +161,32 @@ class TestActiveShow:
 
     def test_different_active_show_not_equal(self):
         assert Settings(active_show="a") != Settings(active_show="b")
+
+
+class TestMode:
+    def test_default_lume(self):
+        assert Settings().mode == "lume"
+
+    def test_valid_modes_kept(self):
+        assert Settings(mode="lume").mode == "lume"
+        assert Settings(mode="director").mode == "director"
+
+    def test_unknown_mode_falls_back_to_lume(self):
+        assert Settings(mode="wizard").mode == "lume"
+        assert Settings(mode=None).mode == "lume"
+        assert Settings(mode=1).mode == "lume"
+
+    def test_round_trips(self):
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
+            path = f.name
+        try:
+            Settings(mode="director").save(path)
+            assert Settings.load(path).mode == "director"
+        finally:
+            os.unlink(path)
+
+    def test_different_mode_not_equal(self):
+        assert Settings(mode="lume") != Settings(mode="director")
 
 
 class TestEquality:

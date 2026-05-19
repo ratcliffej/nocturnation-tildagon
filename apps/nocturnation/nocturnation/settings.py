@@ -28,6 +28,13 @@ Three operator-tunable values:
     string means "no choice yet" - the DirectorController falls back
     to the first registered Show.
 
+  mode (str: "lume", "director", default "lume")
+    App role (Epic 6B). "lume" is the original receive-only behaviour;
+    "director" runs the Show framework + IMU tap-to-beat and broadcasts
+    LIGHT_COMMAND frames. Persisted so a Director badge reopens in
+    Director mode. Unknown values fall back to "lume" (the safe,
+    receive-only default).
+
 Persisted as JSON at DEFAULT_PATH (outside the apps directory so the
 app's deploy.sh wipe-and-copy doesn't clobber operator preferences).
 """
@@ -42,16 +49,19 @@ import json
 DEFAULT_PATH = "/nocturnation_settings.json"
 
 _VALID_CHANNELS = ("auto", "1", "11")
+_VALID_MODES = ("lume", "director")
 
 
 class Settings:
-    __slots__ = ("calm_mode", "group", "channel", "active_show")
+    __slots__ = ("calm_mode", "group", "channel", "active_show", "mode")
 
-    def __init__(self, calm_mode=True, group=0, channel="auto", active_show=""):
+    def __init__(self, calm_mode=True, group=0, channel="auto", active_show="",
+                 mode="lume"):
         self.calm_mode = bool(calm_mode)
         self.group = self._coerce_group(group)
         self.channel = self._coerce_channel(channel)
         self.active_show = self._coerce_active_show(active_show)
+        self.mode = self._coerce_mode(mode)
 
     @staticmethod
     def _coerce_group(g):
@@ -82,12 +92,21 @@ class Settings:
             return s
         return ""
 
+    @staticmethod
+    def _coerce_mode(m):
+        """Constrain to known modes. Anything else falls back to "lume"
+        - the safe, receive-only default."""
+        if m in _VALID_MODES:
+            return m
+        return "lume"
+
     def to_dict(self):
         return {
             "calm_mode": self.calm_mode,
             "group": self.group,
             "channel": self.channel,
             "active_show": self.active_show,
+            "mode": self.mode,
         }
 
     @classmethod
@@ -99,6 +118,7 @@ class Settings:
             group=d.get("group", 0),
             channel=d.get("channel", "auto"),
             active_show=d.get("active_show", ""),
+            mode=d.get("mode", "lume"),
         )
 
     def save(self, path=DEFAULT_PATH):
@@ -125,12 +145,17 @@ class Settings:
             and self.group == other.group
             and self.channel == other.channel
             and self.active_show == other.active_show
+            and self.mode == other.mode
         )
 
     def __repr__(self):
-        return "Settings(calm_mode=%r, group=%r, channel=%r, active_show=%r)" % (
-            self.calm_mode,
-            self.group,
-            self.channel,
-            self.active_show,
+        return (
+            "Settings(calm_mode=%r, group=%r, channel=%r, active_show=%r, mode=%r)"
+            % (
+                self.calm_mode,
+                self.group,
+                self.channel,
+                self.active_show,
+                self.mode,
+            )
         )
