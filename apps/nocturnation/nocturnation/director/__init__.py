@@ -22,6 +22,10 @@ block by block:
   button_tap      - B5: ButtonTapSource, a button-as-tap fallback for
                     show development when the IMU isn't tuned. Emits
                     the same on_tap callback the ImuAdapter does.
+  controller      - B6a: DirectorController, the orchestration core -
+                    holds one active Show, routes input to it, manages
+                    Show selection + persistence. The app.py FSM (B6b)
+                    drives it.
 
 The render fan-out mirrors the M5 firmware's
 `dispatch_output_class_group`: one render_fx call goes to the wire
@@ -43,6 +47,12 @@ from .imu import (
     SENSITIVITY_HIGH,
 )
 from .button_tap import ButtonTapSource, DEFAULT_TAP_STRENGTH
+from .controller import (
+    DirectorController,
+    RESULT_HANDLED,
+    RESULT_OPEN_PICKER,
+    RESULT_OPEN_SETTINGS,
+)
 
 __all__ = [
     "RenderDispatcher",
@@ -56,4 +66,8 @@ __all__ = [
     "SENSITIVITY_HIGH",
     "ButtonTapSource",
     "DEFAULT_TAP_STRENGTH",
+    "DirectorController",
+    "RESULT_HANDLED",
+    "RESULT_OPEN_PICKER",
+    "RESULT_OPEN_SETTINGS",
 ]

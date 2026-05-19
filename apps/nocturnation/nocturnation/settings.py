@@ -22,6 +22,12 @@ Three operator-tunable values:
     on STA_IF is known-flaky on Tildagon (Epic 5 Q6); the operator
     may end up locked to channel 11 regardless of this setting.
 
+  active_show (str, default "")
+    Director-mode active Show id (Epic 6B). Persisted so the badge
+    reopens the last-used Show on the next Director-mode entry. Empty
+    string means "no choice yet" - the DirectorController falls back
+    to the first registered Show.
+
 Persisted as JSON at DEFAULT_PATH (outside the apps directory so the
 app's deploy.sh wipe-and-copy doesn't clobber operator preferences).
 """
@@ -39,12 +45,13 @@ _VALID_CHANNELS = ("auto", "1", "11")
 
 
 class Settings:
-    __slots__ = ("calm_mode", "group", "channel")
+    __slots__ = ("calm_mode", "group", "channel", "active_show")
 
-    def __init__(self, calm_mode=True, group=0, channel="auto"):
+    def __init__(self, calm_mode=True, group=0, channel="auto", active_show=""):
         self.calm_mode = bool(calm_mode)
         self.group = self._coerce_group(group)
         self.channel = self._coerce_channel(channel)
+        self.active_show = self._coerce_active_show(active_show)
 
     @staticmethod
     def _coerce_group(g):
@@ -66,11 +73,21 @@ class Settings:
             return c
         return "auto"
 
+    @staticmethod
+    def _coerce_active_show(s):
+        """Coerce to a string; non-strings fall back to "" (no choice).
+        The DirectorController validates the id against the registry, so
+        an unknown-but-well-formed id is harmless here."""
+        if isinstance(s, str):
+            return s
+        return ""
+
     def to_dict(self):
         return {
             "calm_mode": self.calm_mode,
             "group": self.group,
             "channel": self.channel,
+            "active_show": self.active_show,
         }
 
     @classmethod
@@ -81,6 +98,7 @@ class Settings:
             calm_mode=d.get("calm_mode", True),
             group=d.get("group", 0),
             channel=d.get("channel", "auto"),
+            active_show=d.get("active_show", ""),
         )
 
     def save(self, path=DEFAULT_PATH):
@@ -106,11 +124,13 @@ class Settings:
             self.calm_mode == other.calm_mode
             and self.group == other.group
             and self.channel == other.channel
+            and self.active_show == other.active_show
         )
 
     def __repr__(self):
-        return "Settings(calm_mode=%r, group=%r, channel=%r)" % (
+        return "Settings(calm_mode=%r, group=%r, channel=%r, active_show=%r)" % (
             self.calm_mode,
             self.group,
             self.channel,
+            self.active_show,
         )

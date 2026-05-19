@@ -20,6 +20,7 @@ class TestDefaults:
         assert s.calm_mode is True
         assert s.group == 0
         assert s.channel == "auto"
+        assert s.active_show == ""
 
 
 class TestGroupCoercion:
@@ -62,21 +63,30 @@ class TestChannelCoercion:
 
 class TestDictRoundTrip:
     def test_to_dict_has_all_fields(self):
-        s = Settings(calm_mode=False, group=3, channel="11")
+        s = Settings(calm_mode=False, group=3, channel="11", active_show="simple_tap")
         d = s.to_dict()
-        assert d == {"calm_mode": False, "group": 3, "channel": "11"}
+        assert d == {
+            "calm_mode": False,
+            "group": 3,
+            "channel": "11",
+            "active_show": "simple_tap",
+        }
 
     def test_from_dict_populates(self):
-        s = Settings.from_dict({"calm_mode": False, "group": 2, "channel": "1"})
+        s = Settings.from_dict({
+            "calm_mode": False, "group": 2, "channel": "1", "active_show": "motion_wave",
+        })
         assert s.calm_mode is False
         assert s.group == 2
         assert s.channel == "1"
+        assert s.active_show == "motion_wave"
 
     def test_from_dict_missing_keys_uses_defaults(self):
         s = Settings.from_dict({"calm_mode": False})
         assert s.calm_mode is False
         assert s.group == 0
         assert s.channel == "auto"
+        assert s.active_show == ""
 
     def test_from_dict_non_dict_returns_defaults(self):
         # Corrupted JSON might decode to a list or string; fall back
@@ -120,6 +130,31 @@ class TestPersistence:
         # Outside /apps/ so app deploys don't clobber operator settings.
         assert DEFAULT_PATH.startswith("/")
         assert not DEFAULT_PATH.startswith("/apps/")
+
+
+class TestActiveShow:
+    def test_default_empty(self):
+        assert Settings().active_show == ""
+
+    def test_string_kept(self):
+        assert Settings(active_show="simple_tap").active_show == "simple_tap"
+
+    def test_non_string_falls_back_to_empty(self):
+        # Corrupt JSON could decode active_show to a non-string.
+        assert Settings(active_show=42).active_show == ""
+        assert Settings(active_show=None).active_show == ""
+
+    def test_round_trips(self):
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
+            path = f.name
+        try:
+            Settings(active_show="motion_wave").save(path)
+            assert Settings.load(path).active_show == "motion_wave"
+        finally:
+            os.unlink(path)
+
+    def test_different_active_show_not_equal(self):
+        assert Settings(active_show="a") != Settings(active_show="b")
 
 
 class TestEquality:

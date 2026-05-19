@@ -15,6 +15,7 @@ boot.
 from .show import Show
 from .show_context import ShowContext
 from .registry import ShowRegistry, show_registry, discover_shows
+from .input_action import InputAction
 
 __all__ = [
     "Show",
@@ -22,4 +23,5 @@ __all__ = [
     "ShowRegistry",
     "show_registry",
     "discover_shows",
+    "InputAction",
 ]

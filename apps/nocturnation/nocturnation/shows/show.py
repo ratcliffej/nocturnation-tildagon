@@ -120,10 +120,22 @@ class Show(Plugin):
     # -------------------------------------------------------------------
     # Context accessor
     # -------------------------------------------------------------------
+    #
+    # On the Tildagon the DirectorController owns the active Show's
+    # ShowContext and binds it here on activation, so a concrete Show
+    # does not need to construct or return its own (unlike the M5
+    # TU-static-singleton pattern). The bound context is also passed
+    # as the first argument to every hook, so most Shows never call
+    # `context()` directly - it exists for API parity with M5.
+
+    _bound_context = None  # class default; bind_context sets a per-instance value
+
+    def bind_context(self, ctx):
+        """Framework hook: the DirectorController calls this when the
+        Show becomes active, so `context()` returns a live context."""
+        self._bound_context = ctx
 
     def context(self):
-        """Return this Show's per-instance ShowContext. Concrete
-        Shows construct a ShowContext in their factory and return
-        it here so the host can route events without hard-coding
-        per-id branches."""
-        raise NotImplementedError("Show.context() must be overridden")
+        """Return the framework-bound ShowContext, or None if the Show
+        is not currently active."""
+        return self._bound_context
