@@ -91,6 +91,7 @@ from .nocturnation.receive import process_frame
 from .nocturnation.render import LcdRenderer, PerimeterRenderer
 from .nocturnation.settings import Settings
 from .nocturnation.signal_tracker import SignalTracker
+from .nocturnation.tofu import TofuLock
 
 
 # Cycle order for the settings menu.
@@ -142,6 +143,13 @@ class NocturNationApp(app.App):
         # frame; the draw loop overlays NO SIGNAL when the gap exceeds
         # 3 s per protocol manual section 6.2.
         self._signal_tracker = SignalTracker()
+        # Epic 5.5 B6: Trust-On-First-Use lock on Director source_id.
+        # Locks to the first valid frame from a non-broadcast source
+        # after construction or clear(); subsequent frames from other
+        # source_ids are dropped silently. On channel 11, only
+        # Performance-range source_ids (0x40..0xFE) are eligible to
+        # be locked. Lock expires after 10 s of inactivity.
+        self._tofu = TofuLock()
         # Bring the perimeter LEDs out of low-power before the first
         # tick. Harmless if tildagonos is None (host environment).
         if tildagonos is not None:
@@ -288,6 +296,11 @@ class NocturNationApp(app.App):
                 pass
         self._settings_open = False
         self._settings_menu = None
+        # Drop any pending button press. The Menu component doesn't clear
+        # button_states after invoking select_handler / back_handler, so
+        # without this the next update() cycle would re-read the same
+        # CONFIRM press as a fresh menu-open (or CANCEL as a minimise).
+        self.button_states.clear()
 
     def _settings_menu_items(self):
         """Compose the menu line labels from current settings values."""
@@ -513,11 +526,19 @@ class NocturNationApp(app.App):
                 if buf is not None:
                     frame = process_frame(buf, self._dedup)
                     if frame is not None:
-                        self._observe_frame(frame)
-                        print("[nocturnation] locking channel %d" % ch)
-                        self._scanner.lock()
-                        self._status = "locked"
-                        return True
+                        # TOFU + cross-range gate (Epic 5.5 B6). A frame
+                        # that fails the gate (e.g. community-range id
+                        # on ch 11) is dropped silently; the channel
+                        # remains in scan because no eligible Director
+                        # was found on it.
+                        now_ms = time.ticks_ms() if time is not None else 0
+                        if self._tofu.admit(frame, ch, now_ms):
+                            self._observe_frame(frame)
+                            print("[nocturnation] locking channel %d "
+                                  "(src_id=0x%02X)" % (ch, frame.source_id))
+                            self._scanner.lock()
+                            self._status = "locked"
+                            return True
                 await asyncio.sleep_ms(poll_ms)
                 elapsed += poll_ms
 
@@ -538,18 +559,29 @@ class NocturNationApp(app.App):
             if buf is not None:
                 frame = process_frame(buf, self._dedup)
                 if frame is not None:
-                    self._observe_frame(frame)
-                    if frame.message_type == MessageType.LIGHT_COMMAND:
-                        print(
-                            "[nocturnation] LIGHT r=%d g=%d b=%d cls=%d grp=%d"
-                            % (
-                                frame.r,
-                                frame.g,
-                                frame.b,
-                                frame.target_class,
-                                frame.target_group,
+                    # TOFU + cross-range gate (Epic 5.5 B6). Drops frames
+                    # from non-locked source_ids and community-range ids
+                    # on channel 11.
+                    now_ms = time.ticks_ms() if time is not None else 0
+                    if self._tofu.admit(frame, self._receive_channel, now_ms):
+                        self._observe_frame(frame)
+                        if frame.message_type == MessageType.LIGHT_COMMAND:
+                            print(
+                                "[nocturnation] LIGHT r=%d g=%d b=%d cls=%d grp=%d"
+                                % (
+                                    frame.r,
+                                    frame.g,
+                                    frame.b,
+                                    frame.target_class,
+                                    frame.target_group,
+                                )
                             )
-                        )
+            # Expire the TOFU lock on extended silence. The signal_tracker
+            # already shows NO SIGNAL on a 3 s gap; the TOFU timeout is
+            # the longer 10 s threshold that decides "give up on this
+            # Director and treat the next frame as a fresh lock".
+            if time is not None and self._tofu.tick(time.ticks_ms()):
+                print("[nocturnation] TOFU lock expired; ready to relock")
             # Tick the perimeter at ~20 Hz independent of foreground
             # state. The settings menu, if open, skips this tick (the
             # menu owns the screen visually and our LEDs stay dark).
