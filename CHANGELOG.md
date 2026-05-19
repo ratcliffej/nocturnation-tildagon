@@ -4,6 +4,63 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-05-17 — Epic 5.5: channel 11 access control (source_id partition + TOFU)
+
+Lume-side implementation of the channel 11 access control mechanism
+landing in the companion M5 firmware repo (`ratcliffej/nocturnation-m5`).
+**No wire-format change**; `protocol_version` stays at `0x02`. The
+Tildagon now applies a Trust-On-First-Use (TOFU) lock to the first
+valid frame from a non-broadcast source_id, dropping subsequent frames
+from any other source for the duration of the session.
+
+Behaviour:
+
+- New `nocturnation/tofu.py` module with `TofuLock` class.
+  `admit(frame, channel, now_ms)` runs between dedup and observation;
+  `tick(now_ms)` each loop iteration expires the lock on extended
+  silence; `clear()` is the operator-initiated rescan hook.
+- New `nocturnation/protocol/source_id.py` module with the partition
+  constants (`SourceId.COMMUNITY_MIN/MAX/PERFORMANCE_MIN/MAX/BROADCAST`)
+  and helper predicates `is_community_range` / `is_performance_range`.
+- Cross-range filter: on channel 11, only Performance-range source_ids
+  (`0x40-0xFE`) are eligible to be locked; community-range ids on
+  channel 11 are silently dropped without locking. Channels 1 and 6
+  accept any non-broadcast source_id. Broadcast (`0xFF`) is never
+  eligible.
+- Lock timeout: 10 s (`DEFAULT_TIMEOUT_MS`, mirrors the M5 firmware's
+  `kRescanMs`). When the lock expires the next valid frame establishes
+  a fresh lock.
+- UI: LCD status line now shows lock state using the same `C:nn` /
+  `P:nn` convention as the M5 firmware:
+
+  | Label | Meaning |
+  |---|---|
+  | `ch N scan` | scanner hunting for any Director |
+  | `ch N listen` | channel locked, no TOFU peer yet (post-rescan / post-timeout) |
+  | `ch N C:nn` | TOFU locked to a community-range source |
+  | `ch N P:nn` | TOFU locked to a Performance-range source |
+  | `ch N ?:nn` | defensive: out-of-range source (shouldn't happen) |
+
+  Audience members can verify they're locked to the right Director
+  by visual comparison with the Director's screen.
+- Settings menu: new "Rescan" item between "Channel" and "Back".
+  Selecting it calls `tofu.clear()` so the next valid frame on the
+  current channel establishes a fresh lock. The Tildagon's radio
+  doesn't support reliable channel re-scan post-boot (Epic 5 Q6
+  caveat), so this is a TOFU-only reset; the wifi channel stays
+  where it was.
+
+Spec deviation captured inline in the M5 repo's protocol-manual.md
+§3.4 + §7.1: TOFU locks on any valid frame, not specifically the
+first HEARTBEAT. The HEARTBEAT-only formulation from the initial
+v0.29 draft didn't compose with skip-if-recent heartbeat suppression
+during active music - a Lume joining mid-song would otherwise sit
+idle for the duration of the song.
+
+157/157 host-side pytest tests pass on CPython 3.10+ (130 -> 157,
++27 from the source_id partition tests in B2 and the TOFU tests in
+B6+B7). Protocol modules remain CPython + MicroPython compatible.
+
 ## 2026-05-16 — Auto-scan now includes channel 6 (design intent)
 
 `SCAN_ORDER` in `nocturnation.channel_scan` extended from `(11, 1)`
