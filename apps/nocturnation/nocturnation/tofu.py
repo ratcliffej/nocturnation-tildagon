@@ -25,7 +25,7 @@ current channel. Unit-tested host-side; runs unchanged on the badge.
 """
 
 from .protocol import MessageType
-from .protocol.source_id import SourceId, is_performance_range
+from .protocol.source_id import SourceId, is_community_range, is_performance_range
 
 
 DEFAULT_TIMEOUT_MS = 10000   # mirrors the M5 firmware's kRescanMs
@@ -129,3 +129,34 @@ class TofuLock:
         """
         self._locked_id     = None
         self._last_frame_ms = None
+
+
+def format_lock_label(channel, scanner_locked, tofu_locked_id):
+    """Compose the channel + TOFU lock status into a single-line label.
+
+    Mirrors the M5 firmware's ``EspNowBroadcastDriver::format_status_label``
+    convention so the operator sees the same ``C:nn`` / ``P:nn`` format
+    on both Director and Lume screens.
+
+    States:
+
+    * scanner unlocked              -> ``"ch N scan"``   (looking for any Director)
+    * scanner locked, TOFU unlocked -> ``"ch N listen"`` (waiting for next valid frame)
+    * scanner+TOFU locked, community-range source -> ``"ch N C:nn"``
+    * scanner+TOFU locked, Performance-range source -> ``"ch N P:nn"``
+    * scanner+TOFU locked, out-of-range source -> ``"ch N ?:nn"`` (defensive)
+
+    Pure function: takes the state values, returns a string. Unit-testable
+    without instantiating the whole receive pipeline.
+    """
+    if not scanner_locked:
+        return "ch %d scan" % channel
+    if tofu_locked_id is None:
+        return "ch %d listen" % channel
+    if is_community_range(tofu_locked_id):
+        prefix = "C"
+    elif is_performance_range(tofu_locked_id):
+        prefix = "P"
+    else:
+        prefix = "?"
+    return "ch %d %s:%02X" % (channel, prefix, tofu_locked_id)

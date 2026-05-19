@@ -91,7 +91,7 @@ from .nocturnation.receive import process_frame
 from .nocturnation.render import LcdRenderer, PerimeterRenderer
 from .nocturnation.settings import Settings
 from .nocturnation.signal_tracker import SignalTracker
-from .nocturnation.tofu import TofuLock
+from .nocturnation.tofu import TofuLock, format_lock_label
 
 
 # Cycle order for the settings menu.
@@ -308,6 +308,7 @@ class NocturNationApp(app.App):
             "Calm Mode: %s" % ("ON" if self._settings.calm_mode else "OFF"),
             "Group: %d" % self._settings.group,
             "Channel: %s" % self._settings.channel,
+            "Rescan",
             "Back",
         ]
 
@@ -346,6 +347,16 @@ class NocturNationApp(app.App):
                 pos = -1
             self._settings.channel = _CHANNEL_CYCLE[(pos + 1) % len(_CHANNEL_CYCLE)]
         elif idx == 3:
+            # Rescan (Epic 5.5 B7). Clears the TOFU lock so the next
+            # valid frame on the current channel establishes a fresh
+            # lock. Note: the Tildagon's radio doesn't reliably support
+            # channel re-scanning post-boot (CHANGELOG / Epic 5 Q6), so
+            # this is a TOFU-only reset; the channel stays the same.
+            self._tofu.clear()
+            print("[nocturnation] TOFU lock cleared by operator")
+            self._close_settings()
+            return
+        elif idx == 4:
             self._close_settings()
             return
         # Persist after every change. If the save fails we keep the
@@ -417,9 +428,14 @@ class NocturNationApp(app.App):
 
         ctx.font_size = 12
         ctx.move_to(0, -20).text(self._status)
+        # Channel + TOFU lock status. Composed by format_lock_label so
+        # the Director and Lume use the same `C:nn` / `P:nn` convention.
         ctx.move_to(0, 0).text(
-            "ch %d %s"
-            % (self._scanner.current_channel, "locked" if self._scanner.is_locked else "scan")
+            format_lock_label(
+                channel=self._scanner.current_channel,
+                scanner_locked=self._scanner.is_locked,
+                tofu_locked_id=self._tofu.locked_id,
+            )
         )
         ctx.move_to(0, 20).text("frames: %d" % self._frame_count)
 

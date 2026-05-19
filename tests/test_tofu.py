@@ -9,7 +9,7 @@ import pytest
 
 from nocturnation.protocol import MessageType
 from nocturnation.protocol.frame import Frame
-from nocturnation.tofu import TofuLock, DEFAULT_TIMEOUT_MS
+from nocturnation.tofu import TofuLock, DEFAULT_TIMEOUT_MS, format_lock_label
 
 
 def make_frame(source_id, message_type=MessageType.LIGHT_COMMAND,
@@ -251,3 +251,46 @@ class TestRebootIsImplicitClear:
         # Second instance (post-reboot) starts unlocked regardless.
         t2 = TofuLock()
         assert t2.is_locked() is False
+
+
+# =============================================================================
+# Lock-label formatter (Epic 5.5 B7)
+# =============================================================================
+
+class TestFormatLockLabel:
+    def test_scanner_unlocked_shows_scan(self):
+        # No channel lock yet: the badge is hunting for a Director.
+        assert format_lock_label(11, scanner_locked=False,
+                                 tofu_locked_id=None) == "ch 11 scan"
+        assert format_lock_label(1, scanner_locked=False,
+                                 tofu_locked_id=None) == "ch 1 scan"
+
+    def test_scanner_locked_but_tofu_unlocked_shows_listen(self):
+        # Channel locked, but no TOFU peer (initial state or post-rescan
+        # / post-timeout). Waiting for the next valid frame.
+        assert format_lock_label(11, scanner_locked=True,
+                                 tofu_locked_id=None) == "ch 11 listen"
+
+    def test_community_range_shows_C_prefix(self):
+        assert format_lock_label(1, scanner_locked=True,
+                                 tofu_locked_id=0x03) == "ch 1 C:03"
+        # Boundaries:
+        assert format_lock_label(1, scanner_locked=True,
+                                 tofu_locked_id=0x00) == "ch 1 C:00"
+        assert format_lock_label(1, scanner_locked=True,
+                                 tofu_locked_id=0x3F) == "ch 1 C:3F"
+
+    def test_performance_range_shows_P_prefix(self):
+        assert format_lock_label(11, scanner_locked=True,
+                                 tofu_locked_id=0x4F) == "ch 11 P:4F"
+        # Boundaries:
+        assert format_lock_label(11, scanner_locked=True,
+                                 tofu_locked_id=0x40) == "ch 11 P:40"
+        assert format_lock_label(11, scanner_locked=True,
+                                 tofu_locked_id=0xFE) == "ch 11 P:FE"
+
+    def test_out_of_range_id_shows_question_prefix(self):
+        # Defensive: should never happen for a conforming Director,
+        # but the label surface stays informative if it does.
+        assert format_lock_label(11, scanner_locked=True,
+                                 tofu_locked_id=0xFF) == "ch 11 ?:FF"
