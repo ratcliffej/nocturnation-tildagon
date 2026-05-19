@@ -300,6 +300,37 @@ class TestTick:
         assert ticks == [("tick", 0), ("tick", 100)]
 
 
+class TestPollButton:
+    def test_poll_button_drives_button_tap_only(self, tmp_path):
+        # poll_button must not also poll the IMU (the app drives the IMU
+        # from its background loop separately).
+        imu = _FakeImu()
+        button = ButtonTapSource()
+        show = _FakeShow("alpha")
+        c = _controller(tmp_path, [show], imu=imu, button=button)
+        c.enter()
+        c.poll_button(True, 0)  # rising edge -> tap
+        assert any(call[0] == "tap" for call in show.calls)
+
+
+class TestApplySensitivity:
+    def test_apply_sensitivity_repushes(self, tmp_path):
+        imu = _FakeImu()
+        show = _FakeShow("alpha", sensitivity_default=2)
+        c = _controller(tmp_path, [show], imu=imu)
+        c.enter()
+        assert imu.sensitivity == 2
+        # Simulate the operator changing the property, then re-applying.
+        c.active_context.set_property("sensitivity", 0)
+        c.apply_sensitivity()
+        assert imu.sensitivity == 0
+
+    def test_apply_sensitivity_no_active_show_is_safe(self, tmp_path):
+        imu = _FakeImu()
+        c = _controller(tmp_path, [], imu=imu)
+        c.apply_sensitivity()  # no active show; must not crash
+
+
 class TestLifecycle:
     def test_exit_calls_show_exit(self, tmp_path):
         show = _FakeShow("alpha")

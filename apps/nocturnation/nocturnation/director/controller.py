@@ -184,6 +184,21 @@ class DirectorController:
         if self._button_tap is not None and button_pressed is not None:
             self._button_tap.poll(button_pressed, now_ms)
 
+    def poll_button(self, pressed, now_ms):
+        """Drive only the button-tap fallback. The app polls the IMU
+        from its always-running background loop and the button from its
+        foreground update(), so they're driven separately."""
+        if self._button_tap is not None:
+            self._button_tap.poll(pressed, now_ms)
+
+    def apply_sensitivity(self):
+        """Re-push the active Show's sensitivity property to the IMU
+        adapter. Called after the settings overlay changes a value so
+        a sensitivity edit takes effect without re-activating the
+        Show."""
+        if self._active_ctx is not None:
+            self._apply_sensitivity(self._active_ctx)
+
     def _on_tap(self, strength):
         if self._active_show is None:
             return
