@@ -4,6 +4,67 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-05-21 — Epic 6B: Tildagon Director + Show framework
+
+The badge becomes a NocturNation **Director** (not just a Lume): an
+operator can run a show that broadcasts `LIGHT_COMMAND` frames driven
+by IMU tap-to-beat, alongside the existing receive-only Lume mode. A
+MicroPython Show plug-in framework mirrors the M5 firmware's `Show`
+surface so the same authoring model applies on both hosts
+(`docs/developing-shows.md` in the M5 repo).
+
+Show framework + Director runtime:
+
+- `nocturnation/hal/` — `Capability` enum + `CapabilityMask` (1:1 with
+  the C++ `hal::Capability`), incl. the Epic 6B `IMU_TAP` / `IMU_MOTION`
+  sub-capabilities.
+- `nocturnation/plugins/` — `Plugin` base, `PropertyDef` /
+  `PropertyType` / `PowerProfile`, and `PropertyBag` (JSON-backed,
+  `/nocturnation_plugins.json`, one section per plug-in id).
+- `nocturnation/shows/` — `Show` base (analyser + IMU + input + render
+  hooks), `ShowContext` (render_fx / properties / caps / display),
+  `InputAction`, and a folder-per-show registry (`discover_shows()`
+  walks `apps/nocturnation/shows/<id>/`).
+- `nocturnation/director/` — `RenderDispatcher` (one `render_fx` ->
+  ESP-NOW broadcast + local perimeter/LCD loopback + 1 Hz HEARTBEAT
+  beacon + 3x redundancy), `DirectorHost`, `ImuAdapter` (gravity-EMA
+  high-pass tap + motion, sensitivity-scaled), `ButtonTapSource`
+  (button-as-tap fallback), `DirectorButtonMapper`, and
+  `DirectorController` (active-show lifecycle / input routing /
+  per-Show sensitivity / tick).
+- Reference Shows: `simple_tap` (tap-to-beat, palette incl. Rainbow)
+  and `motion_wave` (axis-coloured motion), under
+  `apps/nocturnation/shows/`.
+
+App + lifecycle:
+
+- **Idle start menu** on launch (Lume / Director / Settings / Help /
+  Quit) with WiFi up. A mode is started explicitly; only then is the
+  radio taken.
+- **WiFi/ESP-NOW coexistence**: the app calls the badge `wifi.stop()`
+  when entering an active mode (an unassociated STA makes the ESP32
+  firmware channel-sweep, which breaks ESP-NOW), and restores WiFi
+  (`wifi.connect()`) on returning to idle / Quit. So WiFi is only down
+  while a Lume/Director session is running (foreground or background;
+  the lights are the visual cue).
+- **Channel** setting now pins a single channel (1/11) rather than the
+  auto-scan that mis-locked on stray frames.
+- **Quit** releases the radio, restores WiFi, hands the LEDs back, and
+  cleanly terminates (relaunch starts fresh).
+- **Help** screen renders a QR code (vendored `uQR.py`, MIT, from
+  `JASchilz/uQR`) to a configurable `Settings.help_url` (default
+  `http://www.nocturnation.net`).
+- Settings gained `mode`, `active_show`, `help_url`.
+- Director transmits on **channel 1 only** (Epic 5.5: the Tildagon must
+  not broadcast on the channel-11 Performance band).
+- `deploy.sh` strips host `__pycache__` before copying so only `.py`
+  source reaches the badge.
+
+Bench-verified M5 <-> Tildagon interop (Director taps light a Plus2
+Lume's bracelet via IR, and the Tildagon Lume receives M5 broadcasts).
+Host suite 399 tests. Wire format unchanged; `protocol_version` stays
+`0x02`.
+
 ## 2026-05-17 — Epic 5.5: channel 11 access control (source_id partition + TOFU)
 
 Lume-side implementation of the channel 11 access control mechanism
