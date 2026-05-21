@@ -83,7 +83,7 @@ class TestSimpleTapIdentity:
 
 
 class TestSimpleTapTap:
-    def test_tap_fires_render_fx_to_light_group_1(self, tmp_path):
+    def test_tap_fires_render_fx_to_all_light(self, tmp_path):
         s = make_simple_tap()
         host = _FakeHost()
         ctx = _ctx(s, tmp_path, host=host)
@@ -91,7 +91,9 @@ class TestSimpleTapTap:
         s.on_tap_detected(ctx, 200)
         assert len(host.renders) == 1
         target, ev = host.renders[0]
-        assert target == "01:01"
+        # Light class, all groups - a stock group-0 Lume lights without
+        # group config.
+        assert target == "01:00"
         assert (ev.r, ev.g, ev.b) == (255, 40, 40)
 
     def test_rainbow_advances_hue_across_taps(self, tmp_path):

@@ -31,6 +31,25 @@ Reference: https://tildagon.badge.emfcamp.org/tildagon-apps/development/
 Block plan: nocturnation-m5 docs/epics/epic-05-tildagon.md
 """
 
+# The Tildagon launcher loads this module as ``apps.nocturnation.app`` and
+# does NOT add ``apps/nocturnation/`` to sys.path, so this app's own modules
+# use relative imports (``from .nocturnation.X import Y`` below). The Epic 6B
+# Director Show library, however, lives in the sibling top-level packages
+# ``shows`` (concrete Shows) and is imported absolutely - both by
+# ``discover_shows()`` (``__import__("shows")``) and by each Show's
+# ``from nocturnation.X import Y`` - so the identical Show source runs
+# unchanged under host pytest (where ``apps/nocturnation`` IS on the path).
+# Add the app dir to sys.path here so those absolute imports resolve on the
+# badge too. Harmless on the host (already on the path) and a no-op if the
+# entry is already present.
+import sys as _sys
+try:
+    _APP_DIR = "/apps/nocturnation"
+    if _APP_DIR not in _sys.path:
+        _sys.path.append(_APP_DIR)
+except Exception as _exc:  # pragma: no cover - defensive only
+    print("[nocturnation] could not extend sys.path: %s" % _exc)
+
 import app
 from events.input import Buttons, BUTTON_TYPES
 
@@ -68,10 +87,12 @@ try:
     from system.scheduler.events import (
         RequestForegroundPushEvent,
         RequestForegroundPopEvent,
+        RequestStopAppEvent,
     )
 except ImportError:
     RequestForegroundPushEvent = None
     RequestForegroundPopEvent = None
+    RequestStopAppEvent = None
 try:
     from app_components import Menu, clear_background
 except ImportError:
@@ -83,6 +104,12 @@ try:
     import imu
 except ImportError:
     imu = None
+# Badge WiFi manager. We stop it before ESP-NOW so the radio stops
+# sweeping channels (B9 root cause). Optional import for host / sim.
+try:
+    import wifi as _badge_wifi
+except ImportError:
+    _badge_wifi = None
 
 # Relative imports against the internal nocturnation/ package: the
 # Tildagon launcher loads this module as apps.nocturnation.app and does
@@ -119,6 +146,13 @@ from .nocturnation.director.espnow_sender import make_sender
 _GROUP_CYCLE = (0, 1, 2, 3)
 _CHANNEL_CYCLE = ("auto", "1", "11")
 
+# B9 bench debug: when True, the receive path logs the *actual* radio
+# channel (wlan.config('channel')) vs the app's belief, WiFi
+# association state, and every raw frame with its parse + TOFU verdict.
+# The gated helpers (_dbg_radio / _dbg_frame) stay for future bench
+# work; flip this back on to re-enable the logging.
+_DEBUG = False
+
 # Director mode transmits on the hobby channel only (Epic 5.5: the
 # Tildagon must not broadcast on the channel-11 Performance band).
 DIRECTOR_CHANNEL = 1
@@ -147,11 +181,13 @@ class NocturNationApp(app.App):
     def __init__(self) -> None:
         self.button_states = Buttons(self)
         self._dedup = DedupRing()
-        self._scanner = ChannelScanner()
         self._frame_count = 0
         self._last_frame = None
         self._status = "starting"
         self._esp = None
+        # WiFi STA handle, stored so the receive loop can read back the
+        # actual radio channel for B9 debug.
+        self._wlan = None
         # Last channel for which wlan.config(channel=N) succeeded. None
         # if we never managed to set the radio channel at all. Shown on
         # the LCD so the operator knows which channel to align the
@@ -160,6 +196,11 @@ class NocturNationApp(app.App):
         # Load persisted settings before constructing renderers so the
         # initial Calm Mode state matches what the operator last chose.
         self._settings = Settings.load()
+        # Build the channel scanner from the persisted Channel setting:
+        # "1" / "11" pin a single channel (no scan, no mis-lock); "auto"
+        # cycles the full order. Constructed after settings load so the
+        # pin takes effect.
+        self._scanner = self._make_scanner()
         # Perimeter LED renderer. Calm Mode default per persisted
         # settings (default True). Architecture spec section 15.
         self._renderer = PerimeterRenderer(calm_mode=self._settings.calm_mode)
@@ -169,11 +210,30 @@ class NocturNationApp(app.App):
         # In-app settings menu state.
         self._settings_open = False
         self._settings_menu = None
-        # Epic 6B: app role. "lume" (receive-only, the original
-        # behaviour) or "director" (Show framework + IMU tap-to-beat +
-        # LIGHT_COMMAND broadcast). Restored from persisted settings so
-        # a Director badge reopens in Director mode.
-        self._mode = self._settings.mode
+        # Epic 6B: app role. "idle" (no radio, WiFi left up so the badge
+        # stays connected while the operator is in the start menu),
+        # "lume" (receive), or "director" (Show framework + IMU + TX).
+        # Always launch into idle; the operator starts a mode from the
+        # idle menu, at which point we take the radio (wifi.stop) - so
+        # WiFi only goes down when a mode is actively running.
+        self._mode = "idle"
+        # Idle start-menu (Menu component); built lazily on first idle
+        # tick. None while a mode is running.
+        self._idle_menu = None
+        # Help screen (QR code) state. _help_matrix is the cached uQR
+        # matrix; built once on open so QR generation doesn't run every
+        # draw frame.
+        self._help_open = False
+        self._help_matrix = None
+        # True while we hold the radio (WiFi stopped + ESP-NOW up). The
+        # background loop acquires it on entering a mode and releases it
+        # (restoring WiFi) on returning to idle.
+        self._radio_held = False
+        # Director runtime, built lazily on first Director-mode entry
+        # (_ensure_director). None in Lume mode / before first entry.
+        self._controller = None
+        self._director_host = None
+        self._dispatcher = None
         # Director runtime, built lazily on first Director-mode entry
         # (_ensure_director). None in Lume mode / before first entry.
         self._controller = None
@@ -289,18 +349,36 @@ class NocturNationApp(app.App):
             self._settings_menu.update(delta)
             return
 
+        # Help screen owns input: any of CONFIRM / CANCEL closes it.
+        if self._help_open:
+            if (self.button_states.get(BUTTON_TYPES["CANCEL"])
+                    or self.button_states.get(BUTTON_TYPES["CONFIRM"])):
+                self.button_states.clear()
+                self._close_help()
+            return
+
+        # Idle: the start menu owns input. Lazily open it on the first
+        # idle tick (Menu can't be built in __init__ before the app is
+        # registered with the scheduler).
+        if self._mode == "idle":
+            if self._idle_menu is None and Menu is not None:
+                self._open_idle_menu()
+            if self._idle_menu is not None:
+                self._idle_menu.update(delta)
+            return
+
         # Director mode owns its own foreground input handling.
         if self._mode == "director":
             self._update_director(delta)
             return
 
+        # Lume mode.
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
-            # Block 6: do NOT release patterns - the perimeter LEDs
-            # keep animating in the background per architecture spec
-            # section 7.3. The patterndisplay service stays inhibited
-            # for the lifetime of the app instance.
-            self.minimise()
+            # F = stop the Lume session and return to the idle menu
+            # (which restores WiFi). Switching to another badge app
+            # instead keeps the Lume running in the background (Block 6).
+            self._stop_to_idle()
             return
         if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
             self.button_states.clear()
@@ -339,10 +417,10 @@ class NocturNationApp(app.App):
         confirm = bool(self.button_states.get(BUTTON_TYPES["CONFIRM"]))
         self._controller.poll_button(confirm, now)
 
-        # CANCEL = leave Director mode.
+        # CANCEL = stop Director mode, back to the idle menu.
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
-            self._exit_director()
+            self._stop_to_idle()
             return
 
         # Nav buttons -> InputActions (mapper does its own edge
@@ -363,20 +441,141 @@ class NocturNationApp(app.App):
                 self._open_director_settings()
                 return
 
-    def _exit_director(self) -> None:
-        """Switch back to Lume mode. The background_task director
-        session sees self._mode change and returns (calling
-        controller.exit()); the lume session then resumes receive."""
-        self._mode = "lume"
-        self._settings.mode = "lume"
+    # =====================================================================
+    # Idle start menu + mode start/stop (Epic 6B B9)
+    # =====================================================================
+
+    def _idle_menu_items(self):
+        return ["Lume Mode", "Director Mode", "Settings", "Help", "Quit"]
+
+    def _open_idle_menu(self) -> None:
+        if Menu is None or self._idle_menu is not None:
+            return
+        self._idle_menu = Menu(
+            self,
+            self._idle_menu_items(),
+            select_handler=self._idle_menu_select,
+            back_handler=self._idle_menu_back,
+        )
+
+    def _close_idle_menu(self) -> None:
+        if self._idle_menu is not None:
+            try:
+                self._idle_menu._cleanup()
+            except Exception:
+                pass
+        self._idle_menu = None
+        self.button_states.clear()
+
+    def _idle_menu_select(self, item, idx) -> None:
+        if idx == 0:
+            self._start_mode("lume")
+        elif idx == 1:
+            self._start_mode("director")
+        elif idx == 2:
+            self._open_settings()   # config submenu; returns to idle on Back
+        elif idx == 3:
+            self._open_help()
+        elif idx == 4:
+            self._quit()
+
+    def _idle_menu_back(self) -> None:
+        # Back from the top idle menu minimises to the launcher. WiFi
+        # stays up (we never took the radio in idle).
+        self.minimise()
+
+    def _start_mode(self, mode) -> None:
+        """Leave idle and start an active mode. The background loop sees
+        the mode change and acquires the radio (stopping WiFi)."""
+        self._close_idle_menu()
+        self._mode = mode
+        self._settings.mode = mode
         try:
             self._settings.save()
         except Exception as exc:
             print("[nocturnation] settings save failed: %s" % exc)
+        print("[nocturnation] starting %s mode" % mode)
+
+    def _stop_to_idle(self) -> None:
+        """Stop the active mode and return to the idle menu. The
+        background loop releases the radio + restores WiFi on its next
+        idle iteration."""
+        self._mode = "idle"
         self._renderer.clear()
         self._lcd_renderer.clear()
         self._dark_perimeter()
-        print("[nocturnation] exited Director mode")
+        self._open_idle_menu()
+        print("[nocturnation] stopped to idle")
+
+    # =====================================================================
+    # Help screen - QR code to the project URL (Epic 6B B9)
+    # =====================================================================
+
+    def _build_qr(self, url):
+        """Generate the QR matrix for `url` via the vendored uQR library.
+        Returns a 2D bool matrix, or None on failure (lazy import so the
+        ~1300-line module only loads when Help is opened)."""
+        try:
+            from .uQR import QRCode
+            qr = QRCode()
+            qr.add_data(url)
+            return qr.get_matrix()
+        except Exception as exc:
+            print("[nocturnation] QR build failed: %s" % exc)
+            return None
+
+    def _open_help(self) -> None:
+        self._close_idle_menu()
+        self._help_open = True
+        self._help_matrix = self._build_qr(self._settings.help_url)
+
+    def _close_help(self) -> None:
+        self._help_open = False
+        self._help_matrix = None
+        self.button_states.clear()
+        if self._mode == "idle":
+            self._open_idle_menu()
+
+    def _restore_wifi(self) -> None:
+        """Re-enable the OS WiFi connection we took down at startup.
+
+        wifi.connect() is non-blocking - it reactivates the STA and kicks
+        off association to the configured SSID without waiting."""
+        if _badge_wifi is None:
+            return
+        try:
+            _badge_wifi.connect()
+            print("[nocturnation] WiFi restored to the OS")
+        except Exception as exc:
+            print("[nocturnation] wifi restore failed: %s" % exc)
+
+    def _quit(self) -> None:
+        """Cleanly leave the app and hand the radio back to the OS.
+
+        We took the radio with wifi.stop() at startup, so on quit we
+        release ESP-NOW, restore WiFi, return the LED ring to the badge's
+        idle animation, then ask the scheduler to stop us. RequestStopApp
+        cancels our background + update tasks and drops the launcher
+        cache, so a relaunch starts fresh."""
+        # Release ESP-NOW before WiFi reclaims the radio.
+        try:
+            if self._esp is not None:
+                self._esp.active(False)
+        except Exception as exc:
+            print("[nocturnation] esp deactivate failed: %s" % exc)
+        self._restore_wifi()
+        # Hand the LED ring back to the badge's pattern service.
+        self._resume_patterns()
+        self._dark_perimeter()
+        print("[nocturnation] quitting")
+        if eventbus is not None and RequestStopAppEvent is not None:
+            try:
+                eventbus.emit(RequestStopAppEvent(self))
+                return
+            except Exception as exc:
+                print("[nocturnation] stop-app emit failed: %s" % exc)
+        # Fallback if the scheduler event is unavailable: just minimise.
+        self.minimise()
 
     def _open_settings(self) -> None:
         """Open the in-app settings menu (Block 5).
@@ -388,6 +587,9 @@ class NocturNationApp(app.App):
         if Menu is None:
             print("[nocturnation] Menu component unavailable; cannot open settings")
             return
+        # If we came from the idle menu, close it so it doesn't draw
+        # underneath; _close_settings reopens it on Back when in idle.
+        self._close_idle_menu()
         self._settings_open = True
         self._renderer.clear()
         self._lcd_renderer.clear()
@@ -424,14 +626,20 @@ class NocturNationApp(app.App):
         # without this the next update() cycle would re-read the same
         # CONFIRM press as a fresh menu-open (or CANCEL as a minimise).
         self.button_states.clear()
+        # If we opened Settings from the idle menu, return to it.
+        if self._mode == "idle":
+            self._open_idle_menu()
 
     def _settings_menu_items(self):
-        """Compose the menu line labels from current settings values."""
+        """Compose the menu line labels from current settings values.
+
+        Config only - mode selection (Lume/Director) and Quit live on
+        the idle menu; this submenu is reachable both from idle and
+        in-session (CONFIRM while a Lume runs)."""
         return [
             "Calm Mode: %s" % ("ON" if self._settings.calm_mode else "OFF"),
             "Group: %d" % self._settings.group,
             "Channel: %s" % self._settings.channel,
-            "Mode: %s" % ("Director" if self._mode == "director" else "Lume"),
             "Rescan",
             "Back",
         ]
@@ -471,19 +679,6 @@ class NocturNationApp(app.App):
                 pos = -1
             self._settings.channel = _CHANNEL_CYCLE[(pos + 1) % len(_CHANNEL_CYCLE)]
         elif idx == 3:
-            # Toggle app mode (Epic 6B). Persist immediately, then close
-            # settings; the background_task loop picks up the new
-            # self._mode on its next iteration and switches sessions.
-            self._mode = "director" if self._mode != "director" else "lume"
-            self._settings.mode = self._mode
-            try:
-                self._settings.save()
-            except Exception as exc:
-                print("[nocturnation] settings save failed: %s" % exc)
-            print("[nocturnation] mode -> %s" % self._mode)
-            self._close_settings()
-            return
-        elif idx == 4:
             # Rescan (Epic 5.5 B7). Clears the TOFU lock so the next
             # valid frame on the current channel establishes a fresh
             # lock. Note: the Tildagon's radio doesn't reliably support
@@ -493,7 +688,7 @@ class NocturNationApp(app.App):
             print("[nocturnation] TOFU lock cleared by operator")
             self._close_settings()
             return
-        elif idx == 5:
+        elif idx == 4:
             self._close_settings()
             return
         # Persist after every change. If the save fails we keep the
@@ -551,6 +746,16 @@ class NocturNationApp(app.App):
             self._settings_menu.draw(ctx)
             return
 
+        # Help screen (QR code) owns the screen when open.
+        if self._help_open:
+            self._draw_help(ctx)
+            return
+
+        # Idle: the start menu owns the screen.
+        if self._mode == "idle":
+            self._draw_idle(ctx)
+            return
+
         # Director mode: the active Show owns the screen (or an overlay).
         if self._mode == "director":
             self._draw_director(ctx)
@@ -605,6 +810,67 @@ class NocturNationApp(app.App):
         # what.
         ctx.font_size = 10
         ctx.move_to(0, 85).text("C: settings   F: exit")
+
+    def _draw_idle(self, ctx) -> None:
+        """Idle screen: the start menu (Lume / Director / Settings /
+        Quit). WiFi is up here; no radio session is running."""
+        if clear_background is not None:
+            clear_background(ctx)
+        else:
+            ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
+        if self._idle_menu is not None:
+            self._idle_menu.draw(ctx)
+        else:
+            ctx.rgb(1, 1, 1)
+            ctx.text_align = ctx.CENTER
+            ctx.text_baseline = ctx.MIDDLE
+            ctx.font_size = 22
+            ctx.move_to(0, -10).text("NocturNation")
+            ctx.font_size = 12
+            ctx.move_to(0, 20).text("starting...")
+
+    def _draw_help(self, ctx) -> None:
+        """Render the cached QR matrix as black modules on white, centred
+        in the round LCD, with the URL caption beneath. Pattern from the
+        shkspr.mobi Tildagon QR article."""
+        # QR codes need a light background; white the whole screen.
+        ctx.rgb(1, 1, 1).rectangle(-120, -120, 240, 240).fill()
+        m = self._help_matrix
+        if not m:
+            ctx.rgb(0, 0, 0)
+            ctx.text_align = ctx.CENTER
+            ctx.text_baseline = ctx.MIDDLE
+            ctx.font_size = 16
+            ctx.move_to(0, -10).text("Help unavailable")
+            ctx.font_size = 10
+            ctx.move_to(0, 15).text(self._settings.help_url)
+            return
+        qr_size = len(m)
+        # The round 240 px screen inscribes a ~170 px square (240/sqrt2),
+        # and a QR's corner finder patterns must stay on-screen to scan -
+        # so floor the module size to keep the whole code within 170 px
+        # (the blog's "+1" can overshoot for longer URLs and clip the
+        # corners under the bezel).
+        pixel_size = max(1, int(170 / qr_size))
+        code_px = pixel_size * qr_size
+        offset = -120 + (240 - code_px) / 2
+        for row in range(qr_size):
+            r = m[row]
+            for col in range(qr_size):
+                if r[col]:
+                    ctx.rgb(0, 0, 0).rectangle(
+                        (col * pixel_size) + offset,
+                        (row * pixel_size) + offset,
+                        pixel_size, pixel_size).fill()
+        # URL caption just below the code's bottom edge (the QR carries
+        # its own quiet-zone margin). Sitting it right under the code
+        # keeps it where the round screen is still wide enough to show
+        # the full text, rather than down at the narrow bottom chord.
+        ctx.rgb(0, 0, 0)
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+        ctx.font_size = 10
+        ctx.move_to(0, (offset + code_px) + 8).text(self._settings.help_url)
 
     def _draw_director(self, ctx) -> None:
         """Director mode draw: an open overlay owns the screen; otherwise
@@ -662,26 +928,103 @@ class NocturNationApp(app.App):
             print("[nocturnation] required modules unavailable; receive disabled")
             return
 
-        wlan = network.WLAN(network.STA_IF)
-        wlan.active(True)
-        self._esp = espnow.ESPNow()
-        self._esp.active(True)
-
-        # Session loop (Epic 6B): run the Lume receive session or the
-        # Director transmit session depending on self._mode. Each
-        # session returns when the mode changes; this outer loop then
-        # switches to the other.
+        # Session loop (Epic 6B). In idle we hold no radio and leave WiFi
+        # up (the operator is in the start menu / connected). On entering
+        # a mode we take the radio (wifi.stop + ESP-NOW); on returning to
+        # idle we release it and restore WiFi. So WiFi is only down while
+        # a Lume / Director session is actively running.
         while True:
+            if self._mode == "idle":
+                self._release_radio()
+                await asyncio.sleep_ms(100)
+                continue
+            self._acquire_radio()
+            if self._wlan is None:
+                # Acquire failed; drop back to idle rather than spin.
+                self._mode = "idle"
+                await asyncio.sleep_ms(200)
+                continue
             if self._mode == "director":
-                await self._director_session(wlan)
+                await self._director_session(self._wlan)
             else:
-                await self._lume_session(wlan)
+                await self._lume_session(self._wlan)
             await asyncio.sleep_ms(20)
 
+    def _acquire_radio(self) -> None:
+        """Take the radio for ESP-NOW: stop the badge WiFi manager (so the
+        ESP32 firmware stops channel-sweeping for an AP - the B9 root
+        cause), bring the STA up, and activate ESP-NOW. Idempotent while
+        held. Resets the scanner + TOFU so each session starts fresh."""
+        if self._radio_held:
+            return
+        if _badge_wifi is not None:
+            try:
+                _badge_wifi.stop()
+                print("[nocturnation] WiFi stopped to free the radio for ESP-NOW")
+            except Exception as exc:
+                print("[nocturnation] wifi.stop() failed: %s" % exc)
+        try:
+            self._wlan = network.WLAN(network.STA_IF)
+            self._wlan.active(True)
+            if self._esp is None:
+                self._esp = espnow.ESPNow()
+            self._esp.active(True)
+        except Exception as exc:
+            print("[nocturnation] radio acquire failed: %s" % exc)
+            self._wlan = None
+            return
+        # Fresh scan / lock state for this session.
+        self._scanner = self._make_scanner()
+        self._tofu.clear()
+        self._radio_held = True
+        self._dbg_radio("acquire")
+
+    def _release_radio(self) -> None:
+        """Release ESP-NOW and hand WiFi back to the OS. Idempotent."""
+        if not self._radio_held:
+            return
+        try:
+            if self._esp is not None:
+                self._esp.active(False)
+        except Exception as exc:
+            print("[nocturnation] esp deactivate failed: %s" % exc)
+        self._restore_wifi()
+        self._radio_held = False
+        self._status = "idle"
+        print("[nocturnation] radio released; WiFi restored")
+
+    def _make_scanner(self):
+        """Build the ChannelScanner from the persisted Channel setting.
+
+        "1" / "11" pin a single channel - no scan cycling, so the radio
+        stays put and can't mis-lock onto a neighbour that bleeds a
+        stray frame in (the B9 channel-6 bug). "auto" uses the full
+        11 -> 1 -> 6 scan order.
+        """
+        ch = self._settings.channel
+        if ch == "1":
+            return ChannelScanner(order=(1,))
+        if ch == "11":
+            return ChannelScanner(order=(11,))
+        return ChannelScanner()  # "auto" -> default SCAN_ORDER (11, 1, 6)
+
     async def _lume_session(self, wlan) -> None:
-        """Original receive behaviour: auto-scan, lock, then receive
-        until the mode changes back to something other than 'lume'."""
-        if not await self._scan_until_locked(wlan):
+        """Receive session. A pinned channel ("1"/"11") sets the radio
+        once and locks immediately; "auto" runs the scan state machine.
+        Returns when the mode leaves 'lume'."""
+        pinned = self._settings.channel in ("1", "11")
+        if pinned:
+            ch = int(self._settings.channel)
+            try:
+                wlan.config(channel=ch)
+            except Exception as exc:
+                print("[nocturnation] pin channel %d failed: %s" % (ch, exc))
+            self._receive_channel = ch
+            self._scanner.lock(ch)
+            self._status = "ch %d" % ch
+            print("[nocturnation] channel pinned to %d (no auto-scan)" % ch)
+            self._dbg_radio("pin-%d" % ch)
+        elif not await self._scan_until_locked(wlan):
             # Auto-scan bailed because channel-set failed mid-scan. The
             # radio is on whichever channel was last successfully set,
             # or on the platform default if none succeeded.
@@ -708,13 +1051,8 @@ class NocturNationApp(app.App):
         """
         self._ensure_director()
         if self._controller is None or not self._controller.show_ids():
-            print("[nocturnation] no Director shows available; reverting to Lume")
-            self._mode = "lume"
-            self._settings.mode = "lume"
-            try:
-                self._settings.save()
-            except Exception:
-                pass
+            print("[nocturnation] no Director shows available; back to idle")
+            self._stop_to_idle()
             return
 
         # Director transmits on the hobby channel only (Epic 5.5).
@@ -730,15 +1068,30 @@ class NocturNationApp(app.App):
         self._status = "director"
 
         poll_ms = 5
+        imu_interval_ms = 20     # ~50 Hz IMU poll - matches how the
+                                 # tap/motion detector was tuned (a
+                                 # faster poll lets the gravity EMA
+                                 # erode tap transients).
         render_interval_ms = 50  # ~20 Hz perimeter tick
-        last_render = time.ticks_ms() if time is not None else 0
+        now0 = time.ticks_ms() if time is not None else 0
+        last_imu = now0
+        last_render = now0
         while self._mode == "director":
             now = time.ticks_ms() if time is not None else 0
+            # Beacon a 1 Hz HEARTBEAT (skip-if-recent) so Lumes can
+            # discover the channel and keep their TOFU lock between
+            # taps. Runs even while an overlay is open - the Director
+            # stays discoverable while the operator navigates menus.
+            if time is not None:
+                self._dispatcher.heartbeat_tick(now)
             # When an overlay (picker / per-Show settings) is open it
             # owns the screen and input; the Show pauses.
             if self._director_overlay is None:
-                # IMU tap-to-beat (button tap is polled in update()).
-                self._controller.poll_inputs(now, button_pressed=None)
+                # IMU tap-to-beat at ~50 Hz (button tap is polled in
+                # update()).
+                if time is not None and now - last_imu >= imu_interval_ms:
+                    self._controller.poll_inputs(now, button_pressed=None)
+                    last_imu = now
                 self._controller.tick(now)
                 if time is not None and now - last_render >= render_interval_ms:
                     self._render_perimeter()
@@ -776,6 +1129,7 @@ class NocturNationApp(app.App):
             perimeter=self._renderer,
             lcd=self._lcd_renderer,
             source_id=DIRECTOR_SOURCE_ID,
+            redundancy=3,  # ESP-NOW is lossy; match the M5 master's 3x TX
         )
         clock = time.ticks_ms if time is not None else (lambda: 0)
         self._director_host = DirectorHost(
@@ -946,6 +1300,48 @@ class NocturNationApp(app.App):
         # closes doesn't immediately re-trigger.
         self._dir_buttons.reset()
 
+    def _dbg_radio(self, where) -> None:
+        """Log the actual radio channel + WiFi association vs the app's
+        belief. The crux of the B9 channel mystery: if wlan reports a
+        different channel than the scanner thinks, the channel-set is
+        being silently overridden (WiFi association pins it)."""
+        if not _DEBUG or self._wlan is None:
+            return
+        try:
+            actual = self._wlan.config("channel")
+        except Exception as exc:
+            actual = "ERR(%s)" % exc
+        try:
+            conn = self._wlan.isconnected()
+        except Exception:
+            conn = "?"
+        essid = ""
+        try:
+            if conn:
+                essid = self._wlan.config("essid")
+        except Exception:
+            pass
+        print("[dbg %s] radio_ch=%s wifi_conn=%s essid=%r | scanner_ch=%s recv_ch=%s tofu=%s"
+              % (where, actual, conn, essid,
+                 self._scanner.current_channel, self._receive_channel,
+                 self._tofu.locked_id))
+
+    def _dbg_frame(self, where, buf, frame, admitted) -> None:
+        """Log one received frame: raw head, magic check, parse + admit."""
+        if not _DEBUG:
+            return
+        n = len(buf)
+        head = bytes(buf[: min(n, 12)]).hex()
+        magic_ok = (n >= 3 and buf[0] == 0x4E and buf[1] == 0x4E)
+        if frame is None:
+            print("[dbg %s RX] len=%d magic=%s hex=%s -> DROPPED (parse-fail or dedup)"
+                  % (where, n, magic_ok, head))
+        else:
+            print("[dbg %s RX] len=%d type=0x%02X src=0x%02X seq=%d -> admit=%s (recv_ch=%s tofu=%s)"
+                  % (where, n, frame.message_type, frame.source_id,
+                     frame.sequence_number, admitted, self._receive_channel,
+                     self._tofu.locked_id))
+
     async def _scan_until_locked(self, wlan) -> bool:
         """Run the auto-scan state machine.
 
@@ -978,25 +1374,30 @@ class NocturNationApp(app.App):
             self._receive_channel = ch
 
             print("[nocturnation] scanning channel %d for %d ms" % (ch, listen_ms))
+            # Read back the ACTUAL radio channel: if it differs from `ch`,
+            # the channel-set was silently overridden (WiFi association).
+            self._dbg_radio("scan-set-%d" % ch)
             elapsed = 0
             while elapsed < listen_ms:
                 buf = self._try_recv()
                 if buf is not None:
                     frame = process_frame(buf, self._dedup)
-                    if frame is not None:
-                        # TOFU + cross-range gate (Epic 5.5 B6). A frame
-                        # that fails the gate (e.g. community-range id
-                        # on ch 11) is dropped silently; the channel
-                        # remains in scan because no eligible Director
-                        # was found on it.
-                        now_ms = time.ticks_ms() if time is not None else 0
-                        if self._tofu.admit(frame, ch, now_ms):
-                            self._observe_frame(frame)
-                            print("[nocturnation] locking channel %d "
-                                  "(src_id=0x%02X)" % (ch, frame.source_id))
-                            self._scanner.lock()
-                            self._status = "locked"
-                            return True
+                    # TOFU + cross-range gate (Epic 5.5 B6). A frame
+                    # that fails the gate (e.g. community-range id
+                    # on ch 11) is dropped silently; the channel
+                    # remains in scan because no eligible Director
+                    # was found on it.
+                    now_ms = time.ticks_ms() if time is not None else 0
+                    admitted = (frame is not None
+                                and self._tofu.admit(frame, ch, now_ms))
+                    self._dbg_frame("scan", buf, frame, admitted)
+                    if admitted:
+                        self._observe_frame(frame)
+                        print("[nocturnation] locking channel %d "
+                              "(src_id=0x%02X)" % (ch, frame.source_id))
+                        self._scanner.lock()
+                        self._status = "locked"
+                        return True
                 await asyncio.sleep_ms(poll_ms)
                 elapsed += poll_ms
 
@@ -1012,30 +1413,40 @@ class NocturNationApp(app.App):
         poll_ms = 5
         render_interval_ms = 50  # ~20 Hz perimeter tick
         last_render_ms = 0 if time is None else time.ticks_ms()
+        last_dbg_ms = last_render_ms
         # Return when the mode leaves "lume" so background_task can
         # switch to the Director session.
         while self._mode == "lume":
             buf = self._try_recv()
             if buf is not None:
                 frame = process_frame(buf, self._dedup)
-                if frame is not None:
-                    # TOFU + cross-range gate (Epic 5.5 B6). Drops frames
-                    # from non-locked source_ids and community-range ids
-                    # on channel 11.
-                    now_ms = time.ticks_ms() if time is not None else 0
-                    if self._tofu.admit(frame, self._receive_channel, now_ms):
-                        self._observe_frame(frame)
-                        if frame.message_type == MessageType.LIGHT_COMMAND:
-                            print(
-                                "[nocturnation] LIGHT r=%d g=%d b=%d cls=%d grp=%d"
-                                % (
-                                    frame.r,
-                                    frame.g,
-                                    frame.b,
-                                    frame.target_class,
-                                    frame.target_group,
-                                )
+                # TOFU + cross-range gate (Epic 5.5 B6). Drops frames
+                # from non-locked source_ids and community-range ids
+                # on channel 11.
+                now_ms = time.ticks_ms() if time is not None else 0
+                admitted = (frame is not None
+                            and self._tofu.admit(frame, self._receive_channel, now_ms))
+                self._dbg_frame("rx", buf, frame, admitted)
+                if admitted:
+                    self._observe_frame(frame)
+                    if frame.message_type == MessageType.LIGHT_COMMAND:
+                        print(
+                            "[nocturnation] LIGHT r=%d g=%d b=%d cls=%d grp=%d"
+                            % (
+                                frame.r,
+                                frame.g,
+                                frame.b,
+                                frame.target_class,
+                                frame.target_group,
                             )
+                        )
+            # Periodic radio-state log: reveals whether the actual radio
+            # channel drifts from what the app believes (B9 debug).
+            if _DEBUG and time is not None:
+                now = time.ticks_ms()
+                if now - last_dbg_ms >= 2000:
+                    self._dbg_radio("rx-loop")
+                    last_dbg_ms = now
             # Expire the TOFU lock on extended silence. The signal_tracker
             # already shows NO SIGNAL on a 3 s gap; the TOFU timeout is
             # the longer 10 s threshold that decides "give up on this

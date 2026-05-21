@@ -10,7 +10,7 @@ import pytest
 from nocturnation.director import RenderDispatcher, DispatchResult, parse_target
 from nocturnation.render import RgbPulse, PerimeterRenderer, LcdRenderer
 from nocturnation.protocol import parse_frame
-from nocturnation.protocol.constants import DeviceClass, Time, Chance
+from nocturnation.protocol.constants import DeviceClass, MessageType, Time, Chance
 
 
 def _always_fire_perimeter():
@@ -112,6 +112,21 @@ class TestBroadcast:
         assert result.sent is False
         assert result.perimeter_lit == 12
 
+    def test_redundancy_repeats_same_sequence(self):
+        # redundancy=3 -> each dispatch broadcasts the frame 3x with the
+        # SAME sequence number (the receiver dedups). Reliability without
+        # double-rendering.
+        sent = []
+        d = RenderDispatcher(send_fn=sent.append, redundancy=3)
+        d.dispatch("01:00", _pulse(), now_ms=0)
+        assert len(sent) == 3
+        seqs = [parse_frame(b).sequence_number for b in sent]
+        assert seqs == [0, 0, 0]
+        # Next dispatch advances the sequence once, then repeats it.
+        d.dispatch("01:00", _pulse(), now_ms=0)
+        seqs2 = [parse_frame(b).sequence_number for b in sent]
+        assert seqs2 == [0, 0, 0, 1, 1, 1]
+
     def test_no_send_fn_local_only(self):
         perimeter = _always_fire_perimeter()
         d = RenderDispatcher(send_fn=None, perimeter=perimeter)
@@ -188,6 +203,61 @@ class TestLoopbackRespectsRendererCaps:
         second = d.dispatch("01:00", _pulse(), now_ms=100)
         assert first.perimeter_lit == 12
         assert second.perimeter_lit == 0
+
+
+class TestHeartbeat:
+    def test_beacons_immediately_when_nothing_sent(self):
+        sent = []
+        d = RenderDispatcher(send_fn=sent.append, source_id=0x20)
+        assert d.heartbeat_tick(0) is True
+        assert len(sent) == 1
+        f = parse_frame(sent[0])
+        assert f.message_type == MessageType.HEARTBEAT
+        assert f.source_id == 0x20
+
+    def test_skips_within_interval(self):
+        sent = []
+        d = RenderDispatcher(send_fn=sent.append)
+        d.heartbeat_tick(0)        # beacon
+        assert d.heartbeat_tick(500) is False   # < 1000 ms
+        assert len(sent) == 1
+
+    def test_beacons_again_after_interval(self):
+        sent = []
+        d = RenderDispatcher(send_fn=sent.append)
+        d.heartbeat_tick(0)
+        assert d.heartbeat_tick(1000) is True
+        assert len(sent) == 2
+
+    def test_recent_light_command_suppresses_heartbeat(self):
+        # Skip-if-recent: a tap broadcast resets the timer, so no
+        # heartbeat is needed for the next second.
+        sent = []
+        d = RenderDispatcher(send_fn=sent.append)
+        d.dispatch("01:00", _pulse(), now_ms=0)   # LIGHT_COMMAND
+        assert d.heartbeat_tick(500) is False
+        # ...but once the gap exceeds the interval, the beacon resumes.
+        assert d.heartbeat_tick(1001) is True
+
+    def test_no_heartbeat_without_send_fn(self):
+        d = RenderDispatcher(send_fn=None)
+        assert d.heartbeat_tick(0) is False
+
+    def test_heartbeat_does_not_loop_back_locally(self):
+        # A heartbeat is a beacon, not a light - it must not arm LEDs.
+        perimeter = _always_fire_perimeter()
+        d = RenderDispatcher(send_fn=lambda p: None, perimeter=perimeter)
+        d.heartbeat_tick(0)
+        lit = sum(1 for i in range(1, 13) if perimeter._envelopes[i] is not None)
+        assert lit == 0
+
+    def test_shares_sequence_counter_with_light(self):
+        sent = []
+        d = RenderDispatcher(send_fn=sent.append)
+        d.dispatch("01:00", _pulse(), now_ms=0)   # seq 0
+        d.heartbeat_tick(2000)                      # seq 1
+        seqs = [parse_frame(b).sequence_number for b in sent]
+        assert seqs == [0, 1]
 
 
 class TestDispatchResult:

@@ -17,6 +17,7 @@ from .frame import (
     parse_frame,
     FrameError,
     encode_light_command,
+    encode_heartbeat,
     make_light_command_frame,
 )
 from .source_id import SourceId, is_community_range, is_performance_range
@@ -32,6 +33,7 @@ __all__ = [
     "parse_frame",
     "FrameError",
     "encode_light_command",
+    "encode_heartbeat",
     "make_light_command_frame",
     "SourceId",
     "is_community_range",

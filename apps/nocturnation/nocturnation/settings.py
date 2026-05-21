@@ -35,6 +35,11 @@ Three operator-tunable values:
     Director mode. Unknown values fall back to "lume" (the safe,
     receive-only default).
 
+  help_url (str, default "http://www.nocturnation.net")
+    URL the Help-screen QR code points to (Epic 6B B9). Configurable so
+    a deployment can point it at its own page; defaults to the project
+    site. Non-strings / empty fall back to the default.
+
 Persisted as JSON at DEFAULT_PATH (outside the apps directory so the
 app's deploy.sh wipe-and-copy doesn't clobber operator preferences).
 """
@@ -47,21 +52,24 @@ import json
 # firmware re-flash because Tildagon preserves user files across most
 # firmware updates.
 DEFAULT_PATH = "/nocturnation_settings.json"
+DEFAULT_HELP_URL = "http://www.nocturnation.net"
 
 _VALID_CHANNELS = ("auto", "1", "11")
 _VALID_MODES = ("lume", "director")
 
 
 class Settings:
-    __slots__ = ("calm_mode", "group", "channel", "active_show", "mode")
+    __slots__ = ("calm_mode", "group", "channel", "active_show", "mode",
+                 "help_url")
 
     def __init__(self, calm_mode=True, group=0, channel="auto", active_show="",
-                 mode="lume"):
+                 mode="lume", help_url=DEFAULT_HELP_URL):
         self.calm_mode = bool(calm_mode)
         self.group = self._coerce_group(group)
         self.channel = self._coerce_channel(channel)
         self.active_show = self._coerce_active_show(active_show)
         self.mode = self._coerce_mode(mode)
+        self.help_url = self._coerce_help_url(help_url)
 
     @staticmethod
     def _coerce_group(g):
@@ -100,6 +108,14 @@ class Settings:
             return m
         return "lume"
 
+    @staticmethod
+    def _coerce_help_url(u):
+        """Non-empty string kept; anything else falls back to the
+        project default."""
+        if isinstance(u, str) and u:
+            return u
+        return DEFAULT_HELP_URL
+
     def to_dict(self):
         return {
             "calm_mode": self.calm_mode,
@@ -107,6 +123,7 @@ class Settings:
             "channel": self.channel,
             "active_show": self.active_show,
             "mode": self.mode,
+            "help_url": self.help_url,
         }
 
     @classmethod
@@ -119,6 +136,7 @@ class Settings:
             channel=d.get("channel", "auto"),
             active_show=d.get("active_show", ""),
             mode=d.get("mode", "lume"),
+            help_url=d.get("help_url", DEFAULT_HELP_URL),
         )
 
     def save(self, path=DEFAULT_PATH):
@@ -146,16 +164,19 @@ class Settings:
             and self.channel == other.channel
             and self.active_show == other.active_show
             and self.mode == other.mode
+            and self.help_url == other.help_url
         )
 
     def __repr__(self):
         return (
-            "Settings(calm_mode=%r, group=%r, channel=%r, active_show=%r, mode=%r)"
+            "Settings(calm_mode=%r, group=%r, channel=%r, active_show=%r, "
+            "mode=%r, help_url=%r)"
             % (
                 self.calm_mode,
                 self.group,
                 self.channel,
                 self.active_show,
                 self.mode,
+                self.help_url,
             )
         )

@@ -230,3 +230,48 @@ def make_light_command_frame(
     f.release = release
     f.chance = chance
     return f
+
+
+_HEARTBEAT_PAYLOAD_LEN = PAYLOAD_LENGTHS[MessageType.HEARTBEAT]
+
+
+def encode_heartbeat(
+    source_id,
+    sequence_number,
+    tick=0,
+    days_since_2026=0,
+    centiseconds_today=0,
+    hop_count=0,
+):
+    """Build the wire bytes for a HEARTBEAT frame (spec v0.29 §3.3.1).
+
+    8-byte header + 9-byte payload: tick (u32 LE) + days_since_2026
+    (u16 LE) + centiseconds_today (u24 LE). The Director beacons this
+    at ~1 Hz so Lumes can discover its channel and keep their TOFU
+    lock alive between LIGHT_COMMANDs. The clock fields are best-effort
+    (the Tildagon Director has no synced RTC); current Lumes treat any
+    valid frame as liveness and don't act on these values - CLOCK_SYNC
+    / TIME_SYNC were removed in the v0.29 protocol trim.
+    """
+    tick &= 0xFFFFFFFF
+    days = days_since_2026 & 0xFFFF
+    cs = centiseconds_today & 0xFFFFFF
+    return bytes((
+        MAGIC_0,
+        MAGIC_1,
+        PROTOCOL_VERSION,
+        source_id & 0xFF,
+        sequence_number & 0xFF,
+        hop_count & 0xFF,
+        MessageType.HEARTBEAT,
+        _HEARTBEAT_PAYLOAD_LEN,
+        tick & 0xFF,
+        (tick >> 8) & 0xFF,
+        (tick >> 16) & 0xFF,
+        (tick >> 24) & 0xFF,
+        days & 0xFF,
+        (days >> 8) & 0xFF,
+        cs & 0xFF,
+        (cs >> 8) & 0xFF,
+        (cs >> 16) & 0xFF,
+    ))

@@ -43,15 +43,26 @@ def rmtree(p):
 rmtree("/apps/nocturnation")
 '
 
+# Strip host __pycache__ before copying: pytest leaves CPython .pyc
+# files (one __pycache__ per package dir) that MicroPython can't use -
+# copying them just wastes badge flash and slows the wipe. Only .py
+# source should land on the badge.
+echo "[deploy] stripping local __pycache__"
+find apps/nocturnation -name __pycache__ -type d -prune -exec rm -rf {} +
+
 echo "[deploy] copying apps/nocturnation to the badge"
 mpremote cp -r apps/nocturnation :apps/
+
+# Verify the copy landed BEFORE resetting: `mpremote reset` drops and
+# re-enumerates the USB serial device, so any mpremote command issued
+# immediately after fails with "[Errno 6] Device not configured" while
+# the badge reboots. List first (REPL still alive), then reset once.
+echo "[deploy] listing :apps/nocturnation"
+mpremote ls :apps/nocturnation
 
 if [[ "$RESET" -eq 1 ]]; then
     echo "[deploy] resetting badge"
     mpremote reset
 fi
 
-echo "[deploy] listing :apps/nocturnation"
-mpremote ls :apps/nocturnation
-mpremote reset
 echo "[deploy] done. Launch 'NocturNation' from the badge UI."

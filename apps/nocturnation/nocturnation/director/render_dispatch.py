@@ -27,7 +27,11 @@ callable so the whole fan-out is host-testable. B6 wires the real
 `espnow.send(broadcast_mac, ...)` via `espnow_sender.make_sender`.
 """
 
-from ..protocol import encode_light_command, make_light_command_frame
+from ..protocol import (
+    encode_light_command,
+    encode_heartbeat,
+    make_light_command_frame,
+)
 from ..protocol.constants import DeviceClass
 
 
@@ -114,14 +118,28 @@ class RenderDispatcher:
                    is allocated per Epic 5.5 and injected by B6.
     """
 
-    __slots__ = ("_send_fn", "_perimeter", "_lcd", "_source_id", "_sequence")
+    __slots__ = ("_send_fn", "_perimeter", "_lcd", "_source_id", "_sequence",
+                 "_last_tx_ms", "_redundancy")
 
-    def __init__(self, send_fn=None, perimeter=None, lcd=None, source_id=0x01):
+    def __init__(self, send_fn=None, perimeter=None, lcd=None, source_id=0x01,
+                 redundancy=1):
         self._send_fn = send_fn
         self._perimeter = perimeter
         self._lcd = lcd
         self._source_id = source_id & 0xFF
         self._sequence = 0
+        # How many times to repeat each LIGHT_COMMAND broadcast. ESP-NOW
+        # is fire-and-forget with no retransmission, so a single send is
+        # lossy; the M5 master sends 3x for reliability and the receiver
+        # dedups on (source_id, sequence). Default 1 keeps tests simple;
+        # the app opts into 3. Heartbeats stay single (1 Hz is already
+        # redundant over time).
+        self._redundancy = max(1, redundancy)
+        # Wall-clock of the last frame actually broadcast (any type).
+        # Drives heartbeat skip-if-recent: a LIGHT_COMMAND already
+        # proves liveness, so a heartbeat is only sent to fill quiet
+        # gaps. None = nothing sent yet (beacon immediately on entry).
+        self._last_tx_ms = None
 
     @property
     def source_id(self):
@@ -161,12 +179,18 @@ class RenderDispatcher:
 
         sent = False
         if self._send_fn is not None:
-            try:
-                self._send_fn(payload)
-                sent = True
-            except Exception:
-                # Swallow radio errors: the show goes on locally.
-                sent = False
+            # Repeat for reliability; the receiver dedups on
+            # (source_id, sequence) so the repeats render once.
+            for _ in range(self._redundancy):
+                try:
+                    self._send_fn(payload)
+                    sent = True
+                except Exception:
+                    # Swallow radio errors: the show goes on locally,
+                    # and the remaining repeats may still get through.
+                    pass
+            if sent:
+                self._last_tx_ms = now_ms
 
         # 2. Local loopback. Build the Frame directly (no byte
         #    round-trip) and feed the renderers that match the class.
@@ -193,3 +217,27 @@ class RenderDispatcher:
                 lcd_armed = self._lcd.dispatch(frame, now_ms)
 
         return DispatchResult(sent, perimeter_lit, lcd_armed)
+
+    def heartbeat_tick(self, now_ms, interval_ms=1000):
+        """Beacon a HEARTBEAT if no frame has gone out in `interval_ms`.
+
+        Called every loop tick; self-throttles to ~1 Hz. Skip-if-recent:
+        a LIGHT_COMMAND broadcast already proves liveness, so a tapping
+        Director needs no extra heartbeats - they only fill quiet gaps
+        so a Lume can discover the channel and keep its TOFU lock.
+
+        Heartbeats broadcast only (no local loopback - they're a beacon,
+        not a light). Returns True if a heartbeat was sent this call.
+        """
+        if self._send_fn is None:
+            return False
+        if self._last_tx_ms is not None and (now_ms - self._last_tx_ms) < interval_ms:
+            return False
+        payload = encode_heartbeat(self._source_id, self._sequence, tick=now_ms)
+        self._sequence = (self._sequence + 1) & 0xFF
+        try:
+            self._send_fn(payload)
+        except Exception:
+            return False
+        self._last_tx_ms = now_ms
+        return True

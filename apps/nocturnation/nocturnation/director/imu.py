@@ -50,21 +50,33 @@ SENSITIVITY_HIGH = 2
 
 # Per-sensitivity tuning. All accelerations are in m/s^2 of the
 # gravity-removed (high-pass) vector. Higher sensitivity = lower
-# thresholds = more responsive (and more false positives). Bench-
-# tunable in B9.
+# thresholds = more responsive (and more false positives).
 #
 #   tap_threshold  - high-pass magnitude that counts as a tap onset
 #   motion_floor   - motion-envelope level that counts as "in motion"
 #
+# Bench-tuned on real hardware (Epic 6B B9): a hand-held finger-tap on
+# the Tildagon delivers only ~1.0-2.6 m/s^2 of high-pass acceleration
+# (the hand absorbs most of the impulse), not the ~6-9 the first-cut
+# values assumed. The thresholds below sit inside that measured band.
+# `tap_threshold` stays above `motion_floor` at each level so a sharp
+# tap reads as a tap while gentler sustained movement reads as motion -
+# though on this badge the two bands nearly overlap, so expect brisk
+# waving to occasionally register a tap.
+#
 # tap strength saturates `TAP_SATURATION_MS2` above the threshold.
 _SENSITIVITY_TABLE = {
-    SENSITIVITY_LOW:    {"tap_threshold": 9.0, "motion_floor": 4.0},
-    SENSITIVITY_MEDIUM: {"tap_threshold": 6.0, "motion_floor": 2.5},
-    SENSITIVITY_HIGH:   {"tap_threshold": 3.5, "motion_floor": 1.5},
+    SENSITIVITY_LOW:    {"tap_threshold": 2.2, "motion_floor": 1.5},
+    SENSITIVITY_MEDIUM: {"tap_threshold": 1.5, "motion_floor": 1.0},
+    # High retuned down (B9): a normal badge tap still needed too firm a
+    # hit at 1.0, so trigger at 0.6 with the motion floor below it.
+    SENSITIVITY_HIGH:   {"tap_threshold": 0.6, "motion_floor": 0.35},
 }
 
 # Magnitude above the tap threshold that maps to full strength (255).
-TAP_SATURATION_MS2 = 10.0
+# Real taps clear the threshold by only ~1-1.5 m/s^2, so the saturation
+# span is small (was 10.0, tuned for the old hard-hit assumption).
+TAP_SATURATION_MS2 = 2.0
 
 # Minimum gap between taps. A second spike inside this window is the
 # same physical tap ringing down; drop it. Mirrors the M5

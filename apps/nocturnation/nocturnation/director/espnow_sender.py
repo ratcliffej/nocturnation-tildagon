@@ -27,6 +27,12 @@ def make_sender(esp, broadcast_mac=BROADCAST_MAC):
     add_peer for the same MAC raises OSError, which we swallow so
     callers don't have to track registration state). The returned
     callable sends one frame per call.
+
+    Lightweight TX diagnostics (Epic 6B B9): prints the first
+    successful broadcast and every 50th thereafter, and surfaces send
+    failures (the first few) before re-raising so the caller's
+    dispatch result stays accurate. This is the only window onto
+    "is the Director actually transmitting?" from the badge REPL.
     """
     try:
         esp.add_peer(broadcast_mac)
@@ -35,7 +41,18 @@ def make_sender(esp, broadcast_mac=BROADCAST_MAC):
         # either way the peer exists and send() will work.
         pass
 
+    state = {"sent": 0, "errs": 0}
+
     def send_fn(payload):
-        esp.send(broadcast_mac, payload)
+        try:
+            esp.send(broadcast_mac, payload)
+        except Exception as exc:
+            state["errs"] += 1
+            if state["errs"] <= 5:
+                print("[director] ESP-NOW TX failed: %s" % exc)
+            raise
+        state["sent"] += 1
+        if state["sent"] == 1 or state["sent"] % 50 == 0:
+            print("[director] ESP-NOW TX #%d (%d bytes)" % (state["sent"], len(payload)))
 
     return send_fn

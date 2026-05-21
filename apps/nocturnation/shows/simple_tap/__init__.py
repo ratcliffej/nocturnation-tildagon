@@ -98,7 +98,11 @@ class SimpleTap(Show):
         r, g, b = self._colour_for(palette)
         self._last_rgb = (r, g, b)
         self._last_tap_ms = ctx.now_ms()
-        ctx.render_fx("01:01", RgbPulse(
+        # Light class, group 0 = every Light-class Lume regardless of its
+        # group setting. A basic tap show shouldn't require operators to
+        # configure a matching group on each badge; group targeting is
+        # for shows that deliberately address sub-zones.
+        ctx.render_fx("01:00", RgbPulse(
             r, g, b,
             attack=Time.T_0_MS,
             sustain=Time.T_96_MS,
@@ -176,7 +180,7 @@ _PROPS = (
     PropertyDef(
         key="sensitivity",
         type=PropertyType.ENUM,
-        default_value=1,  # Medium
+        default_value=2,  # High - a hand-held badge tap is gentle (B9 bench)
         min_value=0,
         max_value=2,
         display_name="Sensitivity",

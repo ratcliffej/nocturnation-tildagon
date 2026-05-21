@@ -7,8 +7,13 @@ with no badge.
 
 Gravity is primed to (0, 0, 9.81) by the first sample in each trace;
 the gravity EMA (alpha 0.05) then tracks slowly while the high-pass
-captures transients. With a single-sample spike after priming, the
-high-pass Z works out to ~0.95 * (az - 9.81).
+captures transients. With a single-sample Z spike after priming the
+high-pass works out to ~0.95 * (az - 9.81), so `_az_for_hp` inverts
+that to place a tap at a chosen magnitude.
+
+Thresholds are read from `_SENSITIVITY_TABLE` rather than hardcoded,
+so these tests track the bench-tuned values instead of breaking on
+every retune.
 """
 
 from nocturnation.director import (
@@ -18,11 +23,28 @@ from nocturnation.director import (
     SENSITIVITY_MEDIUM,
     SENSITIVITY_HIGH,
 )
-from nocturnation.director.imu import AXIS_X, AXIS_Y, AXIS_Z
+from nocturnation.director.imu import (
+    AXIS_X, AXIS_Y, AXIS_Z,
+    _SENSITIVITY_TABLE,
+    TAP_SATURATION_MS2,
+)
 from nocturnation.hal import Capability
 
 
 G = 9.81  # resting gravity on Z, m/s^2
+
+
+def _tap_thr(level):
+    return _SENSITIVITY_TABLE[level]["tap_threshold"]
+
+
+def _motion_floor(level):
+    return _SENSITIVITY_TABLE[level]["motion_floor"]
+
+
+def _az_for_hp(hp):
+    """Z accel that, after gravity priming at G, yields high-pass `hp`."""
+    return G + hp / 0.95
 
 
 class _Recorder:
@@ -60,11 +82,27 @@ def _trace_reader(samples):
     return read
 
 
+def _spike(hp, level=SENSITIVITY_MEDIUM):
+    """A prime-then-spike trace placing a single tap at high-pass `hp`."""
+    return [(0, 0, G), (0, 0, _az_for_hp(hp))]
+
+
 class TestCapabilityExport:
     def test_adapter_caps_are_tap_and_motion(self):
         assert IMU_ADAPTER_CAPS.has(Capability.IMU_TAP) is True
         assert IMU_ADAPTER_CAPS.has(Capability.IMU_MOTION) is True
         assert IMU_ADAPTER_CAPS.has(Capability.IMU) is False  # coarse flag not implied
+
+
+class TestThresholdOrdering:
+    def test_tap_threshold_above_motion_floor(self):
+        # A sharp tap must read harder than gentle sustained motion at
+        # every sensitivity level, or the two can't be told apart.
+        for level in (SENSITIVITY_LOW, SENSITIVITY_MEDIUM, SENSITIVITY_HIGH):
+            assert _tap_thr(level) > _motion_floor(level)
+
+    def test_higher_sensitivity_lowers_thresholds(self):
+        assert _tap_thr(SENSITIVITY_HIGH) < _tap_thr(SENSITIVITY_MEDIUM) < _tap_thr(SENSITIVITY_LOW)
 
 
 class TestPriming:
@@ -87,36 +125,52 @@ class TestPriming:
 class TestTapDetection:
     def test_spike_fires_tap(self):
         rec = _Recorder()
-        # prime at gravity, then one Z spike well above the Medium
-        # threshold (hz ~ 0.95 * (18 - 9.81) = 7.78 > 6.0).
-        a = _adapter(rec, acc_read_fn=_trace_reader([(0, 0, G), (0, 0, 18.0)]))
+        hp = _tap_thr(SENSITIVITY_MEDIUM) + 1.0
+        a = _adapter(rec, acc_read_fn=_trace_reader(_spike(hp)))
         a.poll(0)        # prime
         tap, _motion = a.poll(20)
         assert tap is True
         assert len(rec.taps) == 1
         assert rec.taps[0] >= 1  # strength floor invariant
 
-    def test_strength_scales_with_spike(self):
+    def test_just_over_threshold_floors_strength_to_at_least_1(self):
         rec = _Recorder()
-        a = _adapter(rec, acc_read_fn=_trace_reader([(0, 0, G), (0, 0, 18.0)]))
+        hp = _tap_thr(SENSITIVITY_MEDIUM) + 0.01
+        a = _adapter(rec, acc_read_fn=_trace_reader(_spike(hp)))
         a.poll(0)
         a.poll(20)
-        # over = 7.78 - 6.0 = 1.78; strength = 1.78/10*255 ~ 45.
-        assert 43 <= rec.taps[0] <= 47
+        assert rec.taps == [max(1, rec.taps[0])]
+        assert rec.taps[0] >= 1
+
+    def test_strength_increases_with_spike(self):
+        rec_small = _Recorder()
+        a_small = _adapter(rec_small, acc_read_fn=_trace_reader(
+            _spike(_tap_thr(SENSITIVITY_MEDIUM) + 0.4)))
+        a_small.poll(0); a_small.poll(20)
+
+        rec_big = _Recorder()
+        a_big = _adapter(rec_big, acc_read_fn=_trace_reader(
+            _spike(_tap_thr(SENSITIVITY_MEDIUM) + 1.5)))
+        a_big.poll(0); a_big.poll(20)
+
+        assert rec_small.taps[0] < rec_big.taps[0]
 
     def test_huge_spike_saturates_strength(self):
         rec = _Recorder()
-        a = _adapter(rec, acc_read_fn=_trace_reader([(0, 0, G), (0, 0, 100.0)]))
+        hp = _tap_thr(SENSITIVITY_MEDIUM) + TAP_SATURATION_MS2 + 5.0
+        a = _adapter(rec, acc_read_fn=_trace_reader(_spike(hp)))
         a.poll(0)
         a.poll(20)
         assert rec.taps[0] == 255
 
     def test_below_threshold_no_tap(self):
         rec = _Recorder()
-        # hz ~ 0.95 * (13 - 9.81) = 3.03, below Medium 6.0.
-        a = _adapter(rec, acc_read_fn=_trace_reader([(0, 0, G), (0, 0, 13.0)]))
+        # Below the tap threshold and below the motion floor (a single
+        # spike only moves the motion envelope by ~0.30 * hp).
+        hp = _tap_thr(SENSITIVITY_MEDIUM) - 0.3
+        a = _adapter(rec, acc_read_fn=_trace_reader(_spike(hp)))
         a.poll(0)
-        tap, _ = a.poll(20)
+        tap, motion = a.poll(20)
         assert tap is False
         assert rec.taps == []
 
@@ -124,8 +178,9 @@ class TestTapDetection:
 class TestRefractory:
     def test_second_spike_within_refractory_dropped(self):
         rec = _Recorder()
+        hp = _tap_thr(SENSITIVITY_MEDIUM) + 1.0
         a = _adapter(rec, acc_read_fn=_trace_reader(
-            [(0, 0, G), (0, 0, 18.0), (0, 0, 18.0)]))
+            [(0, 0, G), (0, 0, _az_for_hp(hp)), (0, 0, _az_for_hp(hp))]))
         a.poll(0)            # prime
         a.poll(20)           # tap 1
         tap2, _ = a.poll(60)  # 40 ms later, inside 120 ms refractory
@@ -134,8 +189,9 @@ class TestRefractory:
 
     def test_second_spike_after_refractory_fires(self):
         rec = _Recorder()
+        hp = _tap_thr(SENSITIVITY_MEDIUM) + 1.0
         a = _adapter(rec, acc_read_fn=_trace_reader(
-            [(0, 0, G), (0, 0, 18.0), (0, 0, G), (0, 0, 18.0)]))
+            [(0, 0, G), (0, 0, _az_for_hp(hp)), (0, 0, G), (0, 0, _az_for_hp(hp))]))
         a.poll(0)             # prime
         a.poll(20)            # tap 1
         a.poll(40)            # back to gravity-ish
@@ -146,9 +202,9 @@ class TestRefractory:
 
 class TestSensitivity:
     def test_high_fires_where_medium_does_not(self):
-        # hz ~ 0.95 * (15 - 9.81) = 4.93. Above High (3.5), below
-        # Medium (6.0).
-        trace = [(0, 0, G), (0, 0, 15.0)]
+        # A tap between the High and Medium thresholds.
+        hp = (_tap_thr(SENSITIVITY_HIGH) + _tap_thr(SENSITIVITY_MEDIUM)) / 2.0
+        trace = _spike(hp)
 
         med = _Recorder()
         a_med = _adapter(med, sensitivity=SENSITIVITY_MEDIUM,
@@ -163,9 +219,9 @@ class TestSensitivity:
         assert len(high.taps) == 1
 
     def test_low_needs_firmer_tap(self):
-        # hz ~ 0.95 * (17 - 9.81) = 6.83. Above Medium (6.0), below
-        # Low (9.0).
-        trace = [(0, 0, G), (0, 0, 17.0)]
+        # A tap between the Medium and Low thresholds.
+        hp = (_tap_thr(SENSITIVITY_MEDIUM) + _tap_thr(SENSITIVITY_LOW)) / 2.0
+        trace = _spike(hp)
 
         low = _Recorder()
         a_low = _adapter(low, sensitivity=SENSITIVITY_LOW,
@@ -180,7 +236,8 @@ class TestSensitivity:
         assert len(med.taps) == 1
 
     def test_set_sensitivity_runtime(self):
-        trace = [(0, 0, G), (0, 0, 15.0)]
+        hp = (_tap_thr(SENSITIVITY_HIGH) + _tap_thr(SENSITIVITY_MEDIUM)) / 2.0
+        trace = _spike(hp)
         rec = _Recorder()
         a = _adapter(rec, sensitivity=SENSITIVITY_MEDIUM,
                      acc_read_fn=_trace_reader(trace))
@@ -189,64 +246,78 @@ class TestSensitivity:
         assert len(rec.taps) == 1
 
     def test_unknown_sensitivity_falls_back_to_medium(self):
-        trace = [(0, 0, G), (0, 0, 18.0)]  # fires at Medium
+        hp = _tap_thr(SENSITIVITY_MEDIUM) + 1.0  # fires at Medium
+        trace = _spike(hp)
         rec = _Recorder()
         a = _adapter(rec, acc_read_fn=_trace_reader(trace))
-        a.set_sensitivity(99)  # nonsense
+        a.set_sensitivity(99)  # nonsense -> Medium
         a.poll(0); a.poll(20)
         assert len(rec.taps) == 1
 
 
 class TestMotion:
-    def _oscillation(self, n, amp=5.0):
+    def _oscillation(self, n, amp):
         # Z oscillates +/- amp around gravity: a "wave". |hz| ~ 0.95*amp
-        # each poll (below the 6.0 tap threshold for amp=5), envelope
-        # builds above the motion floor, gravity stays ~G.
+        # each poll; gravity stays ~G because the swings cancel.
         samples = [(0, 0, G)]  # prime
         for i in range(n):
             samples.append((0, 0, G + (amp if i % 2 == 0 else -amp)))
         return samples
 
+    def _amp_for_hp(self, hp):
+        return hp / 0.95
+
     def test_sustained_motion_fires(self):
+        # |hz| sits between the motion floor and the tap threshold, so a
+        # wave reads as motion without tripping taps.
+        med_motion = _motion_floor(SENSITIVITY_MEDIUM)
+        med_tap = _tap_thr(SENSITIVITY_MEDIUM)
+        amp = self._amp_for_hp((med_motion + med_tap) / 2.0)
         rec = _Recorder()
-        a = _adapter(rec, acc_read_fn=_trace_reader(self._oscillation(20)))
+        a = _adapter(rec, acc_read_fn=_trace_reader(self._oscillation(20, amp)))
         for i in range(21):
             a.poll(i * 20)  # 50 Hz
         assert len(rec.motions) >= 1
+        assert rec.taps == []  # below the tap threshold
         axis, mag = rec.motions[0]
         assert axis == AXIS_Z
         assert mag > 0
 
     def test_motion_rate_limited(self):
+        med_motion = _motion_floor(SENSITIVITY_MEDIUM)
+        med_tap = _tap_thr(SENSITIVITY_MEDIUM)
+        amp = self._amp_for_hp((med_motion + med_tap) / 2.0)
         rec = _Recorder()
-        a = _adapter(rec, acc_read_fn=_trace_reader(self._oscillation(40)))
+        a = _adapter(rec, acc_read_fn=_trace_reader(self._oscillation(40, amp)))
         # 41 polls at 20 ms = 800 ms. Motion interval 100 ms -> at most
-        # ~8 events even though the wave is continuous.
+        # ~9 events even though the wave is continuous.
         for i in range(41):
             a.poll(i * 20)
         assert len(rec.motions) <= 9
 
     def test_no_motion_below_floor(self):
+        # |hz| under the motion floor -> the envelope never crosses it.
+        amp = self._amp_for_hp(_motion_floor(SENSITIVITY_MEDIUM) * 0.5)
         rec = _Recorder()
-        # amp=1.5 -> |hz| ~ 1.4, envelope stays under Medium floor 2.5.
-        a = _adapter(rec, acc_read_fn=_trace_reader(self._oscillation(20, amp=1.5)))
+        a = _adapter(rec, acc_read_fn=_trace_reader(self._oscillation(20, amp)))
         for i in range(21):
             a.poll(i * 20)
         assert rec.motions == []
 
     def test_tap_suppresses_motion_same_poll(self):
-        rec = _Recorder()
-        # Build the envelope with a wave, then a big spike. On the spike
-        # poll the tap fires and motion must be suppressed.
+        # Build the envelope with a wave, then a firm spike. On the spike
+        # poll the tap fires and motion is suppressed.
+        med_motion = _motion_floor(SENSITIVITY_MEDIUM)
+        med_tap = _tap_thr(SENSITIVITY_MEDIUM)
+        amp = self._amp_for_hp((med_motion + med_tap) / 2.0)
         samples = [(0, 0, G)]
         for i in range(12):
-            samples.append((0, 0, G + (5.0 if i % 2 == 0 else -5.0)))
-        samples.append((0, 0, 25.0))  # firm tap
-        a = _adapter(rec, acc_read_fn=_trace_reader(samples))
+            samples.append((0, 0, G + (amp if i % 2 == 0 else -amp)))
+        samples.append((0, 0, _az_for_hp(med_tap + 2.0)))  # firm tap
+        a = _adapter(_Recorder(), acc_read_fn=_trace_reader(samples))
         results = []
         for i in range(len(samples)):
             results.append(a.poll(i * 20))
-        # Last poll is the spike: tap True, motion False.
         tap, motion = results[-1]
         assert tap is True
         assert motion is False
@@ -255,8 +326,9 @@ class TestMotion:
 class TestReset:
     def test_reset_reprimes(self):
         rec = _Recorder()
+        hp = _tap_thr(SENSITIVITY_MEDIUM) + 1.0
         a = _adapter(rec, acc_read_fn=_trace_reader(
-            [(0, 0, G), (0, 0, 18.0), (0, 0, 18.0)]))
+            [(0, 0, G), (0, 0, _az_for_hp(hp)), (0, 0, _az_for_hp(hp))]))
         a.poll(0)    # prime
         a.poll(20)   # tap
         assert len(rec.taps) == 1

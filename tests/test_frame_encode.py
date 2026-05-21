@@ -7,6 +7,7 @@ encode -> parse round-trips cleanly against the existing parser.
 
 from nocturnation.protocol import (
     encode_light_command,
+    encode_heartbeat,
     make_light_command_frame,
     parse_frame,
 )
@@ -105,6 +106,49 @@ class TestEncodeParseRoundTrip:
         buf = encode_light_command(0x05, 0, DeviceClass.ALL, 0, 1, 2, 3, 0, 0, 0, 0)
         f = parse_frame(buf)  # would raise FrameError on any mismatch
         assert f.message_type == MessageType.LIGHT_COMMAND
+
+
+class TestEncodeHeartbeat:
+    def test_byte_layout(self):
+        buf = encode_heartbeat(
+            source_id=0x20,
+            sequence_number=7,
+            tick=0x01020304,
+            days_since_2026=0x0506,
+            centiseconds_today=0x070809,
+        )
+        assert buf == bytes((
+            MAGIC_0, MAGIC_1, PROTOCOL_VERSION,
+            0x20,            # source_id
+            7,               # sequence
+            0x00,            # hop_count
+            MessageType.HEARTBEAT,
+            0x09,            # payload_len
+            # tick u32 LE
+            0x04, 0x03, 0x02, 0x01,
+            # days_since_2026 u16 LE
+            0x06, 0x05,
+            # centiseconds_today u24 LE
+            0x09, 0x08, 0x07,
+        ))
+        assert len(buf) == 17
+
+    def test_round_trip(self):
+        buf = encode_heartbeat(0x20, 3, tick=123456, days_since_2026=42,
+                               centiseconds_today=8675309 & 0xFFFFFF)
+        f = parse_frame(buf)
+        assert f.message_type == MessageType.HEARTBEAT
+        assert f.source_id == 0x20
+        assert f.sequence_number == 3
+        assert f.tick == 123456
+        assert f.days_since_2026 == 42
+        assert f.centiseconds_today == (8675309 & 0xFFFFFF)
+
+    def test_defaults_are_zero(self):
+        f = parse_frame(encode_heartbeat(0x20, 0))
+        assert f.tick == 0
+        assert f.days_since_2026 == 0
+        assert f.centiseconds_today == 0
 
 
 class TestMakeLightCommandFrame:

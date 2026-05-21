@@ -11,7 +11,7 @@ import tempfile
 
 import pytest
 
-from nocturnation.settings import Settings, DEFAULT_PATH
+from nocturnation.settings import Settings, DEFAULT_PATH, DEFAULT_HELP_URL
 
 
 class TestDefaults:
@@ -22,6 +22,7 @@ class TestDefaults:
         assert s.channel == "auto"
         assert s.active_show == ""
         assert s.mode == "lume"
+        assert s.help_url == DEFAULT_HELP_URL
 
 
 class TestGroupCoercion:
@@ -65,7 +66,8 @@ class TestChannelCoercion:
 class TestDictRoundTrip:
     def test_to_dict_has_all_fields(self):
         s = Settings(calm_mode=False, group=3, channel="11",
-                     active_show="simple_tap", mode="director")
+                     active_show="simple_tap", mode="director",
+                     help_url="http://example.com")
         d = s.to_dict()
         assert d == {
             "calm_mode": False,
@@ -73,18 +75,21 @@ class TestDictRoundTrip:
             "channel": "11",
             "active_show": "simple_tap",
             "mode": "director",
+            "help_url": "http://example.com",
         }
 
     def test_from_dict_populates(self):
         s = Settings.from_dict({
             "calm_mode": False, "group": 2, "channel": "1",
             "active_show": "motion_wave", "mode": "director",
+            "help_url": "http://example.com",
         })
         assert s.calm_mode is False
         assert s.group == 2
         assert s.channel == "1"
         assert s.active_show == "motion_wave"
         assert s.mode == "director"
+        assert s.help_url == "http://example.com"
 
     def test_from_dict_missing_keys_uses_defaults(self):
         s = Settings.from_dict({"calm_mode": False})
@@ -93,6 +98,7 @@ class TestDictRoundTrip:
         assert s.channel == "auto"
         assert s.active_show == ""
         assert s.mode == "lume"
+        assert s.help_url == DEFAULT_HELP_URL
 
     def test_from_dict_non_dict_returns_defaults(self):
         # Corrupted JSON might decode to a list or string; fall back
@@ -187,6 +193,29 @@ class TestMode:
 
     def test_different_mode_not_equal(self):
         assert Settings(mode="lume") != Settings(mode="director")
+
+
+class TestHelpUrl:
+    def test_default(self):
+        assert Settings().help_url == DEFAULT_HELP_URL
+        assert DEFAULT_HELP_URL == "http://www.nocturnation.net"
+
+    def test_custom_kept(self):
+        assert Settings(help_url="http://example.com/x").help_url == "http://example.com/x"
+
+    def test_empty_or_non_string_falls_back(self):
+        assert Settings(help_url="").help_url == DEFAULT_HELP_URL
+        assert Settings(help_url=None).help_url == DEFAULT_HELP_URL
+        assert Settings(help_url=42).help_url == DEFAULT_HELP_URL
+
+    def test_round_trips(self):
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
+            path = f.name
+        try:
+            Settings(help_url="http://example.com/y").save(path)
+            assert Settings.load(path).help_url == "http://example.com/y"
+        finally:
+            os.unlink(path)
 
 
 class TestEquality:
