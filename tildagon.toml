@@ -30,5 +30,7 @@ author = "ratcliffej"
 license = "MIT"
 url = "https://github.com/ratcliffej/nocturnation-tildagon"
 description = "Turn your badge into a Lume that pulses with the crowd in time to the music, or tap to run your own show. Open-source, no cloud."
-# Monotonic integer; bump on every app-store release.
-version = 1
+# Monotonic version string; bump on every app-store release. The store
+# schema requires a string here (a bare TOML integer is rejected by the
+# crawler as "expected string, received bigint").
+version = "1"
