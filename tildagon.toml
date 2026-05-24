@@ -1,32 +1,34 @@
 # Tildagon app-store submission manifest.
 #
 # Read by the EMF app-store crawler when this repo is public and tagged
-# with the `tildagon-app` GitHub topic; the crawler builds and installs
-# the app at https://apps.badge.emfcamp.org/. Reference format:
+# with the `tildagon-app` GitHub topic; the app then appears at
+# https://apps.badge.emfcamp.org/. Manifest schema reference:
 # https://tildagon.badge.emfcamp.org/tildagon-apps/publish/
 #
-# Distinct from apps/nocturnation/metadata.json - that is the on-badge
-# runtime artefact (used by the launcher to enumerate installed apps);
-# this file is the source-repo manifest used at submission time.
+# Distinct from metadata.json, which is the on-badge runtime artefact the
+# launcher uses to enumerate installed apps.
 
+[app]
 name = "NocturNation"
+# Store category; one of: Badge, Music, Media, Apps, Games.
 category = "Music"
+# Legacy fallback for firmware predating the Music category ("Badge",
+# "Music", or "Apps"); "Apps" is the catch-all bucket.
+menu = "Apps"
+# The app drives ESP-NOW directly and does not want a station-mode
+# associate-to-AP step on launch. It manages the radio itself: WiFi stays
+# up in the idle menu and is dropped (wifi.stop()) while a mode runs.
+wifi_preference = false
+
+[entry]
+# Entry-point Application subclass, defined in app.py at the repo root
+# (also exported there as `__app_export__ = NocturNationApp`).
+class = "NocturNationApp"
+
+[metadata]
 author = "ratcliffej"
 license = "MIT"
 url = "https://github.com/ratcliffej/nocturnation-tildagon"
-description = "Music-reactive crowd lighting. Pulses badge LEDs and screen in time with a Director Stick over ESP-NOW."
+description = "Turn your badge into a Lume that pulses with the crowd in time to the music, or tap to run your own show. Open-source, no cloud."
+# Monotonic integer; bump on every app-store release.
 version = 1
-
-# Fallback category for older firmware that pre-dates the Music
-# category. "Apps" is the catch-all bucket.
-menu = "Apps"
-
-# The app talks to ESP-NOW peers but does not need station-mode WiFi
-# (the badge's own networking layer keeps STA_IF up for ESP-NOW
-# regardless). false signals to the OS that no associate-to-AP step is
-# wanted on launch.
-wifi_preference = false
-
-# Entry point. The badge's launcher also accepts __app_export__ at the
-# bottom of app.py; both are wired so either loader path works.
-class = "NocturNationApp"

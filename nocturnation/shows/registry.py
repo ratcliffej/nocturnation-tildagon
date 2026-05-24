@@ -1,9 +1,9 @@
 """ShowRegistry + auto-discovery of concrete Shows.
 
-Concrete Shows live in `apps/nocturnation/shows/<show_id>/` -
-sibling to `apps/nocturnation/app.py`, separate from the framework
-code here. Each Show is a directory containing at least
-`__init__.py` exposing a `make_show()` factory.
+Concrete Shows live in `shows/<show_id>/` at the repo root -
+sibling to `app.py`, separate from the framework code here. Each
+Show is a directory containing at least `__init__.py` exposing a
+`make_show()` factory.
 
 Discovery happens at framework startup:
   `discover_shows()` walks the `shows/` directory, imports each
@@ -12,9 +12,10 @@ Discovery happens at framework startup:
 
 This file lives in `nocturnation/shows/` (the framework package)
 and reads from the top-level `shows/` package (the concrete-show
-library). Both directories exist for clarity:
+library). Both directories sit at the repo root for clarity:
 
-    apps/nocturnation/
+    <repo root> (installed to /apps/<dir>/ on the badge)
+      app.py                  <- entry point
       nocturnation/shows/     <- framework (this module)
       shows/                  <- concrete Show library
 
@@ -87,8 +88,8 @@ def discover_shows(shows_root="shows", registry=None):
     to get a Show instance, then register it.
 
     `shows_root` is a Python import path (default `"shows"`,
-    which on the Tildagon resolves to `apps/nocturnation/shows/`
-    because the app directory is on sys.path). On the host
+    which on the Tildagon resolves to the installed app dir's
+    `shows/` - app.py puts that dir on sys.path). On the host
     pytest environment the same import path resolves through
     pyproject.toml's `pythonpath` entry.
 

@@ -16,7 +16,7 @@ Thanks for your interest. Issues and pull requests are welcome.
   - `.github/` (workflows, actions, repository configuration),
   - dependencies and packaging (`pyproject.toml`, `tildagon.toml`, vendored files such as `uQR.py`),
   - `deploy.sh` and anything on the release-to-badge path (see [RELEASING.md](RELEASING.md)),
-  - the protocol, receive, and TOFU code under `apps/nocturnation/nocturnation/`.
+  - the protocol, receive, and TOFU code under `nocturnation/`.
 - New or changed behaviour needs tests. PRs that do not pass `pytest` will not be merged.
 
 ## Testing
@@ -30,4 +30,4 @@ The suite runs on host Python - no badge required. Byte-level frame behaviour is
 
 ## Adding a Show
 
-A Show is a folder under `apps/nocturnation/shows/<id>/` exposing `make_show()`, auto-discovered at boot. The authoring model mirrors the M5 firmware; see the [developer guide](https://github.com/ratcliffej/nocturnation-docs/blob/main/developing-shows.md) for hooks, properties, drawing, and the host-test pattern.
+A Show is a folder under `shows/<id>/` (at the repo root) exposing `make_show()`, auto-discovered at boot. The authoring model mirrors the M5 firmware; see the [developer guide](https://github.com/ratcliffej/nocturnation-docs/blob/main/developing-shows.md) for hooks, properties, drawing, and the host-test pattern.

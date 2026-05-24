@@ -3,11 +3,10 @@
 Mirrors `nocturnation::shows` on the M5 firmware: the `Show` base
 class (`show.py`), the `ShowContext` services surface
 (`show_context.py`), and the registry that auto-discovers concrete
-Shows from `apps/nocturnation/shows/<show_id>/` (`registry.py`).
+Shows from the top-level `shows/<show_id>/` package (`registry.py`).
 
-Concrete Shows live at the top of the app directory
-(`apps/nocturnation/shows/<show_id>/__init__.py`), separate from
-the framework code here. Drop a new folder in there, expose a
+Concrete Shows live in `shows/<show_id>/__init__.py` at the repo
+root (sibling to `app.py`), separate from the framework code here. Drop a new folder in there, expose a
 factory at module scope, and it appears in the picker at the next
 boot.
 """

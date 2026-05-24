@@ -59,12 +59,12 @@ cd nocturnation-tildagon
 ./deploy.sh
 ```
 
-`deploy.sh` wipes any previous copy, copies `apps/nocturnation` to the badge, and resets. Then scroll to **NocturNation** in the badge launcher and tap to run. On launch you land in the idle menu — pick **Lume** to receive or **Director** to run a show. Button **C** confirms a selection, **F** backs out.
+`deploy.sh` wipes any previous copy, copies the app payload to `:apps/nocturnation/` on the badge, and resets. Then scroll to **NocturNation** in the badge launcher and tap to run. On launch you land in the idle menu — pick **Lume** to receive or **Director** to run a show. Button **C** confirms a selection, **F** backs out.
 
 For fast iteration after the first deploy, copy a single changed file and reset (overwriting a file in place avoids a re-wipe):
 
 ```sh
-mpremote cp apps/nocturnation/app.py :apps/nocturnation/app.py
+mpremote cp app.py :apps/nocturnation/app.py
 mpremote reset
 ```
 
@@ -75,34 +75,37 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The suite runs on host Python — no hardware required. `pyproject.toml` puts `apps/nocturnation/` on the pytest path so badge imports like `from nocturnation.protocol import parse_frame` resolve identically on host and badge.
+The suite runs on host Python — no hardware required. `pyproject.toml` puts the repo root on the pytest path so badge imports like `from nocturnation.protocol import parse_frame` resolve identically on host and badge.
 
 ## Project layout
 
+The **app payload** (`app.py` plus the `nocturnation/` and `shows/` packages, `metadata.json`, `uQR.py`) lives at the repo root so the app-store tarball has `app.py` at the top, as the installer requires. The rest are dev/repo scaffolding.
+
 ```
+app.py                        App entry: idle menu, mode lifecycle, WiFi/radio handover
+metadata.json                 On-badge launcher manifest
+uQR.py                        Vendored QR generator (MIT) for the Help screen
+shows/                        Installable Shows, one folder each (simple_tap, motion_wave)
+nocturnation/                 Internal package
+  protocol/                   Frame parse/encode, constants, dedup ring, source_id
+  receive.py                  Parse + dedup + hop-count pipeline
+  channel_scan.py             Channel selection
+  render/                     Perimeter, LCD, pulse, envelope, display surface
+  shows/                      Show base class, context, registry, input actions
+  director/                   Render dispatcher, IMU adapter, controller, sender, button map
+  hal/                        Capability vocabulary (1:1 with the M5 firmware)
+  plugins/                    Plugin base + property bags
+  settings.py                 Persistent settings
+  signal_tracker.py           NO SIGNAL gap detector
+  tofu.py                     Trust-On-First-Use Director lock
 tildagon.toml                 EMF app-store submission manifest
+deploy.sh                     Wipe + copy + reset wrapper for mpremote (dev installs)
 CHANGELOG.md                  Per-release notes
-deploy.sh                     Wipe + copy + reset wrapper for mpremote
-apps/nocturnation/            Mirrors the badge's /apps/<app>/ layout
-  app.py                      App entry: idle menu, mode lifecycle, WiFi/radio handover
-  metadata.json               On-badge launcher manifest
-  uQR.py                      Vendored QR generator (MIT) for the Help screen
-  shows/                      Installable Shows, one folder each (simple_tap, motion_wave)
-  nocturnation/               Internal package
-    protocol/                 Frame parse/encode, constants, dedup ring, source_id
-    receive.py                Parse + dedup + hop-count pipeline
-    channel_scan.py           Channel selection
-    render/                   Perimeter, LCD, pulse, envelope, display surface
-    shows/                    Show base class, context, registry, input actions
-    director/                 Render dispatcher, IMU adapter, controller, sender, button map
-    hal/                      Capability vocabulary (1:1 with the M5 firmware)
-    plugins/                  Plugin base + property bags
-    settings.py               Persistent settings
-    signal_tracker.py         NO SIGNAL gap detector
-    tofu.py                   Trust-On-First-Use Director lock
 tests/                        Host-side pytest suite (not deployed to the badge)
 pyproject.toml                Dev environment + pytest config
 ```
+
+On the badge the app lives at `/apps/nocturnation/` (via `deploy.sh`) or `/apps/nocturnation_tildagon/` (via the app store); `app.py` derives its own directory at runtime, so both work.
 
 ## Architecture notes
 

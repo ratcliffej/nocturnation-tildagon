@@ -16,7 +16,7 @@ Expect a best-effort acknowledgement. There is no formal SLA - this is a single-
 
 **In scope:**
 
-- The app code in this repository (`apps/nocturnation/` - protocol, receive pipeline, render, Shows, director).
+- The app code in this repository (`app.py` plus the `nocturnation/` and `shows/` packages - protocol, receive pipeline, render, Shows, director).
 - ESP-NOW frame parsing/encoding and the Trust-On-First-Use source locking.
 - The release and deploy path (`tildagon.toml`, `deploy.sh`, the published release artefacts).
 
