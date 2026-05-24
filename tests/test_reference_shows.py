@@ -1,6 +1,6 @@
 """Reference Show tests: simple_tap + motion_wave.
 
-These are the concrete Shows under apps/nocturnation/shows/. They're
+These are the concrete Shows under shows/ at the repo root. They're
 exercised through a ShowContext with a fake host (records render_fx)
 and a fake display (records draw calls).
 """
@@ -211,7 +211,7 @@ class TestDiscovery:
         show_registry().clear()
 
     def test_discovers_both_reference_shows(self):
-        n = discover_shows()  # walks apps/nocturnation/shows/
+        n = discover_shows()  # walks shows/ (repo root)
         assert n >= 2
         ids = [s.id() for s in show_registry()]
         assert "simple_tap" in ids

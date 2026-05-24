@@ -4,6 +4,20 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-05-24 — Repo restructure for app-store packaging
+
+Moved the app payload (`app.py`, `metadata.json`, `uQR.py`, and the
+`nocturnation/` and `shows/` packages) from `apps/nocturnation/` to the
+**repo root**. The EMF app-store installer requires `app.py` at the top of
+the release tarball and does not recurse into subdirectories, so the
+previous nested layout could not be installed from the store. `app.py` now
+derives its own directory from the launcher module name and adds it to
+`sys.path`, so the Show library's absolute imports resolve whether the app
+is installed to `/apps/nocturnation` (via `deploy.sh`) or
+`/apps/nocturnation_tildagon` (via the app store). `deploy.sh`, the pytest
+path, and the docs are updated to match. No behavioural change; all 399
+host tests pass.
+
 ## 2026-05-21 — Epic 6B: Tildagon Director + Show framework
 
 The badge becomes a NocturNation **Director** (not just a Lume): an

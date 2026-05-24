@@ -31,20 +31,25 @@ Reference: https://tildagon.badge.emfcamp.org/tildagon-apps/development/
 Block plan: nocturnation-m5 docs/epics/epic-05-tildagon.md
 """
 
-# The Tildagon launcher loads this module as ``apps.nocturnation.app`` and
-# does NOT add ``apps/nocturnation/`` to sys.path, so this app's own modules
-# use relative imports (``from .nocturnation.X import Y`` below). The Epic 6B
-# Director Show library, however, lives in the sibling top-level packages
-# ``shows`` (concrete Shows) and is imported absolutely - both by
-# ``discover_shows()`` (``__import__("shows")``) and by each Show's
-# ``from nocturnation.X import Y`` - so the identical Show source runs
-# unchanged under host pytest (where ``apps/nocturnation`` IS on the path).
-# Add the app dir to sys.path here so those absolute imports resolve on the
-# badge too. Harmless on the host (already on the path) and a no-op if the
-# entry is already present.
+# The Tildagon launcher loads this module as ``apps.<dir>.app`` and does
+# NOT add the app's own directory to sys.path, so this app's modules use
+# relative imports (``from .nocturnation.X import Y`` below). The Show
+# library is imported *absolutely* - by ``discover_shows()``
+# (``__import__("shows")``) and by each Show's ``from nocturnation.X import
+# Y`` - so the identical Show source runs unchanged under host pytest
+# (where ``nocturnation`` / ``shows`` are importable via pyproject).
+#
+# Derive this app's own directory from the launcher module name and add it
+# to sys.path so those absolute imports resolve on the badge too, whatever
+# the install directory is called: ``/apps/nocturnation`` when deployed via
+# deploy.sh, or ``/apps/nocturnation_tildagon`` when installed from the EMF
+# app store (the store derives the dir from the repo name). app.py and its
+# ``nocturnation`` / ``shows`` packages sit at the repo root so the store
+# tarball has ``app.py`` at the top, as the installer requires.
 import sys as _sys
 try:
-    _APP_DIR = "/apps/nocturnation"
+    _pkg = __name__.rsplit(".", 1)[0]  # e.g. "apps.nocturnation"
+    _APP_DIR = "/" + _pkg.replace(".", "/") if "." in __name__ else "/apps/nocturnation"
     if _APP_DIR not in _sys.path:
         _sys.path.append(_APP_DIR)
 except Exception as _exc:  # pragma: no cover - defensive only
@@ -112,10 +117,10 @@ except ImportError:
     _badge_wifi = None
 
 # Relative imports against the internal nocturnation/ package: the
-# Tildagon launcher loads this module as apps.nocturnation.app and does
-# not add apps/nocturnation/ to sys.path, so absolute `from
-# nocturnation.X import Y` fails on the badge. Relative imports resolve
-# via the parent package (apps.nocturnation) and work on both runtimes.
+# Tildagon launcher loads this module as apps.<dir>.app and does not add
+# the app's own directory to sys.path, so a bare absolute `from
+# nocturnation.X import Y` would fail on the badge. Relative imports
+# resolve via the parent package (apps.<dir>) and work on both runtimes.
 # Host-side pytest never imports this file (only the nocturnation/
 # package below), so the dot prefix is invisible to the test suite.
 from .nocturnation.channel_scan import ChannelScanner
