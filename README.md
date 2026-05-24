@@ -2,6 +2,8 @@
 
 > Open-source crowd lighting, on the EMF Tildagon badge.
 
+> ⚠️ **Photosensitivity warning.** NocturNation flashes the badge's perimeter LEDs in time with music — and, in Full mode, the round screen too. Flashing light can trigger seizures in people with photosensitive epilepsy, and the badge sits close to your face. **Calm Mode is ON by default** (reduced brightness, 2 Hz cap, screen flashing disabled), and we strongly recommend leaving it on, especially in a crowd. If you have photosensitive epilepsy or are sensitive to flashing light, please take care — keep Calm Mode on, or skip this app. NocturNation is an open-source hobby project, not a certified safety or medical device; you use it at your own risk.
+
 NocturNation turns a crowd into a light show: a **Director** listens to music, detects the beat, and broadcasts light commands over ESP-NOW to a swarm of **Lumes** that light up in time. This repository is the [EMF Tildagon badge](https://tildagon.badge.emfcamp.org/) app — it lets a badge join a NocturNation show in two ways:
 
 - **Lume (receiver).** The badge listens for a Director's light commands and animates its twelve perimeter LEDs and round LCD in sync with the music. **Calm Mode** is on by default, so it is comfortable to wear straight out of the box.
@@ -124,6 +126,10 @@ On the badge the app lives at `/apps/nocturnation/` (via `deploy.sh`) or `/apps/
 6. **Ship fixes** by bumping `version` and tagging a new release.
 
 The manifest schema is documented at <https://tildagon.badge.emfcamp.org/tildagon-apps/publish/>.
+
+## Privacy
+
+NocturNation collects nothing — no account, no telemetry, no analytics, no cloud, no microphone. All traffic is short-range ESP-NOW light commands; nothing reaches the internet. See [PRIVACY.md](PRIVACY.md) for the full statement.
 
 ## Contributing
 
