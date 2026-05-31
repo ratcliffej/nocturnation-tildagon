@@ -98,13 +98,21 @@ class SimpleTap(Show):
         r, g, b = self._colour_for(palette)
         self._last_rgb = (r, g, b)
         self._last_tap_ms = ctx.now_ms()
+        # Attack time picks: fixed palettes keep a near-instant T_32_MS
+        # attack so each tap feels punchy. The Rainbow palette uses
+        # T_192_MS so successive taps crossfade smoothly through the
+        # hue wheel (per Epic 6C Phase G - the perimeter / LCD
+        # renderers now lerp from the LED's current colour during the
+        # attack phase, so a non-zero attack on a fast hue cycle
+        # actually blends instead of snapping through black).
+        attack = Time.T_192_MS if palette == _RAINBOW else Time.T_32_MS
         # Light class, group 0 = every Light-class Lume regardless of its
         # group setting. A basic tap show shouldn't require operators to
         # configure a matching group on each badge; group targeting is
         # for shows that deliberately address sub-zones.
         ctx.render_fx("01:00", RgbPulse(
             r, g, b,
-            attack=Time.T_0_MS,
+            attack=attack,
             sustain=Time.T_96_MS,
             release=Time.T_480_MS,
             chance=Chance.CHANCE_100,

@@ -22,7 +22,7 @@ from nocturnation.render.perimeter import (
 
 
 class FakeFrame:
-    """Minimal stand-in for protocol.Frame with just the LIGHT_COMMAND fields
+    """Minimal stand-in for protocol.Frame with just the LIGHT_PULSE fields
     the renderer reads. Real Frame objects work equally well but are noisier
     to construct in test cases."""
 
@@ -242,3 +242,167 @@ class TestLEDIndexing:
         indices = [c[0] for c in captured]
         assert indices == list(range(1, 13))
         # Per Tildagon hardware: tildagonos.leds[1..12] is the addressable range.
+
+
+class TestAdrCrossfade:
+    """Epic 6C Phase G ADR fix. The attack phase now lerps from the
+    LED's *current rendered colour* to the new pulse's target, instead
+    of from brightness 0. So a series of differently-coloured pulses
+    arriving with overlapping envelopes crossfades smoothly rather than
+    snapping through black between colours."""
+
+    def test_attack_lerps_from_previous_pulse_colour(self):
+        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        # First pulse: red at full sustain so the LEDs sit at red.
+        r.dispatch(
+            FakeFrame(r=200, g=0, b=0,
+                      attack=Time.T_0_MS, sustain=Time.T_2400_MS, release=Time.T_0_MS),
+            now_ms=0,
+        )
+        # Drive the renderer once so _last_rendered captures the red.
+        cap1, set_led1 = make_capture()
+        r.tick(now_ms=10, set_led=set_led1)
+        assert cap1[0][1] == 200  # red at full
+
+        # Now arm a second pulse to blue with a 96ms attack (rate-limit
+        # is 250ms but Full mode allows back-to-back beyond that; the
+        # frequency cap is bypassed by advancing now).
+        r.dispatch(
+            FakeFrame(r=0, g=0, b=200,
+                      attack=Time.T_96_MS, sustain=Time.T_0_MS, release=Time.T_0_MS),
+            now_ms=300,
+        )
+        # At mid-attack (48ms in), the LED should be midway between red
+        # and blue, not at black mid-attack.
+        cap2, set_led2 = make_capture()
+        r.tick(now_ms=300 + 48, set_led=set_led2)
+        red_component   = cap2[0][1]
+        blue_component  = cap2[0][3]
+        # Half-attack: roughly half red (was 200), half blue (target 200).
+        assert 60 <= red_component  <= 140, f"red {red_component} should taper from 200"
+        assert 60 <= blue_component <= 140, f"blue {blue_component} should ramp from 0 to 200"
+
+    def test_attack_zero_still_snaps(self):
+        # T_0_MS attack means no attack ramp - the pulse jumps to its
+        # target colour immediately. Crossfade only engages on
+        # non-zero-attack pulses. (Existing test_attack_phase_ramps_up
+        # covers the from-black case; this is the regression guard for
+        # T_0_MS attacks not accidentally lerping.)
+        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r.dispatch(
+            FakeFrame(r=255, g=0, b=0,
+                      attack=Time.T_0_MS, sustain=Time.T_96_MS, release=Time.T_0_MS),
+            now_ms=0,
+        )
+        cap, set_led = make_capture()
+        r.tick(now_ms=0, set_led=set_led)   # at t=0, attack==0 means jump to dst
+        assert cap[0][1] == 255  # full red immediately
+
+
+class TestWashBaseline:
+    """Epic 6C Phase G LIGHT_WASH support. Wash sits as a uniform
+    baseline across the 12 LEDs with optional cosine-eased ping-pong
+    drift between r1/r2."""
+
+    def _wash_frame(self, **overrides):
+        # Frame stand-in carrying the LIGHT_WASH fields.
+        class F:
+            r1 = 255; g1 = 0;   b1 = 0
+            r2 = 0;   g2 = 0;   b2 = 200
+            wash_attack    = 0     # no attack ramp - tests pre-condition on baseline
+            wash_release   = 10
+            intensity      = 255
+            cycle_ms       = 0     # hold r1g1b1 (no drift)
+            ttl_seconds    = 0
+            pulse_response = 1
+        f = F()
+        for k, v in overrides.items():
+            setattr(f, k, v)
+        return f
+
+    def test_wash_baseline_paints_all_leds_uniformly(self):
+        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r.on_light_wash(self._wash_frame(), now_ms=0)
+        cap, set_led = make_capture()
+        # Advance past attack (which is 0 here).
+        r.tick(now_ms=10, set_led=set_led)
+        # All 12 LEDs should hold red (r1=255).
+        reds = [c[1] for c in cap]
+        assert all(r == 255 for r in reds)
+        greens = [c[2] for c in cap]
+        assert all(g == 0 for g in greens)
+
+    def test_wash_drift_oscillates_between_colours(self):
+        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        # cycle_ms = 1000: t=0 -> r1, t=500 -> r2, t=1000 -> r1.
+        f = self._wash_frame(cycle_ms=1000)
+        r.on_light_wash(f, now_ms=0)
+        cap1, set_led1 = make_capture()
+        r.tick(now_ms=1, set_led=set_led1)   # near start
+        r0 = cap1[0]
+        cap2, set_led2 = make_capture()
+        r.tick(now_ms=500, set_led=set_led2)  # midpoint
+        rmid = cap2[0]
+        # Start should be ~red; midpoint should be ~blue.
+        assert r0[1]   > rmid[1],  "midpoint should have less red than start"
+        assert r0[3]   < rmid[3],  "midpoint should have more blue than start"
+
+    def test_wash_end_fades_to_black(self):
+        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r.on_light_wash(self._wash_frame(), now_ms=0)
+        # Hold at red.
+        cap, set_led = make_capture()
+        r.tick(now_ms=10, set_led=set_led)
+        assert cap[0][1] == 255
+
+        # Cancel with a 100 ms release (10 * 100 ms).
+        class End:
+            release_time = 1   # 1 * 100 ms
+        r.on_light_wash_end(End(), now_ms=20)
+        # Mid-release: roughly half-red.
+        cap2, set_led2 = make_capture()
+        r.tick(now_ms=20 + 50, set_led=set_led2)
+        assert 80 <= cap2[0][1] <= 180, f"mid-release should be mid-red; got {cap2[0][1]}"
+        # Post-release: all black.
+        cap3, set_led3 = make_capture()
+        r.tick(now_ms=20 + 200, set_led=set_led3)
+        assert all(c[1] == 0 and c[2] == 0 and c[3] == 0 for c in cap3)
+
+    def test_pulse_on_wash_overlay_fades_back_to_baseline(self):
+        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r.on_light_wash(self._wash_frame(), now_ms=0)  # red baseline (r=255, g=0, b=0)
+        cap1, set_led1 = make_capture()
+        r.tick(now_ms=10, set_led=set_led1)
+        assert cap1[0][1] == 255  # holding red
+
+        # Fire a blue pulse on top, with non-zero attack so the lerp is
+        # observable, and ALSO non-zero release so we can observe the
+        # fade-back to baseline mid-release.
+        r.dispatch(
+            FakeFrame(r=0, g=0, b=200,
+                      attack=Time.T_96_MS, sustain=Time.T_0_MS, release=Time.T_192_MS),
+            now_ms=300,
+        )
+        # During release, the pulse fades from blue back to the wash
+        # baseline (red), NOT to black. At mid-release the LED is a
+        # mix of blue and red, never zero on both.
+        cap2, set_led2 = make_capture()
+        r.tick(now_ms=300 + 96 + 96, set_led=set_led2)   # mid-release
+        led = cap2[0]
+        # mid-release: lerping from blue (0,0,200) towards red (255,0,0).
+        # Some red present, some blue present. Both > 0.
+        assert led[1] > 0, f"red should reappear mid-release; got {led}"
+
+    def test_pulse_response_zero_drops_pulse(self):
+        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r.on_light_wash(self._wash_frame(pulse_response=0), now_ms=0)
+        cap1, set_led1 = make_capture()
+        r.tick(now_ms=10, set_led=set_led1)
+        baseline_red = cap1[0][1]
+
+        r.dispatch(FakeFrame(r=0, g=0, b=255), now_ms=300)
+        cap2, set_led2 = make_capture()
+        r.tick(now_ms=320, set_led=set_led2)
+        # Pulse was dropped; LED is still showing the wash baseline.
+        assert cap2[0][1] == baseline_red
+        assert cap2[0][3] == 0   # no blue overlay landed

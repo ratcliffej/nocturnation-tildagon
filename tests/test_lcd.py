@@ -5,7 +5,7 @@ current_colour returns None, the LCD stays on its static UI background.
 
 Full mode: each accepted dispatch arms a full-screen envelope.
 current_colour returns the (r, g, b) at that moment, capped at 60 % of
-the LIGHT_COMMAND's RGB to keep the face-distance wash from being
+the LIGHT_PULSE's RGB to keep the face-distance wash from being
 uncomfortably bright. Frequency cap is 4 Hz (250 ms minimum interval).
 """
 

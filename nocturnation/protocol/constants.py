@@ -21,14 +21,19 @@ MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE - HEADER_SIZE
 
 
 class MessageType:
-    # Spec v0.29 §4.3: two active types plus the EXTENSION slot. IDs
-    # 0x01 (BEAT_DETECTED), 0x02 (MODE_CHANGE), 0x04 (CLOCK_SYNC),
-    # 0x05 (TIME_SYNC), 0x06 (MUSIC_EVENT) are RESERVED - they were
-    # removed in the protocol trim and MUST NOT be reused. Inbound
-    # frames carrying a reserved or unassigned message_type are
+    # Spec v0.29 §4.3 + Epic 6C Phase D additions. Active types: HEARTBEAT,
+    # LIGHT_PULSE, the WASH family (0x06/0x07/0x08), plus the EXTENSION
+    # slot. IDs 0x01 (BEAT_DETECTED), 0x02 (MODE_CHANGE), 0x04
+    # (CLOCK_SYNC), 0x05 (TIME_SYNC) remain RESERVED - removed in the
+    # protocol trim, MUST NOT be reused. 0x06 (was MUSIC_EVENT) is
+    # reclaimed by LIGHT_WASH; 0x07 and 0x08 were previously unassigned.
+    # Inbound frames carrying a reserved or unassigned message_type are
     # silently dropped per the spec forward-compat note.
     HEARTBEAT = 0x00
-    LIGHT_COMMAND = 0x03
+    LIGHT_PULSE = 0x03
+    LIGHT_WASH = 0x06           # 16-byte payload: persistent two-colour drift baseline
+    LIGHT_WASH_END = 0x07       # 3-byte payload: explicit cancel with operator release_time
+    LIGHT_WASH_PULSE = 0x08     # 9-byte payload: pulse that fires only on washing Lumes
     EXTENSION = 0xFF
 
 
@@ -36,9 +41,13 @@ class MessageType:
 # unpacking; mismatches MUST be dropped silently per protocol manual section
 # 3.1. HEARTBEAT carries tick (u32 LE) + days_since_2026 (u16 LE) +
 # centiseconds_today (u24 LE) = 9 bytes per spec v0.29 §3.3.1.
+# WASH-family lengths per the Epic 6C design doc (16/3/9 bytes).
 PAYLOAD_LENGTHS = {
-    MessageType.HEARTBEAT: 9,
-    MessageType.LIGHT_COMMAND: 9,
+    MessageType.HEARTBEAT:        9,
+    MessageType.LIGHT_PULSE:      9,
+    MessageType.LIGHT_WASH:       16,
+    MessageType.LIGHT_WASH_END:    3,
+    MessageType.LIGHT_WASH_PULSE:  9,
 }
 
 
@@ -50,7 +59,7 @@ class DeviceClass:
     # 0x04..0xFF reserved
 
 
-# PixMob Time enum values; the LIGHT_COMMAND attack/sustain/release bytes
+# PixMob Time enum values; the LIGHT_PULSE attack/sustain/release bytes
 # index into this table. Names mirror the StickC firmware for parity.
 class Time:
     T_0_MS = 0

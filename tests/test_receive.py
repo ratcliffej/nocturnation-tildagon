@@ -11,14 +11,14 @@ from nocturnation.receive import process_frame, MAX_HOP_COUNT
 
 # Manual annex C.1 reference vector. Modified per-test with helpers.
 # Spec v2: 2-byte "NN" magic prefix + protocol_version 0x02.
-LIGHT_COMMAND_VECTOR = bytes([
+LIGHT_PULSE_VECTOR = bytes([
     0x4E,  # magic byte 0 ('N')
     0x4E,  # magic byte 1 ('N')
     0x02,  # protocol_version
     0x01,  # source_id
     0x2A,  # sequence (42)
     0x00,  # hop_count
-    0x03,  # message_type LIGHT_COMMAND
+    0x03,  # message_type LIGHT_PULSE
     0x09,  # payload_len
     0x00,  # target_class
     0x00,  # target_group
@@ -33,7 +33,7 @@ LIGHT_COMMAND_VECTOR = bytes([
 
 
 def make_frame(seq=42, hop=0, source=1):
-    b = bytearray(LIGHT_COMMAND_VECTOR)
+    b = bytearray(LIGHT_PULSE_VECTOR)
     b[3] = source           # offsets shifted +2 by the magic prefix
     b[4] = seq
     b[5] = hop
@@ -46,7 +46,7 @@ class TestValidFrames:
         f = process_frame(make_frame(), d)
         assert f is not None
         assert f.sequence_number == 42
-        assert f.message_type == MessageType.LIGHT_COMMAND
+        assert f.message_type == MessageType.LIGHT_PULSE
         assert f.r == 0xFF
 
 
@@ -91,13 +91,13 @@ class TestStructuralRejection:
 
     def test_wrong_protocol_version_dropped(self):
         d = DedupRing()
-        bad = bytearray(LIGHT_COMMAND_VECTOR)
+        bad = bytearray(LIGHT_PULSE_VECTOR)
         bad[0] = 0x02
         assert process_frame(bytes(bad), d) is None
 
     def test_payload_len_mismatch_dropped(self):
         d = DedupRing()
-        bad = bytearray(LIGHT_COMMAND_VECTOR)
+        bad = bytearray(LIGHT_PULSE_VECTOR)
         bad[5] = 0x07  # claim 7-byte payload
         assert process_frame(bytes(bad), d) is None
 

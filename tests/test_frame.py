@@ -20,17 +20,17 @@ from nocturnation.protocol import (
 from nocturnation.protocol.constants import Time, Chance
 
 
-# Manual annex C.1: LIGHT_COMMAND from source_id 1, sequence 42, broadcast,
+# Manual annex C.1: LIGHT_PULSE from source_id 1, sequence 42, broadcast,
 # red (255, 0, 0), envelope T_96 / T_0 / T_480, CHANCE_100.
 # Spec v2: 2-byte "NN" magic prefix + protocol_version 0x02.
-LIGHT_COMMAND_VECTOR = bytes([
+LIGHT_PULSE_VECTOR = bytes([
     0x4E,  # magic byte 0 ('N')
     0x4E,  # magic byte 1 ('N')
     0x02,  # protocol_version
     0x01,  # source_id
     0x2A,  # sequence (42)
     0x00,  # hop_count
-    0x03,  # message_type LIGHT_COMMAND
+    0x03,  # message_type LIGHT_PULSE
     0x09,  # payload_len
     0x00,  # target_class (All)
     0x00,  # target_group (broadcast)
@@ -63,13 +63,13 @@ HEARTBEAT_VECTOR = bytes([
 
 
 class TestHeaderParsing:
-    def test_light_command_header_fields(self):
-        f = parse_frame(LIGHT_COMMAND_VECTOR)
+    def test_light_pulse_header_fields(self):
+        f = parse_frame(LIGHT_PULSE_VECTOR)
         assert f.protocol_version == 0x02
         assert f.source_id == 1
         assert f.sequence_number == 42
         assert f.hop_count == 0
-        assert f.message_type == MessageType.LIGHT_COMMAND
+        assert f.message_type == MessageType.LIGHT_PULSE
         assert f.payload_len == 9
 
     def test_heartbeat_header_fields(self):
@@ -87,8 +87,8 @@ class TestHeartbeatPayload:
 
 
 class TestLightCommandPayload:
-    def test_light_command_unpacks_all_fields(self):
-        f = parse_frame(LIGHT_COMMAND_VECTOR)
+    def test_light_pulse_unpacks_all_fields(self):
+        f = parse_frame(LIGHT_PULSE_VECTOR)
         assert f.target_class == DeviceClass.ALL
         assert f.target_group == 0
         assert f.r == 0xFF
@@ -116,19 +116,19 @@ class TestFrameRejection:
         # validation - this is the cheapest disambiguator at
         # event-density channels (EMF etc.) where many ESP-NOW users
         # share the same band.
-        bad = bytearray(LIGHT_COMMAND_VECTOR)
+        bad = bytearray(LIGHT_PULSE_VECTOR)
         bad[0] = 0x18  # foreign vendor prefix; not "NN"
         with pytest.raises(FrameError):
             parse_frame(bytes(bad))
 
     def test_wrong_version_rejected(self):
-        bad = bytearray(LIGHT_COMMAND_VECTOR)
+        bad = bytearray(LIGHT_PULSE_VECTOR)
         bad[2] = 0x09  # protocol_version offset; not 0x02
         with pytest.raises(FrameError):
             parse_frame(bytes(bad))
 
     def test_payload_len_mismatch_rejected(self):
-        bad = bytearray(LIGHT_COMMAND_VECTOR)
+        bad = bytearray(LIGHT_PULSE_VECTOR)
         bad[7] = 0x08  # payload_len offset; claim 8-byte payload, actual is 9
         with pytest.raises(FrameError):
             parse_frame(bytes(bad))
