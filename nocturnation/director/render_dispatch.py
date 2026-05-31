@@ -29,8 +29,14 @@ callable so the whole fan-out is host-testable. B6 wires the real
 
 from ..protocol import (
     encode_light_pulse,
+    encode_light_wash,
+    encode_light_wash_end,
+    encode_light_wash_pulse,
     encode_heartbeat,
     make_light_pulse_frame,
+    make_light_wash_frame,
+    make_light_wash_end_frame,
+    make_light_wash_pulse_frame,
 )
 from ..protocol.constants import DeviceClass
 
@@ -215,6 +221,186 @@ class RenderDispatcher:
                 perimeter_lit = self._perimeter.dispatch(frame, now_ms)
             if self._lcd is not None and target_class in _LCD_CLASSES:
                 lcd_armed = self._lcd.dispatch(frame, now_ms)
+
+        return DispatchResult(sent, perimeter_lit, lcd_armed)
+
+    def dispatch_wash(self, target, ev, now_ms):
+        """Encode + broadcast + locally loop back one LIGHT_WASH event.
+
+        `target` is a `"<class>:<group>"` string; `ev` is an RgbWash;
+        `now_ms` is the Director clock. Returns a DispatchResult.
+
+        Identical fan-out shape to dispatch(): encode + broadcast (with
+        redundancy), then loopback to perimeter / LCD via the renderers'
+        on_light_wash() entry points. Wash frames carry their own
+        attack / release / cycle / ttl so the renderers own the timing;
+        the dispatcher just hands the frame over.
+
+        Raises ValueError if `target` is malformed (Show bug).
+        """
+        target_class, target_group = parse_target(target)
+
+        payload = encode_light_wash(
+            self._source_id,
+            self._sequence,
+            target_class,
+            target_group,
+            ev.r1, ev.g1, ev.b1,
+            ev.r2, ev.g2, ev.b2,
+            ev.attack,
+            ev.release,
+            ev.intensity,
+            ev.cycle_ms,
+            ev.ttl_seconds,
+            ev.pulse_response,
+        )
+        self._sequence = (self._sequence + 1) & 0xFF
+
+        sent = False
+        if self._send_fn is not None:
+            for _ in range(self._redundancy):
+                try:
+                    self._send_fn(payload)
+                    sent = True
+                except Exception:
+                    pass
+            if sent:
+                self._last_tx_ms = now_ms
+
+        perimeter_lit = 0
+        lcd_armed = False
+        if (self._perimeter is not None and target_class in _PERIMETER_CLASSES) or (
+            self._lcd is not None and target_class in _LCD_CLASSES
+        ):
+            frame = make_light_wash_frame(
+                target_class,
+                target_group,
+                ev.r1, ev.g1, ev.b1,
+                ev.r2, ev.g2, ev.b2,
+                ev.attack,
+                ev.release,
+                ev.intensity,
+                ev.cycle_ms,
+                ev.ttl_seconds,
+                ev.pulse_response,
+                source_id=self._source_id,
+            )
+            if self._perimeter is not None and target_class in _PERIMETER_CLASSES:
+                self._perimeter.on_light_wash(frame, now_ms)
+                # on_light_wash is a state setter, not a per-LED count.
+                # Report "loopback fired" as 1 for DispatchResult truthiness.
+                perimeter_lit = 1
+            if self._lcd is not None and target_class in _LCD_CLASSES:
+                self._lcd.on_light_wash(frame, now_ms)
+                lcd_armed = True
+
+        return DispatchResult(sent, perimeter_lit, lcd_armed)
+
+    def dispatch_wash_end(self, target, release_time, now_ms):
+        """Encode + broadcast + locally loop back one LIGHT_WASH_END.
+
+        `release_time` is in 100 ms units (overrides the active wash's
+        own release for this cancel). Returns a DispatchResult.
+        """
+        target_class, target_group = parse_target(target)
+
+        payload = encode_light_wash_end(
+            self._source_id,
+            self._sequence,
+            target_class,
+            target_group,
+            release_time,
+        )
+        self._sequence = (self._sequence + 1) & 0xFF
+
+        sent = False
+        if self._send_fn is not None:
+            for _ in range(self._redundancy):
+                try:
+                    self._send_fn(payload)
+                    sent = True
+                except Exception:
+                    pass
+            if sent:
+                self._last_tx_ms = now_ms
+
+        perimeter_lit = 0
+        lcd_armed = False
+        if (self._perimeter is not None and target_class in _PERIMETER_CLASSES) or (
+            self._lcd is not None and target_class in _LCD_CLASSES
+        ):
+            frame = make_light_wash_end_frame(
+                target_class,
+                target_group,
+                release_time,
+                source_id=self._source_id,
+            )
+            if self._perimeter is not None and target_class in _PERIMETER_CLASSES:
+                self._perimeter.on_light_wash_end(frame, now_ms)
+                perimeter_lit = 1
+            if self._lcd is not None and target_class in _LCD_CLASSES:
+                self._lcd.on_light_wash_end(frame, now_ms)
+                lcd_armed = True
+
+        return DispatchResult(sent, perimeter_lit, lcd_armed)
+
+    def dispatch_wash_pulse(self, target, ev, now_ms):
+        """Encode + broadcast + locally loop back one LIGHT_WASH_PULSE.
+
+        Identical payload to LIGHT_PULSE but routed differently on the
+        Lume side (fires only on washing Lumes, bypassing pulse_response).
+        `ev` is an RgbPulse - same shape as render_fx. Returns a
+        DispatchResult.
+        """
+        target_class, target_group = parse_target(target)
+
+        payload = encode_light_wash_pulse(
+            self._source_id,
+            self._sequence,
+            target_class,
+            target_group,
+            ev.r,
+            ev.g,
+            ev.b,
+            ev.attack,
+            ev.sustain,
+            ev.release,
+            ev.chance,
+        )
+        self._sequence = (self._sequence + 1) & 0xFF
+
+        sent = False
+        if self._send_fn is not None:
+            for _ in range(self._redundancy):
+                try:
+                    self._send_fn(payload)
+                    sent = True
+                except Exception:
+                    pass
+            if sent:
+                self._last_tx_ms = now_ms
+
+        perimeter_lit = 0
+        lcd_armed = False
+        if (self._perimeter is not None and target_class in _PERIMETER_CLASSES) or (
+            self._lcd is not None and target_class in _LCD_CLASSES
+        ):
+            frame = make_light_wash_pulse_frame(
+                target_class,
+                target_group,
+                ev.r,
+                ev.g,
+                ev.b,
+                ev.attack,
+                ev.sustain,
+                ev.release,
+                ev.chance,
+                source_id=self._source_id,
+            )
+            if self._perimeter is not None and target_class in _PERIMETER_CLASSES:
+                perimeter_lit = self._perimeter.on_light_wash_pulse(frame, now_ms)
+            if self._lcd is not None and target_class in _LCD_CLASSES:
+                lcd_armed = bool(self._lcd.on_light_wash_pulse(frame, now_ms))
 
         return DispatchResult(sent, perimeter_lit, lcd_armed)
 

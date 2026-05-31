@@ -8,7 +8,7 @@ loopback, the latter two gated on target_class.
 import pytest
 
 from nocturnation.director import RenderDispatcher, DispatchResult, parse_target
-from nocturnation.render import RgbPulse, PerimeterRenderer, LcdRenderer
+from nocturnation.render import RgbPulse, RgbWash, PerimeterRenderer, LcdRenderer
 from nocturnation.protocol import parse_frame
 from nocturnation.protocol.constants import DeviceClass, MessageType, Time, Chance
 
@@ -272,3 +272,167 @@ class TestDispatchResult:
 
     def test_falsy_when_nothing_happened(self):
         assert bool(DispatchResult(sent=False, perimeter_lit=0, lcd_armed=False)) is False
+
+
+def _wash():
+    return RgbWash(
+        r1=255, g1=140, b1=30,
+        r2=120, g2=30,  b2=200,
+        attack=20, release=10,
+        intensity=200, cycle_ms=5000,
+        ttl_seconds=0, pulse_response=1,
+    )
+
+
+class TestDispatchWash:
+    def test_send_fn_receives_valid_wash_frame(self):
+        sent = []
+        d = RenderDispatcher(send_fn=sent.append, source_id=0x42)
+        d.dispatch_wash("01:00", _wash(), now_ms=1000)
+        assert len(sent) == 1
+        f = parse_frame(sent[0])
+        assert f.message_type == MessageType.LIGHT_WASH
+        assert f.source_id == 0x42
+        assert f.target_class == DeviceClass.LIGHT
+        assert f.target_group == 0
+        assert (f.r1, f.g1, f.b1) == (255, 140, 30)
+        assert (f.r2, f.g2, f.b2) == (120, 30, 200)
+        assert f.wash_attack == 20
+        assert f.wash_release == 10
+        assert f.intensity == 200
+        assert f.cycle_ms == 5000
+        assert f.ttl_seconds == 0
+        assert f.pulse_response == 1
+
+    def test_perimeter_loopback_enters_wash(self):
+        perimeter = _always_fire_perimeter()
+        d = RenderDispatcher(send_fn=lambda p: None, perimeter=perimeter)
+        result = d.dispatch_wash("01:00", _wash(), now_ms=0)
+        assert result.perimeter_lit == 1
+        assert perimeter.is_washing() is True
+
+    def test_lcd_loopback_enters_wash(self):
+        lcd = _full_lcd()
+        d = RenderDispatcher(send_fn=lambda p: None, lcd=lcd)
+        result = d.dispatch_wash("02:00", _wash(), now_ms=0)
+        assert result.lcd_armed is True
+        assert lcd.is_washing() is True
+
+    def test_class_gating_screen_only(self):
+        # A Screen-class wash should arm LCD but not perimeter.
+        perimeter = _always_fire_perimeter()
+        lcd = _full_lcd()
+        d = RenderDispatcher(send_fn=lambda p: None, perimeter=perimeter, lcd=lcd)
+        result = d.dispatch_wash("02:00", _wash(), now_ms=0)
+        assert result.perimeter_lit == 0
+        assert result.lcd_armed is True
+        assert perimeter.is_washing() is False
+        assert lcd.is_washing() is True
+
+    def test_class_gating_light_only(self):
+        perimeter = _always_fire_perimeter()
+        lcd = _full_lcd()
+        d = RenderDispatcher(send_fn=lambda p: None, perimeter=perimeter, lcd=lcd)
+        result = d.dispatch_wash("01:00", _wash(), now_ms=0)
+        assert result.perimeter_lit == 1
+        assert result.lcd_armed is False
+        assert perimeter.is_washing() is True
+        assert lcd.is_washing() is False
+
+    def test_all_class_drives_both_surfaces(self):
+        perimeter = _always_fire_perimeter()
+        lcd = _full_lcd()
+        d = RenderDispatcher(send_fn=lambda p: None, perimeter=perimeter, lcd=lcd)
+        result = d.dispatch_wash("00:00", _wash(), now_ms=0)
+        assert result.perimeter_lit == 1
+        assert result.lcd_armed is True
+
+    def test_sequence_shared_with_pulse(self):
+        # Wash and pulse share the dispatcher's sequence counter; this
+        # matches the M5 side and lets the receiver dedup uniformly.
+        sent = []
+        d = RenderDispatcher(send_fn=sent.append)
+        d.dispatch("01:00", _pulse(), now_ms=0)         # seq 0
+        d.dispatch_wash("01:00", _wash(), now_ms=0)     # seq 1
+        d.dispatch("01:00", _pulse(), now_ms=0)         # seq 2
+        seqs = [parse_frame(b).sequence_number for b in sent]
+        assert seqs == [0, 1, 2]
+
+    def test_redundancy_applies_to_wash(self):
+        sent = []
+        d = RenderDispatcher(send_fn=sent.append, redundancy=3)
+        d.dispatch_wash("01:00", _wash(), now_ms=0)
+        assert len(sent) == 3
+        # All three carry the same sequence (receiver dedups).
+        seqs = [parse_frame(b).sequence_number for b in sent]
+        assert seqs == [0, 0, 0]
+
+    def test_send_failure_is_swallowed_local_loopback_still_runs(self):
+        def boom(_p):
+            raise OSError("radio gone")
+        perimeter = _always_fire_perimeter()
+        d = RenderDispatcher(send_fn=boom, perimeter=perimeter)
+        result = d.dispatch_wash("01:00", _wash(), now_ms=0)
+        assert result.sent is False
+        assert perimeter.is_washing() is True
+
+
+class TestDispatchWashEnd:
+    def test_send_fn_receives_valid_wash_end_frame(self):
+        sent = []
+        d = RenderDispatcher(send_fn=sent.append, source_id=0x42)
+        d.dispatch_wash_end("01:00", release_time=15, now_ms=0)
+        assert len(sent) == 1
+        f = parse_frame(sent[0])
+        assert f.message_type == MessageType.LIGHT_WASH_END
+        assert f.source_id == 0x42
+        assert f.target_class == DeviceClass.LIGHT
+        assert f.target_group == 0
+        assert f.release_time == 15
+
+    def test_local_loopback_cancels_active_wash(self):
+        perimeter = _always_fire_perimeter()
+        d = RenderDispatcher(send_fn=lambda p: None, perimeter=perimeter)
+        d.dispatch_wash("01:00", _wash(), now_ms=0)
+        assert perimeter.is_washing() is True
+        d.dispatch_wash_end("01:00", release_time=10, now_ms=500)
+        # After END the renderer should leave Attack/Hold -> Release.
+        assert perimeter.is_washing() is False
+
+    def test_class_gating_screen_only(self):
+        perimeter = _always_fire_perimeter()
+        lcd = _full_lcd()
+        d = RenderDispatcher(send_fn=lambda p: None, perimeter=perimeter, lcd=lcd)
+        d.dispatch_wash("00:00", _wash(), now_ms=0)
+        # End only Screen - perimeter should still be washing.
+        d.dispatch_wash_end("02:00", release_time=10, now_ms=500)
+        assert perimeter.is_washing() is True
+
+
+class TestDispatchWashPulse:
+    def test_send_fn_receives_valid_wash_pulse_frame(self):
+        sent = []
+        d = RenderDispatcher(send_fn=sent.append, source_id=0x42)
+        d.dispatch_wash_pulse("01:00", _pulse(), now_ms=0)
+        assert len(sent) == 1
+        f = parse_frame(sent[0])
+        assert f.message_type == MessageType.LIGHT_WASH_PULSE
+        assert f.source_id == 0x42
+        assert (f.r, f.g, f.b) == (255, 128, 0)
+
+    def test_wash_pulse_drops_on_non_washing_perimeter(self):
+        # On the local loopback the perimeter is not washing yet, so the
+        # wash-pulse overlay is intentionally dropped (matches the Lume
+        # receive-side semantic from Phase G).
+        perimeter = _always_fire_perimeter()
+        d = RenderDispatcher(send_fn=lambda p: None, perimeter=perimeter)
+        result = d.dispatch_wash_pulse("01:00", _pulse(), now_ms=0)
+        assert result.perimeter_lit == 0
+
+    def test_wash_pulse_fires_when_washing(self):
+        perimeter = _always_fire_perimeter()
+        d = RenderDispatcher(send_fn=lambda p: None, perimeter=perimeter)
+        d.dispatch_wash("01:00", _wash(), now_ms=0)
+        # Now overlay a wash-pulse: should light all 12 LEDs.
+        result = d.dispatch_wash_pulse("01:00", _pulse(), now_ms=100)
+        assert result.perimeter_lit == 12

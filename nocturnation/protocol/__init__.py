@@ -22,6 +22,9 @@ from .frame import (
     encode_light_wash_pulse,
     encode_heartbeat,
     make_light_pulse_frame,
+    make_light_wash_frame,
+    make_light_wash_end_frame,
+    make_light_wash_pulse_frame,
 )
 from .source_id import SourceId, is_community_range, is_performance_range
 
@@ -41,6 +44,9 @@ __all__ = [
     "encode_light_wash_pulse",
     "encode_heartbeat",
     "make_light_pulse_frame",
+    "make_light_wash_frame",
+    "make_light_wash_end_frame",
+    "make_light_wash_pulse_frame",
     "SourceId",
     "is_community_range",
     "is_performance_range",

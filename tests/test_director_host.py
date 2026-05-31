@@ -7,9 +7,9 @@ ctx.render_fx() through to a broadcast frame + local loopback.
 
 from nocturnation.director import DirectorHost, RenderDispatcher
 from nocturnation.hal import Capability, CapabilityMask
-from nocturnation.render import RgbPulse, PerimeterRenderer
+from nocturnation.render import RgbPulse, RgbWash, PerimeterRenderer
 from nocturnation.protocol import parse_frame
-from nocturnation.protocol.constants import DeviceClass, Time, Chance
+from nocturnation.protocol.constants import DeviceClass, MessageType, Time, Chance
 from nocturnation.shows import Show, ShowContext
 from nocturnation.plugins import PropertyBag
 
@@ -131,3 +131,97 @@ class TestEndToEndShowToWire:
     def test_render_fx_through_context_returns_true(self, tmp_path):
         _show, ctx, _sent, _perimeter = self._wire(tmp_path)
         assert ctx.render_fx("01:01", RgbPulse(255, 0, 0)) is True
+
+
+class TestDispatchRenderWash:
+    """Host-level wash dispatch surface (Epic 6D B1)."""
+
+    def _wash(self):
+        return RgbWash(255, 140, 30, 120, 30, 200,
+                       attack=20, release=10, intensity=200,
+                       cycle_ms=5000, ttl_seconds=0, pulse_response=1)
+
+    def test_render_wash_returns_true_on_broadcast(self):
+        host = DirectorHost(RenderDispatcher(send_fn=lambda p: None))
+        assert host.dispatch_render_wash("01:00", self._wash()) is True
+
+    def test_render_wash_returns_true_on_local_loopback_only(self):
+        perimeter = PerimeterRenderer(calm_mode=False, rng=lambda: 0.0)
+        host = DirectorHost(RenderDispatcher(send_fn=None, perimeter=perimeter))
+        assert host.dispatch_render_wash("01:00", self._wash()) is True
+        assert perimeter.is_washing() is True
+
+    def test_render_wash_end_cancels_local_wash(self):
+        perimeter = PerimeterRenderer(calm_mode=False, rng=lambda: 0.0)
+        host = DirectorHost(RenderDispatcher(send_fn=None, perimeter=perimeter))
+        host.dispatch_render_wash("01:00", self._wash())
+        assert perimeter.is_washing() is True
+        host.dispatch_render_wash_end("01:00", release_time=10)
+        assert perimeter.is_washing() is False
+
+    def test_render_wash_pulse_returns_true_when_washing(self):
+        perimeter = PerimeterRenderer(calm_mode=False, rng=lambda: 0.0)
+        host = DirectorHost(RenderDispatcher(send_fn=None, perimeter=perimeter))
+        host.dispatch_render_wash("01:00", self._wash())
+        # Wash-pulse only fires when a wash is active locally.
+        assert host.dispatch_render_wash_pulse(
+            "01:00", RgbPulse(255, 0, 0)
+        ) is True
+
+    def test_wash_broadcasts_carry_correct_message_type(self):
+        sent = []
+        host = DirectorHost(RenderDispatcher(send_fn=sent.append))
+        host.dispatch_render_wash("01:00", self._wash())
+        host.dispatch_render_wash_end("01:00", release_time=10)
+        host.dispatch_render_wash_pulse("01:00", RgbPulse(255, 0, 0))
+        types = [parse_frame(b).message_type for b in sent]
+        assert types == [
+            MessageType.LIGHT_WASH,
+            MessageType.LIGHT_WASH_END,
+            MessageType.LIGHT_WASH_PULSE,
+        ]
+
+
+class TestShowContextWashSurface:
+    """ShowContext mirror of the M5 surface (Epic 6D B1)."""
+
+    def _wash(self):
+        return RgbWash(255, 140, 30, intensity=200, cycle_ms=5000)
+
+    def _wired(self, tmp_path):
+        perimeter = PerimeterRenderer(calm_mode=False, rng=lambda: 0.0)
+        dispatcher = RenderDispatcher(send_fn=lambda p: None, perimeter=perimeter)
+        host = DirectorHost(dispatcher, clock=lambda: 0)
+        show = _BeatShow()
+        bag = PropertyBag(show, path=str(tmp_path / "p.json"))
+        ctx = ShowContext(show, bag, host=host)
+        show._ctx = ctx
+        return show, ctx, perimeter
+
+    def test_render_wash_via_context(self, tmp_path):
+        _show, ctx, perimeter = self._wired(tmp_path)
+        assert ctx.render_wash("01:00", self._wash()) is True
+        assert perimeter.is_washing() is True
+
+    def test_render_wash_end_via_context(self, tmp_path):
+        _show, ctx, perimeter = self._wired(tmp_path)
+        ctx.render_wash("01:00", self._wash())
+        assert ctx.render_wash_end("01:00", release_time=10) is True
+        assert perimeter.is_washing() is False
+
+    def test_render_wash_pulse_via_context(self, tmp_path):
+        _show, ctx, perimeter = self._wired(tmp_path)
+        ctx.render_wash("01:00", self._wash())
+        assert ctx.render_wash_pulse(
+            "01:00", RgbPulse(255, 0, 0)
+        ) is True
+
+    def test_context_falls_back_safely_without_host(self, tmp_path):
+        # No host wired - the methods must short-circuit to False rather
+        # than throwing (host tests written before B1 land in this state).
+        show = _BeatShow()
+        bag = PropertyBag(show, path=str(tmp_path / "p.json"))
+        ctx = ShowContext(show, bag, host=None)
+        assert ctx.render_wash("01:00", self._wash()) is False
+        assert ctx.render_wash_end("01:00", 10) is False
+        assert ctx.render_wash_pulse("01:00", RgbPulse(255, 0, 0)) is False
