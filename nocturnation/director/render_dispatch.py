@@ -28,9 +28,9 @@ callable so the whole fan-out is host-testable. B6 wires the real
 """
 
 from ..protocol import (
-    encode_light_command,
+    encode_light_pulse,
     encode_heartbeat,
-    make_light_command_frame,
+    make_light_pulse_frame,
 )
 from ..protocol.constants import DeviceClass
 
@@ -128,7 +128,7 @@ class RenderDispatcher:
         self._lcd = lcd
         self._source_id = source_id & 0xFF
         self._sequence = 0
-        # How many times to repeat each LIGHT_COMMAND broadcast. ESP-NOW
+        # How many times to repeat each LIGHT_PULSE broadcast. ESP-NOW
         # is fire-and-forget with no retransmission, so a single send is
         # lossy; the M5 master sends 3x for reliability and the receiver
         # dedups on (source_id, sequence). Default 1 keeps tests simple;
@@ -136,7 +136,7 @@ class RenderDispatcher:
         # redundant over time).
         self._redundancy = max(1, redundancy)
         # Wall-clock of the last frame actually broadcast (any type).
-        # Drives heartbeat skip-if-recent: a LIGHT_COMMAND already
+        # Drives heartbeat skip-if-recent: a LIGHT_PULSE already
         # proves liveness, so a heartbeat is only sent to fill quiet
         # gaps. None = nothing sent yet (beacon immediately on entry).
         self._last_tx_ms = None
@@ -162,7 +162,7 @@ class RenderDispatcher:
 
         # 1. Encode + broadcast (always). Sequence wraps at 256; the
         #    dispatcher owns the counter.
-        payload = encode_light_command(
+        payload = encode_light_pulse(
             self._source_id,
             self._sequence,
             target_class,
@@ -199,7 +199,7 @@ class RenderDispatcher:
         if (self._perimeter is not None and target_class in _PERIMETER_CLASSES) or (
             self._lcd is not None and target_class in _LCD_CLASSES
         ):
-            frame = make_light_command_frame(
+            frame = make_light_pulse_frame(
                 target_class,
                 target_group,
                 ev.r,
@@ -222,7 +222,7 @@ class RenderDispatcher:
         """Beacon a HEARTBEAT if no frame has gone out in `interval_ms`.
 
         Called every loop tick; self-throttles to ~1 Hz. Skip-if-recent:
-        a LIGHT_COMMAND broadcast already proves liveness, so a tapping
+        a LIGHT_PULSE broadcast already proves liveness, so a tapping
         Director needs no extra heartbeats - they only fill quiet gaps
         so a Lume can discover the channel and keep its TOFU lock.
 

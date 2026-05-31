@@ -12,7 +12,7 @@ from nocturnation.protocol.frame import Frame
 from nocturnation.tofu import TofuLock, DEFAULT_TIMEOUT_MS, format_lock_label
 
 
-def make_frame(source_id, message_type=MessageType.LIGHT_COMMAND,
+def make_frame(source_id, message_type=MessageType.LIGHT_PULSE,
                sequence=1, hop_count=0):
     """Construct a minimal Frame for TOFU testing.
 
@@ -59,12 +59,12 @@ class TestFirstLock:
         assert t.is_locked() is True
         assert t.locked_id == 0x05
 
-    def test_first_frame_can_be_light_command_not_only_heartbeat(self):
+    def test_first_frame_can_be_light_pulse_not_only_heartbeat(self):
         """Per B6 signoff: TOFU locks on any valid frame, not only HEARTBEAT.
         Mid-song joins would otherwise sit idle until the next heartbeat gap.
         """
         t = TofuLock()
-        f = make_frame(source_id=0x42, message_type=MessageType.LIGHT_COMMAND)
+        f = make_frame(source_id=0x42, message_type=MessageType.LIGHT_PULSE)
         admitted = t.admit(f, channel=11, now_ms=0)
         assert admitted is True
         assert t.locked_id == 0x42

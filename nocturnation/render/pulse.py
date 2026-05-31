@@ -3,7 +3,7 @@
 Cross-platform mirror of `dal::RgbPulseEvent` on the M5 firmware (see
 docs/developing-shows.md in nocturnation-m5). Carries the colour plus
 the PixMob ASR envelope and per-bracelet chance. The Director's
-RenderDispatcher maps these fields straight onto the LIGHT_COMMAND
+RenderDispatcher maps these fields straight onto the LIGHT_PULSE
 payload bytes.
 
 The envelope timings are PixMob Time enum indices (not milliseconds):

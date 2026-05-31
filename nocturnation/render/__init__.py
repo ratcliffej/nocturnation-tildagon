@@ -1,6 +1,6 @@
 """Render surfaces: perimeter LEDs (Block 3), round LCD (Block 4).
 
-The renderers translate parsed LIGHT_COMMAND frames into hardware drive
+The renderers translate parsed LIGHT_PULSE frames into hardware drive
 calls. Each is pure logic with a callback / query interface so the full
 envelope contract is host-testable; the badge-specific drive happens in
 app.py via tildagonos.leds (perimeter) and ctx (LCD).

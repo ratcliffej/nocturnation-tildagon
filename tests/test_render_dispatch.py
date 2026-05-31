@@ -229,12 +229,12 @@ class TestHeartbeat:
         assert d.heartbeat_tick(1000) is True
         assert len(sent) == 2
 
-    def test_recent_light_command_suppresses_heartbeat(self):
+    def test_recent_light_pulse_suppresses_heartbeat(self):
         # Skip-if-recent: a tap broadcast resets the timer, so no
         # heartbeat is needed for the next second.
         sent = []
         d = RenderDispatcher(send_fn=sent.append)
-        d.dispatch("01:00", _pulse(), now_ms=0)   # LIGHT_COMMAND
+        d.dispatch("01:00", _pulse(), now_ms=0)   # LIGHT_PULSE
         assert d.heartbeat_tick(500) is False
         # ...but once the gap exceeds the interval, the beacon resumes.
         assert d.heartbeat_tick(1001) is True

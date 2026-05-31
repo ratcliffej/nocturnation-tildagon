@@ -31,7 +31,7 @@ Three operator-tunable values:
   mode (str: "lume", "director", default "lume")
     App role (Epic 6B). "lume" is the original receive-only behaviour;
     "director" runs the Show framework + IMU tap-to-beat and broadcasts
-    LIGHT_COMMAND frames. Persisted so a Director badge reopens in
+    LIGHT_PULSE frames. Persisted so a Director badge reopens in
     Director mode. Unknown values fall back to "lume" (the safe,
     receive-only default).
 

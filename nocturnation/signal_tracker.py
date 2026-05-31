@@ -29,7 +29,7 @@ class SignalTracker:
 
     def record_frame(self, now_ms):
         """Note that a frame arrived. Call from every accepted frame
-        (LIGHT_COMMAND and HEARTBEAT - both count as proof the
+        (LIGHT_PULSE and HEARTBEAT - both count as proof the
         Director is alive; spec v0.29 trimmed the protocol so those
         are the only two active types)."""
         self._last_frame_ms = now_ms

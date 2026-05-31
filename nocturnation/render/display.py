@@ -12,7 +12,7 @@ on each frame with `set_ctx()` before calling the Show's
 
 Coordinate system mirrors the badge: origin at screen centre, x/y in
 -120..120, screen 240x240 (round). Colours are 0..255 ints (matching
-RgbPulse and the LIGHT_COMMAND wire), converted to the 0..1 floats
+RgbPulse and the LIGHT_PULSE wire), converted to the 0..1 floats
 `ctx.rgb` expects.
 
 Kept as pure logic with the ctx injected so the contract is host-

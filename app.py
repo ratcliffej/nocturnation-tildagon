@@ -7,7 +7,7 @@ Block 2 (shipped): async background_task drives ESP-NOW receive with
 channel auto-scan, deduplication, and hop-count enforcement per the
 protocol manual.
 
-Block 3 (shipped): each accepted LIGHT_COMMAND is dispatched to the
+Block 3 (shipped): each accepted LIGHT_PULSE is dispatched to the
 PerimeterRenderer which arms per-LED envelopes; the update() tick
 advances envelopes and pushes the resulting (r, g, b) per LED via
 tildagonos.leds[i].
@@ -18,7 +18,7 @@ beneath the UI text. Calm Mode disables LCD pulsing entirely.
 
 Block 5 (shipped): persistent settings (Calm Mode, group, channel) +
 in-app menu via app_components.Menu. CONFIRM opens the menu; CANCEL
-backs out. Class + group filter on inbound LIGHT_COMMAND per protocol
+backs out. Class + group filter on inbound LIGHT_PULSE per protocol
 manual section 4.2 and Epic 5 Q1 / Q2.
 
 Block 6: NO SIGNAL indication after a 3 s frame gap (protocol
@@ -803,7 +803,7 @@ class NocturNationApp(app.App):
             ctx.font_size = 12
         elif (
             self._last_frame is not None
-            and self._last_frame.message_type == MessageType.LIGHT_COMMAND
+            and self._last_frame.message_type == MessageType.LIGHT_PULSE
         ):
             f = self._last_frame
             ctx.move_to(0, 45).text("rgb %02x%02x%02x" % (f.r, f.g, f.b))
@@ -1434,7 +1434,7 @@ class NocturNationApp(app.App):
                 self._dbg_frame("rx", buf, frame, admitted)
                 if admitted:
                     self._observe_frame(frame)
-                    if frame.message_type == MessageType.LIGHT_COMMAND:
+                    if frame.message_type == MessageType.LIGHT_PULSE:
                         print(
                             "[nocturnation] LIGHT r=%d g=%d b=%d cls=%d grp=%d"
                             % (
@@ -1487,7 +1487,7 @@ class NocturNationApp(app.App):
         self._last_frame = frame
         # Every accepted frame counts as Director-alive proof for the
         # NO SIGNAL detector, regardless of message type. Heartbeats
-        # are just as good as LIGHT_COMMANDs here.
+        # are just as good as LIGHT_PULSEs here.
         if time is not None:
             self._signal_tracker.record_frame(time.ticks_ms())
 
@@ -1496,12 +1496,14 @@ class NocturNationApp(app.App):
 
         now_ms = time.ticks_ms()
 
-        # MUSIC_EVENT (0x06) was removed in the spec v0.29 protocol
-        # trim; the Director no longer emits DROP / BREAKDOWN / BUILD
-        # and the Tildagon-side synthetic-fire rendering is gone with
-        # it. Inbound HEARTBEAT and any reserved-id frame just bump
-        # the frame counter without further per-surface dispatch.
-        if frame.message_type != MessageType.LIGHT_COMMAND:
+        # HEARTBEAT and unknown / reserved-id frames just bump the frame
+        # counter without further per-surface dispatch. LIGHT_PULSE plus
+        # the LIGHT_WASH family (Epic 6C Phase G) are the routed types.
+        mt = frame.message_type
+        if mt not in (MessageType.LIGHT_PULSE,
+                       MessageType.LIGHT_WASH,
+                       MessageType.LIGHT_WASH_END,
+                       MessageType.LIGHT_WASH_PULSE):
             return
 
         # Group filter per protocol manual section 4.2: target_group == 0
@@ -1516,10 +1518,33 @@ class NocturNationApp(app.App):
         # LCD; MultiLedScreen arms both; All targets both. Other
         # classes (reserved) are silently dropped.
         cls = frame.target_class
-        if cls in _PERIMETER_CLASSES:
-            self._renderer.dispatch(frame, now_ms)
-        if cls in _LCD_CLASSES:
-            self._lcd_renderer.dispatch(frame, now_ms)
+
+        if mt == MessageType.LIGHT_PULSE:
+            if cls in _PERIMETER_CLASSES:
+                self._renderer.dispatch(frame, now_ms)
+            if cls in _LCD_CLASSES:
+                self._lcd_renderer.dispatch(frame, now_ms)
+        elif mt == MessageType.LIGHT_WASH:
+            # Tildagon is wash-capable on both surfaces (can_pulse +
+            # can_wash + can_overlay). Hand the wash to whichever
+            # surface(s) match the target class.
+            if cls in _PERIMETER_CLASSES:
+                self._renderer.on_light_wash(frame, now_ms)
+            if cls in _LCD_CLASSES:
+                self._lcd_renderer.on_light_wash(frame, now_ms)
+        elif mt == MessageType.LIGHT_WASH_END:
+            if cls in _PERIMETER_CLASSES:
+                self._renderer.on_light_wash_end(frame, now_ms)
+            if cls in _LCD_CLASSES:
+                self._lcd_renderer.on_light_wash_end(frame, now_ms)
+        elif mt == MessageType.LIGHT_WASH_PULSE:
+            # The renderer's on_light_wash_pulse handler internally
+            # drops the frame if it has no active wash (per design),
+            # so the receive-side dispatch routes unconditionally.
+            if cls in _PERIMETER_CLASSES:
+                self._renderer.on_light_wash_pulse(frame, now_ms)
+            if cls in _LCD_CLASSES:
+                self._lcd_renderer.on_light_wash_pulse(frame, now_ms)
 
     def _lcd_background_rgb01(self):
         """Return (r, g, b) in 0..1 floats for ctx.rgb() to paint as the
