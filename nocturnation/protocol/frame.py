@@ -400,6 +400,112 @@ def encode_light_wash_pulse(
     ))
 
 
+def make_light_wash_frame(
+    target_class,
+    target_group,
+    r1, g1, b1,
+    r2, g2, b2,
+    attack,
+    release,
+    intensity,
+    cycle_ms,
+    ttl_seconds,
+    pulse_response,
+    source_id=0,
+    sequence_number=0,
+    hop_count=0,
+):
+    """Construct a LIGHT_WASH Frame directly, for local loopback.
+
+    Mirrors make_light_pulse_frame: builds the Frame the perimeter and
+    LCD renderers consume directly, skipping the encode + parse round
+    trip on every render. Loopback paths don't inspect the header
+    fields - only the LIGHT_WASH payload attributes matter.
+    """
+    f = Frame()
+    f.protocol_version = PROTOCOL_VERSION
+    f.source_id = source_id
+    f.sequence_number = sequence_number
+    f.hop_count = hop_count
+    f.message_type = MessageType.LIGHT_WASH
+    f.payload_len = _LIGHT_WASH_PAYLOAD_LEN
+    f.payload = None
+    f.target_class = target_class
+    f.target_group = target_group
+    f.r1 = r1; f.g1 = g1; f.b1 = b1
+    f.r2 = r2; f.g2 = g2; f.b2 = b2
+    f.wash_attack = attack
+    f.wash_release = release
+    f.intensity = intensity
+    f.cycle_ms = cycle_ms
+    f.ttl_seconds = ttl_seconds
+    f.pulse_response = pulse_response
+    return f
+
+
+def make_light_wash_end_frame(
+    target_class,
+    target_group,
+    release_time,
+    source_id=0,
+    sequence_number=0,
+    hop_count=0,
+):
+    """Construct a LIGHT_WASH_END Frame directly, for local loopback."""
+    f = Frame()
+    f.protocol_version = PROTOCOL_VERSION
+    f.source_id = source_id
+    f.sequence_number = sequence_number
+    f.hop_count = hop_count
+    f.message_type = MessageType.LIGHT_WASH_END
+    f.payload_len = _LIGHT_WASH_END_PAYLOAD_LEN
+    f.payload = None
+    f.target_class = target_class
+    f.target_group = target_group
+    f.release_time = release_time
+    return f
+
+
+def make_light_wash_pulse_frame(
+    target_class,
+    target_group,
+    r,
+    g,
+    b,
+    attack,
+    sustain,
+    release,
+    chance,
+    source_id=0,
+    sequence_number=0,
+    hop_count=0,
+):
+    """Construct a LIGHT_WASH_PULSE Frame directly, for local loopback.
+
+    Identical payload to LIGHT_PULSE; the renderers route by frame
+    message_type (LIGHT_WASH_PULSE only fires on washing Lumes,
+    bypassing pulse_response).
+    """
+    f = Frame()
+    f.protocol_version = PROTOCOL_VERSION
+    f.source_id = source_id
+    f.sequence_number = sequence_number
+    f.hop_count = hop_count
+    f.message_type = MessageType.LIGHT_WASH_PULSE
+    f.payload_len = _LIGHT_WASH_PULSE_PAYLOAD_LEN
+    f.payload = None
+    f.target_class = target_class
+    f.target_group = target_group
+    f.r = r
+    f.g = g
+    f.b = b
+    f.attack = attack
+    f.sustain = sustain
+    f.release = release
+    f.chance = chance
+    return f
+
+
 _HEARTBEAT_PAYLOAD_LEN = PAYLOAD_LENGTHS[MessageType.HEARTBEAT]
 
 

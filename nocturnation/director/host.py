@@ -3,16 +3,17 @@
 ShowContext (nocturnation.shows.show_context) forwards a Show's
 service calls to its `host`:
 
-  dispatch_render_fx(target, ev) -> bool
-  now_ms()                       -> int
-  analyser_caps()                -> CapabilityMask
-  imu_caps()                     -> CapabilityMask
+  dispatch_render_fx(target, ev)                  -> bool
+  dispatch_render_wash(target, ev)                -> bool
+  dispatch_render_wash_end(target, release_time)  -> bool
+  dispatch_render_wash_pulse(target, ev)          -> bool
+  now_ms()                                        -> int
+  analyser_caps()                                 -> CapabilityMask
+  imu_caps()                                      -> CapabilityMask
 
-DirectorHost satisfies that contract. In B3 it wraps a
-RenderDispatcher and a clock; analyser_caps is always empty (the
-Tildagon has no microphone) and imu_caps is whatever the IMU adapter
-declares (empty until B4 lights it up). B6 expands this object into
-the full DirectorMode runtime (active-show selection, overlays).
+DirectorHost satisfies that contract. It wraps a RenderDispatcher and
+a clock; analyser_caps is always empty (the Tildagon has no
+microphone) and imu_caps is whatever the IMU adapter declares.
 """
 
 from ..hal import CapabilityMask
@@ -44,6 +45,27 @@ class DirectorHost:
         """Fan a render event out via the dispatcher. Returns True if
         the render did anything (broadcast or local loopback)."""
         result = self._dispatcher.dispatch(target, ev, self.now_ms())
+        return bool(result)
+
+    def dispatch_render_wash(self, target, ev):
+        """Fan a LIGHT_WASH event out via the dispatcher."""
+        result = self._dispatcher.dispatch_wash(target, ev, self.now_ms())
+        return bool(result)
+
+    def dispatch_render_wash_end(self, target, release_time):
+        """Fan a LIGHT_WASH_END out via the dispatcher. `release_time`
+        is in 100 ms units."""
+        result = self._dispatcher.dispatch_wash_end(
+            target, release_time, self.now_ms()
+        )
+        return bool(result)
+
+    def dispatch_render_wash_pulse(self, target, ev):
+        """Fan a LIGHT_WASH_PULSE event out via the dispatcher.
+        `ev` is an RgbPulse (same payload as LIGHT_PULSE)."""
+        result = self._dispatcher.dispatch_wash_pulse(
+            target, ev, self.now_ms()
+        )
         return bool(result)
 
     def now_ms(self):

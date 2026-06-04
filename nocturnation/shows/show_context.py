@@ -63,6 +63,30 @@ class ShowContext:
             return False
         return self._host.dispatch_render_fx(target, ev)
 
+    def render_wash(self, target, ev):
+        """Fan out a LIGHT_WASH event. `ev` is an RgbWash. Cross-platform
+        mirror of `ShowContext::render_wash` on M5 (Epic 6C)."""
+        if self._host is None or not hasattr(self._host, "dispatch_render_wash"):
+            return False
+        return self._host.dispatch_render_wash(target, ev)
+
+    def render_wash_end(self, target, release_time):
+        """Cancel an active wash on `target` with `release_time` (in
+        100 ms units) overriding the wash's own release. Cross-platform
+        mirror of `ShowContext::render_wash_end` on M5."""
+        if self._host is None or not hasattr(self._host, "dispatch_render_wash_end"):
+            return False
+        return self._host.dispatch_render_wash_end(target, release_time)
+
+    def render_wash_pulse(self, target, ev):
+        """Fan out a LIGHT_WASH_PULSE event. `ev` is an RgbPulse (same
+        payload as LIGHT_PULSE; routed only to washing Lumes on the
+        receive side). Cross-platform mirror of
+        `ShowContext::render_wash_pulse` on M5."""
+        if self._host is None or not hasattr(self._host, "dispatch_render_wash_pulse"):
+            return False
+        return self._host.dispatch_render_wash_pulse(target, ev)
+
     # -- Property bag -----------------------------------------------------
 
     def get_property(self, key):
