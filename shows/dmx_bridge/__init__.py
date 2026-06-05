@@ -273,14 +273,28 @@ class DmxBridge(Show):
         # motion_wave / simple_tap). ctx.display() returns a small
         # wrapper with .clear(r, g, b) and .text(x, y, ..., size=, r=,
         # g=, b=) methods; coordinates are centred on the screen.
-        d = ctx.display()
-        if d is None:
-            return
-        d.clear(0, 0, 0)
-        if self._view_diagnostics:
-            self._render_diagnostics(d)
-        else:
-            self._render_status(d, ctx)
+        # All draw calls wrapped in try/except so a single failing
+        # call can't crash the Show.
+        try:
+            d = ctx.display()
+            if d is None:
+                return
+            d.clear(0, 0, 0)
+            if self._view_diagnostics:
+                self._render_diagnostics(d)
+            else:
+                self._render_status(d, ctx)
+        except Exception as e:
+            # Last-resort: try to surface the error on the screen so
+            # the operator sees what went wrong rather than a frozen
+            # display. If THIS errors too, swallow and move on.
+            try:
+                d = ctx.display()
+                d.clear(0, 0, 0)
+                d.text(0, 0, "render err", size=12, r=255, g=80, b=80)
+                d.text(0, 20, repr(e)[:24], size=10, r=255, g=80, b=80)
+            except Exception:
+                pass
 
     def _render_status(self, d, ctx):
         now_ms = ctx.now_ms() if hasattr(ctx, "now_ms") else 0
@@ -305,48 +319,27 @@ class DmxBridge(Show):
         d.text(0, 92, "press button: diag", size=10, r=120, g=120, b=120)
 
     def _render_diagnostics(self, d):
-        d.text(0, -110, "Diagnostics", size=14, r=255, g=255, b=255)
-        # Read-path metadata - what API is delivering bytes, are start
-        # markers present.
-        d.text(0, -90, "path: %s" % self._read_path,
-               size=10, r=200, g=200, b=200)
-        d.text(0, -76, "0x7E seen: %d" % self._start_bytes_seen,
-               size=10, r=200, g=200, b=200)
-        # Last bytes received - 16 most recent, hex. If this looks like
-        # garbage / has unexpected ASCII translation, the read path is
-        # munging bytes.
-        d.text(0, -58, "last bytes:", size=10, r=200, g=200, b=200)
-        # Split the hex string into two lines (16 bytes = 47 chars).
-        if self._last_bytes_hex:
-            half = len(self._last_bytes_hex) // 2
-            d.text(0, -44, self._last_bytes_hex[:half],
-                   size=10, r=255, g=255, b=160)
-            d.text(0, -30, self._last_bytes_hex[half:],
-                   size=10, r=255, g=255, b=160)
-        else:
-            d.text(0, -44, "(none)", size=10, r=160, g=160, b=160)
-        # NocturNation channel slice from the most recent COMPLETED
-        # frame (only updates if a frame parsed; stays at 0 / no data
-        # if parsing isn't working).
-        d.text(0, -10, "last frame channels:",
-               size=10, r=200, g=200, b=200)
-        if not self._last_payload:
-            d.text(0, 6, "(no frame parsed yet)",
-                   size=10, r=160, g=160, b=160)
-            return
-        labels = ("M", "S", "PR", "PG", "PB",
-                  "PT", "AR", "AG", "AB", "BR", "BG", "BB")
-        # Pack 12 labels and values into 4 rows of 3.
-        for row in range(4):
-            cells = []
-            for col in range(3):
-                idx = row * 3 + col
-                if idx >= len(labels) or idx >= len(self._last_payload):
-                    break
-                cells.append("%s:%3d" % (labels[idx],
-                                         self._last_payload[idx]))
-            d.text(0, 6 + row * 14, "  ".join(cells),
-                   size=10, r=255, g=255, b=255)
+        # Minimal layout - five text calls, all within the safe -80..80
+        # vertical range that the conductor Show uses. Big readable
+        # font sizes so the operator can read off the screen quickly.
+        d.text(0, -75, "Diagnostics",   size=14, r=255, g=255, b=255)
+        d.text(0, -45, "path: " + self._read_path,
+               size=12, r=200, g=200, b=200)
+        d.text(0, -25, "0x7E: %d" % self._start_bytes_seen,
+               size=12, r=200, g=200, b=200)
+        d.text(0,  -5, "frames: %d" % self._frames_received,
+               size=12, r=200, g=200, b=200)
+        # Last byte chunk - just the first 8 bytes as hex so the line
+        # fits the screen width at size 10. If it's all printable ASCII
+        # (0x20..0x7E range), text-mode translation is happening; if
+        # it includes 0x00, 0x7E, 0xE7, the raw bytes are coming through.
+        hex_str = self._last_bytes_hex
+        if len(hex_str) > 23:
+            hex_str = hex_str[:23]   # 8 bytes = 23 chars ("XX " * 8 - 1)
+        d.text(0,  25, hex_str if hex_str else "(no data)",
+               size=10, r=255, g=255, b=160)
+        if self._error:
+            d.text(0,  60, self._error[:24], size=10, r=255, g=80, b=80)
 
 
 def make_show():
