@@ -182,12 +182,15 @@ class DmxBridge(Show):
         self._read_path = "?"      # "buffer" | "text" | "?"
         self._last_bytes_hex = ""  # hex dump of the most recent line
         self._start_bytes_seen = 0
-        # Line-buffered hex decoder: shim sends "aabbcc...e7;" per
-        # frame. Use a bytearray so .extend() / del [:n] are in-place
-        # and don't churn the GC.
+        # Quote-delimited hex decoder: shim sends '#"<hex>"\n' per
+        # frame. The # opens a Python comment (REPL no-ops), " is the
+        # frame delimiter we use (\n gets eaten by the REPL but " is
+        # left intact because the REPL only sees a comment). Bytearray
+        # so .extend() / del [:n] stay in-place.
         self._line_buf = bytearray()
-        self._frames_decoded = 0   # successful hex unhexlify count
-        self._bad_lines = 0        # lines that failed unhexlify
+        self._in_quote = False      # state: inside the "..." quote
+        self._frames_decoded = 0    # successful hex unhexlify count
+        self._bad_lines = 0         # lines that failed unhexlify
         # Log file diagnostics.
         self._chunks_logged = 0    # so we log only the first N chunks
         self._next_stats_log_ms = 0
@@ -240,6 +243,7 @@ class DmxBridge(Show):
         self._error = ""
         self._poll = None
         self._line_buf = bytearray()
+        self._in_quote = False
         self._frames_decoded = 0
         self._bad_lines = 0
         self._start_bytes_seen = 0
@@ -321,44 +325,64 @@ class DmxBridge(Show):
                 except Exception:
                     pass
             self._line_buf.extend(chunk)
-            # Pull off as many complete frames as we have. The shim's
-            # Tildagon-specific envelope wraps each frame as a Python
-            # comment + newline: "#<hex>\n". The REPL parses these as
-            # no-op statements and stays alive (without the envelope
-            # the REPL tries to execute the hex string as Python code,
-            # NameErrors out, and we've seen the device hang).
+            # Quote-delimited hex stream. Shim sends '#"<hex>"\n' per
+            # frame. # opens a Python comment so the REPL no-ops; "
+            # is the actual frame delimiter for us (the REPL leaves
+            # quotes intact within comments); \n triggers the REPL to
+            # process and move on. A small two-state machine: outside
+            # a quote we skip bytes looking for the opening "; inside
+            # a quote we accumulate until the closing ".
             #
-            # We accept either \n or ; as delimiter so the same parser
-            # works against legacy shim builds during the transition.
-            # Leading '#' (the comment prefix) is stripped after split.
+            # Two delimiters tried per pass so frames keep flowing:
+            #   "  - primary, the shim's python envelope
+            #   ;  - legacy hex envelope (older shim builds)
             while True:
-                sep_idx = self._line_buf.find(b"\n")
-                if sep_idx < 0:
-                    sep_idx = self._line_buf.find(b";")
-                if sep_idx < 0:
-                    break
-                line = bytes(self._line_buf[:sep_idx])
-                # Mutate buffer in-place to drop the consumed line +
-                # delimiter; no whole-buffer reallocation.
-                del self._line_buf[:sep_idx + 1]
-                # Trim CR / whitespace + the Python-comment prefix.
-                line = line.strip()
-                while line and line[:1] == b"#":
-                    line = line[1:].strip()
-                if not line:
+                if self._in_quote:
+                    # Inside the quotes - read hex chars until closing ".
+                    q_idx = self._line_buf.find(b'"')
+                    if q_idx < 0:
+                        break
+                    hex_line = bytes(self._line_buf[:q_idx])
+                    del self._line_buf[:q_idx + 1]
+                    self._in_quote = False
+                else:
+                    # Outside the quotes - skip noise until opening ".
+                    # Also accept a ; that signals a legacy non-quoted
+                    # frame ended; for that path the prefix is whatever
+                    # noise is in the buffer up to the ;.
+                    open_q = self._line_buf.find(b'"')
+                    legacy_semi = self._line_buf.find(b";")
+                    # Prefer whichever comes first.
+                    if open_q < 0 and legacy_semi < 0:
+                        break
+                    if 0 <= open_q and (legacy_semi < 0 or open_q < legacy_semi):
+                        # Skip everything up to + including the opening ".
+                        del self._line_buf[:open_q + 1]
+                        self._in_quote = True
+                        continue   # re-enter loop to find closing "
+                    # Legacy ; path - hex line up to the ;.
+                    hex_line = bytes(self._line_buf[:legacy_semi])
+                    del self._line_buf[:legacy_semi + 1]
+                    # Trim possible leading #/whitespace.
+                    hex_line = hex_line.strip()
+                    while hex_line and hex_line[:1] == b"#":
+                        hex_line = hex_line[1:].strip()
+
+                hex_line = hex_line.strip()
+                if not hex_line:
                     continue
                 # Log the first decoded line so we can see what a
                 # complete frame looks like in the stream.
                 if self._frames_decoded == 0:
                     try:
                         _log.write("first line: len=%d head=%s"
-                                   % (len(line),
-                                      line[:64].decode("ascii", "ignore")))
+                                   % (len(hex_line),
+                                      hex_line[:64].decode("ascii", "ignore")))
                     except Exception:
                         pass
                 # Hex-decode to raw frame bytes.
                 try:
-                    frame_bytes = binascii.unhexlify(line)
+                    frame_bytes = binascii.unhexlify(hex_line)
                 except Exception as e:
                     self._bad_lines += 1
                     if self._bad_lines <= 3:
@@ -366,7 +390,7 @@ class DmxBridge(Show):
                             _log.write(
                                 "bad line %d: %r head=%s"
                                 % (self._bad_lines, e,
-                                   line[:32].decode("ascii", "ignore")))
+                                   hex_line[:32].decode("ascii", "ignore")))
                         except Exception:
                             pass
                     continue
