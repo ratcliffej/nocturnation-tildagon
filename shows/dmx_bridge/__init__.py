@@ -194,6 +194,12 @@ class DmxBridge(Show):
         # Log file diagnostics.
         self._chunks_logged = 0    # so we log only the first N chunks
         self._next_stats_log_ms = 0
+        # REPL detach state. We call os.dupterm(None, 0) in enter() to
+        # take exclusive ownership of USB-CDC (otherwise the REPL eats
+        # our bytes); save the previous stream and restore it in exit()
+        # so the operator gets the REPL back without a hard reset.
+        self._prev_term = None
+        self._term_detached = False
 
     # ------------------------------------------------------------------
     # Plugin identity
@@ -249,7 +255,23 @@ class DmxBridge(Show):
         self._start_bytes_seen = 0
         self._chunks_logged = 0
         self._next_stats_log_ms = 0
+        self._prev_term = None
+        self._term_detached = False
         _log.write("enter: stdin=%r" % sys.stdin)
+        # Detach REPL slot 0 so USB-CDC bytes flow to us, not the REPL.
+        # All previous bench attempts saw the REPL eat delimiters and
+        # crash under volume; the only documented MicroPython way to
+        # take ownership is os.dupterm(None, idx). Saved stream goes
+        # back in exit() so the operator's REPL works again - critical
+        # for being able to redeploy without a hard reset.
+        try:
+            import os as _os
+            self._prev_term = _os.dupterm(None, 0)
+            self._term_detached = True
+            _log.write("dupterm: detached slot 0, prev=%r"
+                       % self._prev_term)
+        except Exception as e:
+            _log.write("dupterm: detach failed: %r" % e)
         if not _HAS_SELECT:
             self._error = "select module not available"
             return
@@ -267,6 +289,18 @@ class DmxBridge(Show):
         except Exception:
             pass
         self._poll = None
+        # CRITICAL: restore the REPL so the operator gets it back
+        # without needing a hard reset. Wrapped tight so a failure
+        # here surfaces in the log but doesn't propagate.
+        if self._term_detached:
+            try:
+                import os as _os
+                _os.dupterm(self._prev_term, 0)
+                _log.write("dupterm: restored slot 0")
+            except Exception as e:
+                _log.write("dupterm: restore failed: %r" % e)
+            self._term_detached = False
+            self._prev_term = None
 
     # ------------------------------------------------------------------
     # Tick: drain USB-CDC, parse, dispatch
@@ -552,7 +586,9 @@ class DmxBridge(Show):
         d.text(0, -10, "out: pulse:%d wash:%d"
                % (self._pulses_sent, self._washes_sent),
                size=10, r=200, g=200, b=200)
-        d.text(0,   5, "path: %s" % self._read_path,
+        d.text(0,   5, "path: %s  REPL: %s"
+               % (self._read_path,
+                  "off" if self._term_detached else "on"),
                size=10, r=160, g=160, b=160)
         # Show the first 16 chars of the last hex line. Should look
         # like "7e06010200000000" - if it doesn't, the cable isn't
