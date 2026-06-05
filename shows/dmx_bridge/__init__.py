@@ -32,9 +32,23 @@ ESP-NOW radio is free.
 import sys
 
 try:
-    # MicroPython exposes `select` as a top-level module; CPython has
-    # it too but the API surface is narrower. We use poll() which is
-    # present in both.
+    # asyncio is the integration path that actually works on the
+    # Tildagon (reference: benclifford/tildagon-usbserial-kbd, which
+    # reads single chars from sys.stdin via asyncio.StreamReader).
+    # The synchronous select.poll() + sys.stdin.read() pattern we
+    # tried first fights the framework's I/O loop; asyncio shares
+    # sys.stdin cooperatively with the REPL and the framework, and
+    # the REPL no longer eats our bytes because we yield properly to
+    # the scheduler.
+    import asyncio
+    _HAS_ASYNCIO = True
+except ImportError:
+    _HAS_ASYNCIO = False
+
+# Legacy: select.poll() path was a dead-end on the Tildagon. Kept
+# imported so the existing tick()-based read code compiles, but the
+# async reader is what actually runs.
+try:
     import select
     _HAS_SELECT = True
 except ImportError:
@@ -194,12 +208,10 @@ class DmxBridge(Show):
         # Log file diagnostics.
         self._chunks_logged = 0    # so we log only the first N chunks
         self._next_stats_log_ms = 0
-        # REPL detach state. We call os.dupterm(None, 0) in enter() to
-        # take exclusive ownership of USB-CDC (otherwise the REPL eats
-        # our bytes); save the previous stream and restore it in exit()
-        # so the operator gets the REPL back without a hard reset.
-        self._prev_term = None
-        self._term_detached = False
+        # Async reader task handle - the canonical Tildagon pattern for
+        # reading USB-CDC bytes. enter() spawns it via
+        # asyncio.create_task(); exit() cancels it.
+        self._reader_task = None
 
     # ------------------------------------------------------------------
     # Plugin identity
@@ -255,252 +267,185 @@ class DmxBridge(Show):
         self._start_bytes_seen = 0
         self._chunks_logged = 0
         self._next_stats_log_ms = 0
-        self._prev_term = None
-        self._term_detached = False
+        self._reader_task = None
+        self._ctx = ctx     # async reader uses this to dispatch events
         _log.write("enter: stdin=%r" % sys.stdin)
-        # Detach REPL slot 0 so USB-CDC bytes flow to us, not the REPL.
-        # All previous bench attempts saw the REPL eat delimiters and
-        # crash under volume; the only documented MicroPython way to
-        # take ownership is os.dupterm(None, idx). Saved stream goes
-        # back in exit() so the operator's REPL works again - critical
-        # for being able to redeploy without a hard reset.
-        try:
-            import os as _os
-            self._prev_term = _os.dupterm(None, 0)
-            self._term_detached = True
-            _log.write("dupterm: detached slot 0, prev=%r"
-                       % self._prev_term)
-        except Exception as e:
-            _log.write("dupterm: detach failed: %r" % e)
-        if not _HAS_SELECT:
-            self._error = "select module not available"
-            return
-        try:
-            self._poll = select.poll()
-            self._poll.register(sys.stdin, select.POLLIN)
-        except Exception as e:
-            self._poll = None
-            self._error = "poll setup: " + repr(e)
-
+        # Spawn the async reader (the only pattern bench-proven to work
+        # on Tildagon's MicroPython - see module-level comment).
+        if _HAS_ASYNCIO:
+            try:
+                self._reader_task = asyncio.create_task(self._read_loop())
+                _log.write("async reader: task spawned")
+            except Exception as e:
+                _log.write("async reader: spawn failed: %r" % e)
+        else:
+            _log.write("async reader: asyncio not available")
     def exit(self, ctx):
+        # Cancel the async reader so it stops draining sys.stdin.
+        if self._reader_task is not None:
+            try:
+                self._reader_task.cancel()
+                _log.write("async reader: cancelled")
+            except Exception as e:
+                _log.write("async reader: cancel failed: %r" % e)
+            self._reader_task = None
         # Drop Lumes cleanly with a 1 s release fade.
         try:
             ctx.render_wash_end(_BROADCAST_TARGET, 10)
         except Exception:
             pass
         self._poll = None
-        # CRITICAL: restore the REPL so the operator gets it back
-        # without needing a hard reset. Wrapped tight so a failure
-        # here surfaces in the log but doesn't propagate.
-        if self._term_detached:
-            try:
-                import os as _os
-                _os.dupterm(self._prev_term, 0)
-                _log.write("dupterm: restored slot 0")
-            except Exception as e:
-                _log.write("dupterm: restore failed: %r" % e)
-            self._term_detached = False
-            self._prev_term = None
+        self._ctx = None
 
     # ------------------------------------------------------------------
     # Tick: drain USB-CDC, parse, dispatch
     # ------------------------------------------------------------------
 
     def tick(self, ctx, now_ms):
-        if self._poll is None:
-            return
-        try:
-            events = self._poll.poll(0)   # non-blocking
-        except Exception as e:
-            self._error = "poll: " + repr(e)
-            return
-        for stream, mask in events:
-            if not (mask & select.POLLIN):
-                continue
-            raw = self._read_chunk(stream)
-            if not raw:
-                continue
-            self._byte_count += len(raw)
-            # Append the raw chars/bytes into the line buffer. Bytes
-            # come in as either bytes (binary path) or str (text-mode
-            # fallback); coerce to bytes for the buffer. Hex chars are
-            # 7-bit ASCII so the conversion is lossless either way.
-            if isinstance(raw, str):
-                # Convert str -> bytes via latin-1 (one-to-one,
-                # roundtrip-safe for any byte value)
-                chunk = raw.encode("latin-1")
-            else:
-                chunk = raw
-            # Diagnostic: snapshot the first 16 bytes of THIS chunk
-            # immediately so we can see what's arriving regardless of
-            # whether line boundaries are found. Previously the hex
-            # display only updated on line completion - so a stream
-            # with no delimiters showed "(no data)" even with bytes
-            # actively flowing.
-            try:
-                sample = bytes(chunk[:16])
-                self._last_bytes_hex = "".join(
-                    "%02x" % b for b in sample)
-            except Exception:
-                pass
-            # Log the first 5 chunks verbatim with their raw hex so we
-            # can see exactly what's arriving on the cable. Cap so we
-            # don't spam the flash.
-            if self._chunks_logged < 5:
-                self._chunks_logged += 1
-                try:
-                    sample_hex = "".join("%02x" % b for b in chunk[:64])
-                    _log.write(
-                        "chunk %d: type=%s len=%d first64=%s"
-                        % (self._chunks_logged,
-                           "bytes" if isinstance(raw, (bytes, bytearray))
-                           else "str",
-                           len(chunk), sample_hex))
-                except Exception:
-                    pass
-            self._line_buf.extend(chunk)
-            # Quote-delimited hex stream. Shim sends '#"<hex>"\n' per
-            # frame. # opens a Python comment so the REPL no-ops; "
-            # is the actual frame delimiter for us (the REPL leaves
-            # quotes intact within comments); \n triggers the REPL to
-            # process and move on. A small two-state machine: outside
-            # a quote we skip bytes looking for the opening "; inside
-            # a quote we accumulate until the closing ".
-            #
-            # Two delimiters tried per pass so frames keep flowing:
-            #   "  - primary, the shim's python envelope
-            #   ;  - legacy hex envelope (older shim builds)
-            while True:
-                if self._in_quote:
-                    # Inside the quotes - read hex chars until closing ".
-                    q_idx = self._line_buf.find(b'"')
-                    if q_idx < 0:
-                        break
-                    hex_line = bytes(self._line_buf[:q_idx])
-                    del self._line_buf[:q_idx + 1]
-                    self._in_quote = False
-                else:
-                    # Outside the quotes - skip noise until opening ".
-                    # Also accept a ; that signals a legacy non-quoted
-                    # frame ended; for that path the prefix is whatever
-                    # noise is in the buffer up to the ;.
-                    open_q = self._line_buf.find(b'"')
-                    legacy_semi = self._line_buf.find(b";")
-                    # Prefer whichever comes first.
-                    if open_q < 0 and legacy_semi < 0:
-                        break
-                    if 0 <= open_q and (legacy_semi < 0 or open_q < legacy_semi):
-                        # Skip everything up to + including the opening ".
-                        del self._line_buf[:open_q + 1]
-                        self._in_quote = True
-                        continue   # re-enter loop to find closing "
-                    # Legacy ; path - hex line up to the ;.
-                    hex_line = bytes(self._line_buf[:legacy_semi])
-                    del self._line_buf[:legacy_semi + 1]
-                    # Trim possible leading #/whitespace.
-                    hex_line = hex_line.strip()
-                    while hex_line and hex_line[:1] == b"#":
-                        hex_line = hex_line[1:].strip()
-
-                hex_line = hex_line.strip()
-                if not hex_line:
-                    continue
-                # Log the first decoded line so we can see what a
-                # complete frame looks like in the stream.
-                if self._frames_decoded == 0:
-                    try:
-                        _log.write("first line: len=%d head=%s"
-                                   % (len(hex_line),
-                                      hex_line[:64].decode("ascii", "ignore")))
-                    except Exception:
-                        pass
-                # Hex-decode to raw frame bytes.
-                try:
-                    frame_bytes = binascii.unhexlify(hex_line)
-                except Exception as e:
-                    self._bad_lines += 1
-                    if self._bad_lines <= 3:
-                        try:
-                            _log.write(
-                                "bad line %d: %r head=%s"
-                                % (self._bad_lines, e,
-                                   hex_line[:32].decode("ascii", "ignore")))
-                        except Exception:
-                            pass
-                    continue
-                self._frames_decoded += 1
-                # Feed the decoded binary bytes to the Enttec parser.
-                for b in frame_bytes:
-                    if b == 0x7E:
-                        self._start_bytes_seen += 1
-                    if self._parser.feed_byte(b) == FRAME_COMPLETE:
-                        self._on_frame(ctx, now_ms)
-
-        # Periodic stats log: every 10 seconds while in DMX Bridge.
+        """Per-tick housekeeping only - byte reading happens in the
+        async _read_loop coroutine. Periodic stats log + (in the
+        future) any per-tick UI updates that need 'now' from the
+        framework go here.
+        """
         if now_ms >= self._next_stats_log_ms:
             self._next_stats_log_ms = now_ms + 10000
             _log.write(
                 "stats: bytes=%d decoded=%d bad=%d 0x7E=%d "
                 "parsed=%d pulses=%d washes=%d path=%s buf_len=%d"
-                % (self._byte_count, self._frames_decoded, self._bad_lines,
-                   self._start_bytes_seen, self._frames_received,
-                   self._pulses_sent, self._washes_sent,
-                   self._read_path, len(self._line_buf)))
+                % (self._byte_count, self._frames_decoded,
+                   self._bad_lines, self._start_bytes_seen,
+                   self._frames_received, self._pulses_sent,
+                   self._washes_sent, self._read_path,
+                   len(self._line_buf)))
 
-    def _read_chunk(self, stream):
-        """Read whatever bytes are available without blocking.
+    async def _read_loop(self):
+        """Async byte reader. Spawned by enter(), cancelled by exit().
 
-        Three paths tried in order of preference:
-          1. os.read(stdin_fd, 512)        - raw bytes via POSIX read,
-                                             bypasses MicroPython's
-                                             text-mode I/O. THIS is
-                                             the one that actually
-                                             works on Tildagon's
-                                             MicroPython USB-CDC.
-          2. stream.buffer.read(512)       - binary read via the
-                                             .buffer attribute, works
-                                             on CPython 3 and some
-                                             MicroPython builds.
-          3. stream.read(512)              - text-mode fallback;
-                                             filters non-printable
-                                             bytes on MicroPython
-                                             (broken for binary).
+        Wraps sys.stdin in asyncio.StreamReader and pulls chunks
+        cooperatively - this is the canonical Tildagon pattern (ref:
+        benclifford/tildagon-usbserial-kbd). The await yields back to
+        the framework's scheduler so the REPL and our reader share
+        sys.stdin without the REPL eating our delimiters or hanging
+        under volume.
 
-        Records which path returned data in self._read_path so the
-        operator can see what's happening on screen.
+        Decoded bytes get fed straight into the parser; complete
+        frames trigger _on_frame which dispatches via the saved ctx.
         """
-        # Path 1: os.read on the stdin fd. Skip if the module-level
-        # probe found neither os.read nor a valid fd.
-        if _HAS_OS_READ and _STDIN_FD is not None:
+        try:
+            sr = asyncio.StreamReader(sys.stdin)
+            self._read_path = "asyncio"
+            _log.write("read loop: started, sr=%r" % sr)
+            import time as _time
+            while True:
+                try:
+                    chunk = await sr.read(64)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._error = "sr.read: " + repr(e)
+                    _log.write("read loop: read error: %r" % e)
+                    await asyncio.sleep_ms(10)
+                    continue
+                if not chunk:
+                    await asyncio.sleep_ms(1)
+                    continue
+                if isinstance(chunk, str):
+                    raw = chunk.encode("latin-1")
+                else:
+                    raw = chunk
+                self._byte_count += len(raw)
+                self._on_chunk(raw, _time.ticks_ms())
+        except asyncio.CancelledError:
+            _log.write("read loop: cancelled cleanly")
+            raise
+        except Exception as e:
+            _log.write("read loop: fatal: %r" % e)
+
+    def _on_chunk(self, chunk, now_ms):
+        """Decode a freshly-read chunk: append to line buffer, find
+        completed frames, hex-decode each, feed to parser, dispatch
+        events on FRAME_COMPLETE.
+        """
+        if self._ctx is None:
+            return
+        # Diagnostic: snapshot the first 16 bytes of THIS chunk
+        # so the operator can see what's arriving on the cable.
+        try:
+            sample = bytes(chunk[:16])
+            self._last_bytes_hex = "".join("%02x" % b for b in sample)
+        except Exception:
+            pass
+        # Log the first 5 chunks verbatim with hex so we can see what
+        # the cable is actually carrying. Cap so we don't spam flash.
+        if self._chunks_logged < 5:
+            self._chunks_logged += 1
             try:
-                data = os.read(_STDIN_FD, 512)
-                if data:
-                    self._read_path = "os.read"
-                    return data
-            except OSError:
-                # EAGAIN-ish: no data right now.
+                sample_hex = "".join("%02x" % b for b in chunk[:64])
+                _log.write("chunk %d: len=%d first64=%s"
+                           % (self._chunks_logged, len(chunk), sample_hex))
+            except Exception:
                 pass
+        self._line_buf.extend(chunk)
+        # Frame extraction. The shim wraps each frame in either:
+        #   #"<hex>"\n      - python envelope, " is the delimiter
+        #   <hex>;          - legacy hex envelope, ; is the delimiter
+        # We accept both so the parser is robust to shim version drift.
+        while True:
+            if self._in_quote:
+                q_idx = self._line_buf.find(b'"')
+                if q_idx < 0:
+                    break
+                hex_line = bytes(self._line_buf[:q_idx])
+                del self._line_buf[:q_idx + 1]
+                self._in_quote = False
+            else:
+                open_q = self._line_buf.find(b'"')
+                legacy_semi = self._line_buf.find(b";")
+                if open_q < 0 and legacy_semi < 0:
+                    break
+                if 0 <= open_q and (legacy_semi < 0
+                                    or open_q < legacy_semi):
+                    del self._line_buf[:open_q + 1]
+                    self._in_quote = True
+                    continue
+                hex_line = bytes(self._line_buf[:legacy_semi])
+                del self._line_buf[:legacy_semi + 1]
+                hex_line = hex_line.strip()
+                while hex_line and hex_line[:1] == b"#":
+                    hex_line = hex_line[1:].strip()
+
+            hex_line = hex_line.strip()
+            if not hex_line:
+                continue
+            if self._frames_decoded == 0:
+                try:
+                    _log.write("first line: len=%d head=%s"
+                               % (len(hex_line),
+                                  hex_line[:64].decode("ascii", "ignore")))
+                except Exception:
+                    pass
+            try:
+                frame_bytes = binascii.unhexlify(hex_line)
             except Exception as e:
-                self._error = "os.read: " + repr(e)
-        # Path 2: stream.buffer.
-        try:
-            buf = stream.buffer
-            data = buf.read(512)
-            if data:
-                self._read_path = "buffer"
-                return data
-        except AttributeError:
-            pass
-        except Exception:
-            pass
-        # Path 3: text-mode fallback.
-        try:
-            data = stream.read(512)
-            if data:
-                self._read_path = "text"
-            return data
-        except Exception:
-            return None
+                self._bad_lines += 1
+                if self._bad_lines <= 3:
+                    try:
+                        _log.write("bad line %d: %r head=%s"
+                                   % (self._bad_lines, e,
+                                      hex_line[:32].decode("ascii", "ignore")))
+                    except Exception:
+                        pass
+                continue
+            self._frames_decoded += 1
+            for b in frame_bytes:
+                if b == 0x7E:
+                    self._start_bytes_seen += 1
+                if self._parser.feed_byte(b) == FRAME_COMPLETE:
+                    self._on_frame(self._ctx, now_ms)
+
+    # _read_chunk() and the sync read paths (os.read, stream.buffer,
+    # stream.read) were removed - replaced by the async _read_loop()
+    # above. See module-level comments for the bench history.
 
     def _on_frame(self, ctx, now_ms):
         self._frames_received += 1
@@ -586,9 +531,7 @@ class DmxBridge(Show):
         d.text(0, -10, "out: pulse:%d wash:%d"
                % (self._pulses_sent, self._washes_sent),
                size=10, r=200, g=200, b=200)
-        d.text(0,   5, "path: %s  REPL: %s"
-               % (self._read_path,
-                  "off" if self._term_detached else "on"),
+        d.text(0,   5, "path: %s" % self._read_path,
                size=10, r=160, g=160, b=160)
         # Show the first 16 chars of the last hex line. Should look
         # like "7e06010200000000" - if it doesn't, the cable isn't
