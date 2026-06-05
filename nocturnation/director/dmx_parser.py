@@ -63,7 +63,12 @@ class DmxParser:
         self._label = 0
         self._payload_len = 0      # length field value (includes start code)
         self._payload_idx = 0
-        self._buf = bytearray()    # accumulating payload
+        # Pre-allocate a single max-size buffer to avoid per-frame
+        # allocation churn. MicroPython on the Tildagon GC-thrashes
+        # if we allocate a fresh 513-byte bytearray every frame at 44
+        # fps; with this pre-allocation the parser does zero heap
+        # work in the steady state.
+        self._buf = bytearray(_MAX_PAYLOAD)
         self._last_label = 0
         self._last_payload = b""   # excludes the start code byte
         self._frames_complete = 0
@@ -116,7 +121,7 @@ class DmxParser:
                 self._frames_dropped += 1
                 return RESET
             self._payload_idx = 0
-            self._buf = bytearray(self._payload_len)
+            # Reuse pre-allocated buffer; no per-frame allocation.
             self._state = self._S_PAYLOAD
             return NEED_MORE_BYTES
 
@@ -129,11 +134,12 @@ class DmxParser:
 
         if s == self._S_END:
             if b == _END:
-                # Frame valid - store and reset for next.
+                # Frame valid - store and reset for next. Slice up to
+                # the actual payload length we recorded; the buffer is
+                # max-size but only the first _payload_len bytes are
+                # valid this frame. Strip the DMX start code (byte 0).
                 self._last_label = self._label
-                # Strip the DMX start code (first byte of payload) so
-                # consumers see channels 1..N directly.
-                self._last_payload = bytes(self._buf[1:])
+                self._last_payload = bytes(self._buf[1:self._payload_len])
                 self._frames_complete += 1
                 self._reset()
                 return FRAME_COMPLETE

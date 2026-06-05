@@ -40,6 +40,18 @@ try:
 except ImportError:
     _HAS_SELECT = False
 
+# os.read() with sys.stdin.fileno() gives us raw bytes regardless of
+# MicroPython's text-mode I/O layer (which on the Tildagon filters
+# non-printable bytes and breaks the Enttec framing). Cache the fd
+# once at module load if both pieces work.
+try:
+    import os
+    _STDIN_FD = sys.stdin.fileno()
+    _HAS_OS_READ = hasattr(os, "read")
+except Exception:
+    _STDIN_FD = None
+    _HAS_OS_READ = False
+
 from nocturnation.shows import Show, InputAction
 from nocturnation.hal import CapabilityMask
 from nocturnation.plugins import PluginKind, PowerProfile
@@ -201,22 +213,53 @@ class DmxBridge(Show):
     def _read_chunk(self, stream):
         """Read whatever bytes are available without blocking.
 
-        MicroPython's sys.stdin is usually text-mode; .buffer.read()
-        gives raw bytes when present (CPython 3 + some MicroPython
-        builds). Records which path was taken in self._read_path so
-        the diagnostics view can show it.
+        Three paths tried in order of preference:
+          1. os.read(stdin_fd, 512)        - raw bytes via POSIX read,
+                                             bypasses MicroPython's
+                                             text-mode I/O. THIS is
+                                             the one that actually
+                                             works on Tildagon's
+                                             MicroPython USB-CDC.
+          2. stream.buffer.read(512)       - binary read via the
+                                             .buffer attribute, works
+                                             on CPython 3 and some
+                                             MicroPython builds.
+          3. stream.read(512)              - text-mode fallback;
+                                             filters non-printable
+                                             bytes on MicroPython
+                                             (broken for binary).
+
+        Records which path returned data in self._read_path so the
+        operator can see what's happening on screen.
         """
+        # Path 1: os.read on the stdin fd. Skip if the module-level
+        # probe found neither os.read nor a valid fd.
+        if _HAS_OS_READ and _STDIN_FD is not None:
+            try:
+                data = os.read(_STDIN_FD, 512)
+                if data:
+                    self._read_path = "os.read"
+                    return data
+            except OSError:
+                # EAGAIN-ish: no data right now.
+                pass
+            except Exception as e:
+                self._error = "os.read: " + repr(e)
+        # Path 2: stream.buffer.
         try:
             buf = stream.buffer
             data = buf.read(512)
-            if data is not None:
+            if data:
                 self._read_path = "buffer"
                 return data
         except AttributeError:
             pass
+        except Exception:
+            pass
+        # Path 3: text-mode fallback.
         try:
             data = stream.read(512)
-            if data is not None:
+            if data:
                 self._read_path = "text"
             return data
         except Exception:
