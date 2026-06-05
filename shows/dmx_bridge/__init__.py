@@ -225,28 +225,40 @@ class DmxBridge(Show):
             if isinstance(raw, str):
                 # Convert str -> bytes via latin-1 (one-to-one,
                 # roundtrip-safe for any byte value)
-                self._line_buf.extend(raw.encode("latin-1"))
+                chunk = raw.encode("latin-1")
             else:
-                self._line_buf.extend(raw)
+                chunk = raw
+            # Diagnostic: snapshot the first 16 bytes of THIS chunk
+            # immediately so we can see what's arriving regardless of
+            # whether line boundaries are found. Previously the hex
+            # display only updated on line completion - so a stream
+            # with no delimiters showed "(no data)" even with bytes
+            # actively flowing.
+            try:
+                sample = bytes(chunk[:16])
+                self._last_bytes_hex = "".join(
+                    "%02x" % b for b in sample)
+            except Exception:
+                pass
+            self._line_buf.extend(chunk)
             # Pull off as many complete lines as we have. Each line is
-            # one hex-encoded Enttec Pro frame.
+            # one hex-encoded Enttec Pro frame terminated by `;`. (Was
+            # `\n` - MicroPython text-mode reads strip newlines, so
+            # the device-side line buffer never saw the delimiter.
+            # `;` is non-newline ASCII outside the hex alphabet so
+            # MicroPython's line handling can't eat it.)
             while True:
-                nl_idx = self._line_buf.find(b"\n")
-                if nl_idx < 0:
+                sep_idx = self._line_buf.find(b";")
+                if sep_idx < 0:
                     break
-                line = bytes(self._line_buf[:nl_idx])
+                line = bytes(self._line_buf[:sep_idx])
                 # Mutate buffer in-place to drop the consumed line +
-                # its newline; no whole-buffer reallocation.
-                del self._line_buf[:nl_idx + 1]
-                # Strip CR if the shim's platform inserts one (e.g.
-                # Windows line endings). Whitespace strip is cheap.
+                # delimiter; no whole-buffer reallocation.
+                del self._line_buf[:sep_idx + 1]
+                # Strip whitespace (CR or stray spaces).
                 line = line.strip()
                 if not line:
                     continue
-                # Diagnostic: remember the first 16 hex chars of the
-                # last line so the operator can confirm it looks like
-                # hex (e.g. "7e06010200..." not "00 00 00 00...").
-                self._last_bytes_hex = line[:16].decode("ascii", "ignore")
                 # Hex-decode to raw frame bytes.
                 try:
                     frame_bytes = binascii.unhexlify(line)
