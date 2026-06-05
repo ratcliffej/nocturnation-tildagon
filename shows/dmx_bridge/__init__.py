@@ -40,6 +40,12 @@ try:
 except ImportError:
     _HAS_SELECT = False
 
+# binascii.unhexlify gives us bytes from ASCII hex. The shim ships
+# frames hex-encoded so MicroPython's text-mode USB-CDC layer can't
+# eat non-printable bytes - hex chars are all in [0-9a-fA-F] which
+# survives any text-mode handling.
+import binascii
+
 # os.read() with sys.stdin.fileno() gives us raw bytes regardless of
 # MicroPython's text-mode I/O layer (which on the Tildagon filters
 # non-printable bytes and breaks the Enttec framing). Cache the fd
@@ -112,12 +118,17 @@ class DmxBridge(Show):
         self._last_payload = b""
         self._error = ""
         # Read-path diagnostics: which API is delivering bytes, what
-        # the bytes look like, how many 0x7E start markers we've seen.
-        # Surfaces in the diagnostics view to help debug text-mode /
-        # NULL-truncation issues on first MicroPython contact.
+        # the bytes look like, how many 0x7E start markers we've seen
+        # AFTER hex decode (so it counts real frame starts).
         self._read_path = "?"      # "buffer" | "text" | "?"
-        self._last_bytes_hex = ""  # hex dump of the most recent chunk
-        self._start_bytes_seen = 0 # count of 0x7E bytes in stream
+        self._last_bytes_hex = ""  # hex dump of the most recent line
+        self._start_bytes_seen = 0
+        # Line-buffered hex decoder: shim sends "aabbcc...e7\n" per
+        # frame. Use a bytearray so .extend() / del [:n] are in-place
+        # and don't churn the GC.
+        self._line_buf = bytearray()
+        self._frames_decoded = 0   # successful hex unhexlify count
+        self._bad_lines = 0        # lines that failed unhexlify
 
     # ------------------------------------------------------------------
     # Plugin identity
@@ -166,6 +177,10 @@ class DmxBridge(Show):
         self._view_diagnostics = False
         self._error = ""
         self._poll = None
+        self._line_buf = bytearray()
+        self._frames_decoded = 0
+        self._bad_lines = 0
+        self._start_bytes_seen = 0
         if not _HAS_SELECT:
             self._error = "select module not available"
             return
@@ -203,28 +218,48 @@ class DmxBridge(Show):
             if not raw:
                 continue
             self._byte_count += len(raw)
-            # Diagnostic: keep a hex dump of the most recent chunk so
-            # the operator can eyeball what's actually arriving.
-            try:
-                if isinstance(raw, str):
-                    sample = raw[-16:]
-                    self._last_bytes_hex = " ".join(
-                        "%02X" % ord(c) for c in sample)
-                else:
-                    sample = raw[-16:]
-                    self._last_bytes_hex = " ".join(
-                        "%02X" % b for b in sample)
-            except Exception:
-                pass
-            for b in raw:
-                if isinstance(b, str):    # text-mode read
-                    b = ord(b) & 0xFF
-                else:
-                    b = b & 0xFF
-                if b == 0x7E:
-                    self._start_bytes_seen += 1
-                if self._parser.feed_byte(b) == FRAME_COMPLETE:
-                    self._on_frame(ctx, now_ms)
+            # Append the raw chars/bytes into the line buffer. Bytes
+            # come in as either bytes (binary path) or str (text-mode
+            # fallback); coerce to bytes for the buffer. Hex chars are
+            # 7-bit ASCII so the conversion is lossless either way.
+            if isinstance(raw, str):
+                # Convert str -> bytes via latin-1 (one-to-one,
+                # roundtrip-safe for any byte value)
+                self._line_buf.extend(raw.encode("latin-1"))
+            else:
+                self._line_buf.extend(raw)
+            # Pull off as many complete lines as we have. Each line is
+            # one hex-encoded Enttec Pro frame.
+            while True:
+                nl_idx = self._line_buf.find(b"\n")
+                if nl_idx < 0:
+                    break
+                line = bytes(self._line_buf[:nl_idx])
+                # Mutate buffer in-place to drop the consumed line +
+                # its newline; no whole-buffer reallocation.
+                del self._line_buf[:nl_idx + 1]
+                # Strip CR if the shim's platform inserts one (e.g.
+                # Windows line endings). Whitespace strip is cheap.
+                line = line.strip()
+                if not line:
+                    continue
+                # Diagnostic: remember the first 16 hex chars of the
+                # last line so the operator can confirm it looks like
+                # hex (e.g. "7e06010200..." not "00 00 00 00...").
+                self._last_bytes_hex = line[:16].decode("ascii", "ignore")
+                # Hex-decode to raw frame bytes.
+                try:
+                    frame_bytes = binascii.unhexlify(line)
+                except Exception:
+                    self._bad_lines += 1
+                    continue
+                self._frames_decoded += 1
+                # Feed the decoded binary bytes to the Enttec parser.
+                for b in frame_bytes:
+                    if b == 0x7E:
+                        self._start_bytes_seen += 1
+                    if self._parser.feed_byte(b) == FRAME_COMPLETE:
+                        self._on_frame(ctx, now_ms)
 
     def _read_chunk(self, stream):
         """Read whatever bytes are available without blocking.
@@ -349,22 +384,27 @@ class DmxBridge(Show):
         is a single d.text() call so failures stay isolated.
         """
         hex_str = self._last_bytes_hex
-        if len(hex_str) > 23:
-            hex_str = hex_str[:23]
+        if len(hex_str) > 16:
+            hex_str = hex_str[:16]
         d.text(0, -75, "DMX Bridge", size=14, r=255, g=255, b=255)
         d.text(0, -55, "bytes:  %d" % self._byte_count,
                size=10, r=255, g=255, b=255)
-        d.text(0, -40, "frames: %d" % self._frames_received,
+        # Hex-decoded frame count first (most informative single number
+        # in the hex-protocol world); then completed parse count.
+        d.text(0, -40, "decoded: %d  bad: %d"
+               % (self._frames_decoded, self._bad_lines),
                size=10, r=255, g=255, b=255)
-        d.text(0, -25, "0x7E:   %d" % self._start_bytes_seen,
+        d.text(0, -25, "parsed: %d  0x7E: %d"
+               % (self._frames_received, self._start_bytes_seen),
                size=10, r=200, g=200, b=200)
-        # Path used by the read + why os.read isn't being tried (if so).
-        # If "os.read" works, frames should climb; if "buffer"/"text",
-        # the probe field tells us why we couldn't fall back to binary.
-        d.text(0, -10, "path: %s" % self._read_path,
+        d.text(0, -10, "out: pulse:%d wash:%d"
+               % (self._pulses_sent, self._washes_sent),
                size=10, r=200, g=200, b=200)
-        d.text(0,   5, "probe: %s" % (_OS_READ_PROBE or "ok, fd=%s" % _STDIN_FD),
+        d.text(0,   5, "path: %s" % self._read_path,
                size=10, r=160, g=160, b=160)
+        # Show the first 16 chars of the last hex line. Should look
+        # like "7e06010200000000" - if it doesn't, the cable isn't
+        # carrying what we expect.
         d.text(0,  25, hex_str if hex_str else "(no data)",
                size=10, r=255, g=255, b=160)
         if self._error:
