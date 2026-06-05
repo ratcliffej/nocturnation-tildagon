@@ -362,9 +362,16 @@ class DmxBridge(Show):
             _log.write("read loop: fatal: %r" % e)
 
     def _on_chunk(self, chunk, now_ms):
-        """Decode a freshly-read chunk: append to line buffer, find
-        completed frames, hex-decode each, feed to parser, dispatch
-        events on FRAME_COMPLETE.
+        """Decode a freshly-read chunk: byte-by-byte state machine,
+        extracting frames bounded by '"' (python envelope) or ';'
+        (legacy hex envelope), hex-decoding each, feeding the parser,
+        dispatching events on FRAME_COMPLETE.
+
+        Uses bytearray.append() + bytearray.clear() instead of slice
+        deletion (`del buf[:n]`) because MicroPython doesn't support
+        bytearray item deletion - bench-confirmed failure mode that
+        killed the previous version of the read loop on the first
+        chunk.
         """
         if self._ctx is None:
             return
@@ -385,63 +392,81 @@ class DmxBridge(Show):
                            % (self._chunks_logged, len(chunk), sample_hex))
             except Exception:
                 pass
-        self._line_buf.extend(chunk)
-        # Frame extraction. The shim wraps each frame in either:
-        #   #"<hex>"\n      - python envelope, " is the delimiter
-        #   <hex>;          - legacy hex envelope, ; is the delimiter
-        # We accept both so the parser is robust to shim version drift.
-        while True:
+        # State machine over the chunk bytes. self._line_buf carries
+        # state across chunks for partial frames at chunk boundaries.
+        QUOTE = 0x22   # "
+        SEMI  = 0x3B   # ;
+        HASH  = 0x23   # #
+        for b in chunk:
             if self._in_quote:
-                q_idx = self._line_buf.find(b'"')
-                if q_idx < 0:
-                    break
-                hex_line = bytes(self._line_buf[:q_idx])
-                del self._line_buf[:q_idx + 1]
-                self._in_quote = False
+                if b == QUOTE:
+                    # End of quoted hex - process + reset.
+                    self._process_line(now_ms)
+                    self._line_buf = bytearray()  # reset; .clear() is
+                                                   # MicroPython-safe but
+                                                   # reassign is fine too
+                    self._in_quote = False
+                else:
+                    self._line_buf.append(b)
             else:
-                open_q = self._line_buf.find(b'"')
-                legacy_semi = self._line_buf.find(b";")
-                if open_q < 0 and legacy_semi < 0:
-                    break
-                if 0 <= open_q and (legacy_semi < 0
-                                    or open_q < legacy_semi):
-                    del self._line_buf[:open_q + 1]
+                if b == QUOTE:
+                    # Start of quoted hex.
+                    self._line_buf = bytearray()
                     self._in_quote = True
-                    continue
-                hex_line = bytes(self._line_buf[:legacy_semi])
-                del self._line_buf[:legacy_semi + 1]
-                hex_line = hex_line.strip()
-                while hex_line and hex_line[:1] == b"#":
-                    hex_line = hex_line[1:].strip()
+                elif b == SEMI:
+                    # Legacy ; delimiter - any accumulated bytes are
+                    # the hex line (with possible leading #).
+                    if self._line_buf:
+                        self._process_line(now_ms)
+                    self._line_buf = bytearray()
+                elif b == HASH:
+                    # Outside a quote a # is the python envelope's
+                    # comment prefix - skip it.
+                    pass
+                else:
+                    # Outside a quote and not a delimiter - probably
+                    # a legacy bare-hex frame still in progress.
+                    # Accumulate so ; processing finds it.
+                    self._line_buf.append(b)
 
-            hex_line = hex_line.strip()
-            if not hex_line:
-                continue
-            if self._frames_decoded == 0:
+    def _process_line(self, now_ms):
+        """Hex-decode the accumulated line and feed bytes to the
+        parser. Called by _on_chunk when a complete frame boundary
+        is detected."""
+        hex_line = bytes(self._line_buf).strip()
+        # Trim a leading # if it survived (legacy ;-delimited frames
+        # might still have it).
+        while hex_line and hex_line[:1] == b"#":
+            hex_line = hex_line[1:].strip()
+        if not hex_line:
+            return
+        # Log the first decoded line so we can see what a complete
+        # frame looks like in the stream.
+        if self._frames_decoded == 0:
+            try:
+                _log.write("first line: len=%d head=%s"
+                           % (len(hex_line),
+                              hex_line[:64].decode("ascii", "ignore")))
+            except Exception:
+                pass
+        try:
+            frame_bytes = binascii.unhexlify(hex_line)
+        except Exception as e:
+            self._bad_lines += 1
+            if self._bad_lines <= 3:
                 try:
-                    _log.write("first line: len=%d head=%s"
-                               % (len(hex_line),
-                                  hex_line[:64].decode("ascii", "ignore")))
+                    _log.write("bad line %d: %r head=%s"
+                               % (self._bad_lines, e,
+                                  hex_line[:32].decode("ascii", "ignore")))
                 except Exception:
                     pass
-            try:
-                frame_bytes = binascii.unhexlify(hex_line)
-            except Exception as e:
-                self._bad_lines += 1
-                if self._bad_lines <= 3:
-                    try:
-                        _log.write("bad line %d: %r head=%s"
-                                   % (self._bad_lines, e,
-                                      hex_line[:32].decode("ascii", "ignore")))
-                    except Exception:
-                        pass
-                continue
-            self._frames_decoded += 1
-            for b in frame_bytes:
-                if b == 0x7E:
-                    self._start_bytes_seen += 1
-                if self._parser.feed_byte(b) == FRAME_COMPLETE:
-                    self._on_frame(self._ctx, now_ms)
+            return
+        self._frames_decoded += 1
+        for b in frame_bytes:
+            if b == 0x7E:
+                self._start_bytes_seen += 1
+            if self._parser.feed_byte(b) == FRAME_COMPLETE:
+                self._on_frame(self._ctx, now_ms)
 
     # _read_chunk() and the sync read paths (os.read, stream.buffer,
     # stream.read) were removed - replaced by the async _read_loop()
