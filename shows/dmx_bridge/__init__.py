@@ -239,58 +239,56 @@ class DmxBridge(Show):
     # ------------------------------------------------------------------
 
     def on_render(self, ctx):
-        # Get the Tildagon's draw context. The shape of `ctx.lcd()` may
-        # vary by framework version; wrap in a try so a draw failure
-        # doesn't crash the Show.
-        try:
-            lcd = ctx.lcd()
-            gctx = lcd.gctx()
-        except Exception:
+        # Use the same display API as the other Shows (Conductor /
+        # motion_wave / simple_tap). ctx.display() returns a small
+        # wrapper with .clear(r, g, b) and .text(x, y, ..., size=, r=,
+        # g=, b=) methods; coordinates are centred on the screen.
+        d = ctx.display()
+        if d is None:
             return
-        try:
-            gctx.save()
-            gctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
-            if self._view_diagnostics:
-                self._render_diagnostics(gctx, ctx)
-            else:
-                self._render_status(gctx, ctx)
-            gctx.restore()
-        except Exception:
-            pass
+        d.clear(0, 0, 0)
+        if self._view_diagnostics:
+            self._render_diagnostics(d)
+        else:
+            self._render_status(d, ctx)
 
-    def _render_status(self, gctx, ctx):
+    def _render_status(self, d, ctx):
         now_ms = ctx.now_ms() if hasattr(ctx, "now_ms") else 0
         connected = (self._frames_received > 0
                      and now_ms - self._last_frame_ms < _STALE_MS)
-        gctx.rgb(1, 1, 1).move_to(-110, -90).text("DMX Bridge (USB)")
+        d.text(0, -90, "DMX Bridge", size=16, r=255, g=255, b=255)
+        d.text(0, -68, "(USB)",       size=10, r=160, g=160, b=160)
         if connected:
-            gctx.rgb(0, 1, 0).move_to(-110, -60).text("CONNECTED")
+            d.text(0, -40, "CONNECTED", size=18, r=0,   g=255, b=0)
         else:
-            gctx.rgb(1, 0.5, 0).move_to(-110, -60).text("waiting...")
-        gctx.rgb(1, 1, 1)
-        gctx.move_to(-110, -30).text("frames: %d" % self._frames_received)
-        gctx.move_to(-110, -10).text("bytes : %d" % self._byte_count)
-        gctx.move_to(-110,  10).text("pulses: %d" % self._pulses_sent)
-        gctx.move_to(-110,  30).text("washes: %d" % self._washes_sent)
+            d.text(0, -40, "waiting...", size=14, r=255, g=140, b=0)
+        d.text(0, -10, "frames: %d" % self._frames_received,
+               size=12, r=255, g=255, b=255)
+        d.text(0,  8,  "bytes:  %d" % self._byte_count,
+               size=12, r=255, g=255, b=255)
+        d.text(0,  26, "pulses: %d" % self._pulses_sent,
+               size=12, r=255, g=255, b=255)
+        d.text(0,  44, "washes: %d" % self._washes_sent,
+               size=12, r=255, g=255, b=255)
         if self._error:
-            gctx.rgb(1, 0, 0).move_to(-110, 60).text(self._error[:30])
-        gctx.rgb(0.5, 0.5, 0.5).move_to(-110, 90).text("press to toggle diag")
+            d.text(0, 68, self._error[:30], size=10, r=255, g=80, b=80)
+        d.text(0, 92, "press button: diag", size=10, r=120, g=120, b=120)
 
-    def _render_diagnostics(self, gctx, ctx):
-        gctx.rgb(1, 1, 1).move_to(-110, -100).text("DMX channels (last)")
+    def _render_diagnostics(self, d):
+        d.text(0, -100, "DMX channels", size=14, r=255, g=255, b=255)
         if not self._last_payload:
-            gctx.rgb(0.6, 0.6, 0.6).move_to(-110, -70).text("no data yet")
+            d.text(0, -70, "no data yet", size=12, r=160, g=160, b=160)
             return
         labels = ("Master", "Strobe", "PulseR", "PulseG", "PulseB",
-                  "PulseT", "WashAR", "WashAG", "WashAB",
-                  "WashBR", "WashBG", "WashBB")
+                  "PulseT", "WshAR", "WshAG", "WshAB",
+                  "WshBR", "WshBG", "WshBB")
         for i, label in enumerate(labels):
             if i >= len(self._last_payload):
                 break
             val = self._last_payload[i]
-            y = -80 + i * 14
-            gctx.rgb(1, 1, 1).move_to(-115, y).text(
-                "%02d %s %3d" % (i + 1, label, val))
+            y = -78 + i * 14
+            d.text(0, y, "%02d %s %3d" % (i + 1, label, val),
+                   size=10, r=255, g=255, b=255)
 
 
 def make_show():
