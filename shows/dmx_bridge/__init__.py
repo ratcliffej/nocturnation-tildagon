@@ -255,91 +255,57 @@ class DmxBridge(Show):
     # ------------------------------------------------------------------
 
     def on_input_action(self, ctx, action):
-        # The Director's picker / settings shortcuts (PICKER / SETTINGS
-        # / PAUSE) are handled upstream by the controller. We only
-        # toggle the diagnostics view here. CONFIRM and CYCLE_RIGHT
-        # both flip the view - whichever is most natural on the
-        # operator's button layout.
-        if action in (InputAction.CONFIRM, InputAction.CYCLE_RIGHT,
-                      InputAction.CYCLE_LEFT):
-            self._view_diagnostics = not self._view_diagnostics
+        # No view toggle - the combined view is always on. Crashes on
+        # toggle pointed at this hook being entangled with framework
+        # behaviour. Director-level shortcuts (PICKER / SETTINGS /
+        # PAUSE) are handled upstream and don't reach here. Showing
+        # this stub for clarity; deliberately a no-op.
+        pass
 
     # ------------------------------------------------------------------
     # Rendering: status view + diagnostics view
     # ------------------------------------------------------------------
 
     def on_render(self, ctx):
-        # Use the same display API as the other Shows (Conductor /
-        # motion_wave / simple_tap). ctx.display() returns a small
-        # wrapper with .clear(r, g, b) and .text(x, y, ..., size=, r=,
-        # g=, b=) methods; coordinates are centred on the screen.
-        # All draw calls wrapped in try/except so a single failing
-        # call can't crash the Show.
+        # Combined status + diagnostics view - no toggle. Two crashes
+        # of the toggle path on first contact, so simplify by always
+        # showing the load-bearing info inline. on_input_action no
+        # longer needs to react to button presses for view switching.
         try:
             d = ctx.display()
             if d is None:
                 return
             d.clear(0, 0, 0)
-            if self._view_diagnostics:
-                self._render_diagnostics(d)
-            else:
-                self._render_status(d, ctx)
-        except Exception as e:
-            # Last-resort: try to surface the error on the screen so
-            # the operator sees what went wrong rather than a frozen
-            # display. If THIS errors too, swallow and move on.
-            try:
-                d = ctx.display()
-                d.clear(0, 0, 0)
-                d.text(0, 0, "render err", size=12, r=255, g=80, b=80)
-                d.text(0, 20, repr(e)[:24], size=10, r=255, g=80, b=80)
-            except Exception:
-                pass
+            self._render_combined(d, ctx)
+        except Exception:
+            # Render failure - leave the screen as-is (the framework
+            # will keep showing the previous frame). Catching here so
+            # a single bad draw doesn't propagate up and kill the app.
+            pass
 
-    def _render_status(self, d, ctx):
-        now_ms = ctx.now_ms() if hasattr(ctx, "now_ms") else 0
-        connected = (self._frames_received > 0
-                     and now_ms - self._last_frame_ms < _STALE_MS)
-        d.text(0, -90, "DMX Bridge", size=16, r=255, g=255, b=255)
-        d.text(0, -68, "(USB)",       size=10, r=160, g=160, b=160)
-        if connected:
-            d.text(0, -40, "CONNECTED", size=18, r=0,   g=255, b=0)
-        else:
-            d.text(0, -40, "waiting...", size=14, r=255, g=140, b=0)
-        d.text(0, -10, "frames: %d" % self._frames_received,
-               size=12, r=255, g=255, b=255)
-        d.text(0,  8,  "bytes:  %d" % self._byte_count,
-               size=12, r=255, g=255, b=255)
-        d.text(0,  26, "pulses: %d" % self._pulses_sent,
-               size=12, r=255, g=255, b=255)
-        d.text(0,  44, "washes: %d" % self._washes_sent,
-               size=12, r=255, g=255, b=255)
-        if self._error:
-            d.text(0, 68, self._error[:30], size=10, r=255, g=80, b=80)
-        d.text(0, 92, "press button: diag", size=10, r=120, g=120, b=120)
+    def _render_combined(self, d, ctx):
+        """Single view - status + diagnostics inline. No view toggle.
 
-    def _render_diagnostics(self, d):
-        # Minimal layout - five text calls, all within the safe -80..80
-        # vertical range that the conductor Show uses. Big readable
-        # font sizes so the operator can read off the screen quickly.
-        d.text(0, -75, "Diagnostics",   size=14, r=255, g=255, b=255)
-        d.text(0, -45, "path: " + self._read_path,
-               size=12, r=200, g=200, b=200)
-        d.text(0, -25, "0x7E: %d" % self._start_bytes_seen,
-               size=12, r=200, g=200, b=200)
-        d.text(0,  -5, "frames: %d" % self._frames_received,
-               size=12, r=200, g=200, b=200)
-        # Last byte chunk - just the first 8 bytes as hex so the line
-        # fits the screen width at size 10. If it's all printable ASCII
-        # (0x20..0x7E range), text-mode translation is happening; if
-        # it includes 0x00, 0x7E, 0xE7, the raw bytes are coming through.
+        Five lines total, all within the -75..+75 safe range. Each
+        keeps to a single d.text() call so failures stay isolated.
+        """
+        # Truncate the hex line to 8 bytes (23 chars) to fit the
+        # screen width at size 10.
         hex_str = self._last_bytes_hex
         if len(hex_str) > 23:
-            hex_str = hex_str[:23]   # 8 bytes = 23 chars ("XX " * 8 - 1)
+            hex_str = hex_str[:23]
+        d.text(0, -75, "DMX Bridge", size=14, r=255, g=255, b=255)
+        d.text(0, -45, "bytes:  %d" % self._byte_count,
+               size=12, r=255, g=255, b=255)
+        d.text(0, -25, "frames: %d" % self._frames_received,
+               size=12, r=255, g=255, b=255)
+        d.text(0,  -5, "0x7E:   %d  (%s)"
+               % (self._start_bytes_seen, self._read_path),
+               size=10, r=200, g=200, b=200)
         d.text(0,  25, hex_str if hex_str else "(no data)",
                size=10, r=255, g=255, b=160)
         if self._error:
-            d.text(0,  60, self._error[:24], size=10, r=255, g=80, b=80)
+            d.text(0, 60, self._error[:24], size=10, r=255, g=80, b=80)
 
 
 def make_show():
