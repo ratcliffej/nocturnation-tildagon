@@ -46,6 +46,61 @@ except ImportError:
 # survives any text-mode handling.
 import binascii
 
+
+# ============================================================================
+# Debug log file
+#
+# Written to /dmx_bridge.log on the badge filesystem. The LCD diagnostics
+# are limited by screen real estate; this gives us proper post-mortem
+# visibility - pull it back via:
+#
+#   mpremote cat :dmx_bridge.log
+#
+# Capped at ~20 KB so a long-running session can't fill the badge flash.
+# All writes wrapped in try/except so a logging failure can't crash the
+# Show. Low-frequency by design: probe state at module load, the first
+# 5 chunks verbatim, errors, periodic stats every 10 seconds.
+# ============================================================================
+
+_LOG_PATH = "/dmx_bridge.log"
+_LOG_MAX_BYTES = 20000
+
+
+class _LogFile:
+    """Tiny size-capped append-only log writer."""
+
+    def __init__(self, path):
+        self._path = path
+        self._f = None
+        self._size = 0
+        try:
+            self._f = open(path, "w")
+        except Exception:
+            self._f = None
+
+    def write(self, msg):
+        if self._f is None or self._size >= _LOG_MAX_BYTES:
+            return
+        try:
+            line = msg + "\n"
+            self._f.write(line)
+            self._f.flush()
+            self._size += len(line)
+        except Exception:
+            self._f = None
+
+    def close(self):
+        if self._f is not None:
+            try:
+                self._f.close()
+            except Exception:
+                pass
+            self._f = None
+
+
+_log = _LogFile(_LOG_PATH)
+_log.write("== dmx_bridge log start ==")
+
 # os.read() with sys.stdin.fileno() gives us raw bytes regardless of
 # MicroPython's text-mode I/O layer (which on the Tildagon filters
 # non-printable bytes and breaks the Enttec framing). Cache the fd
@@ -72,6 +127,10 @@ if _HAS_OS_READ:
             _STDIN_FD = None
     except Exception as _e:
         _OS_READ_PROBE = "fileno: " + repr(_e)[:16]
+
+_log.write("probe: _HAS_OS_READ=%s _STDIN_FD=%r _OS_READ_PROBE=%r"
+           % (_HAS_OS_READ, _STDIN_FD, _OS_READ_PROBE))
+_log.write("probe: _HAS_SELECT=%s" % _HAS_SELECT)
 
 from nocturnation.shows import Show, InputAction
 from nocturnation.hal import CapabilityMask
@@ -123,12 +182,15 @@ class DmxBridge(Show):
         self._read_path = "?"      # "buffer" | "text" | "?"
         self._last_bytes_hex = ""  # hex dump of the most recent line
         self._start_bytes_seen = 0
-        # Line-buffered hex decoder: shim sends "aabbcc...e7\n" per
+        # Line-buffered hex decoder: shim sends "aabbcc...e7;" per
         # frame. Use a bytearray so .extend() / del [:n] are in-place
         # and don't churn the GC.
         self._line_buf = bytearray()
         self._frames_decoded = 0   # successful hex unhexlify count
         self._bad_lines = 0        # lines that failed unhexlify
+        # Log file diagnostics.
+        self._chunks_logged = 0    # so we log only the first N chunks
+        self._next_stats_log_ms = 0
 
     # ------------------------------------------------------------------
     # Plugin identity
@@ -181,6 +243,9 @@ class DmxBridge(Show):
         self._frames_decoded = 0
         self._bad_lines = 0
         self._start_bytes_seen = 0
+        self._chunks_logged = 0
+        self._next_stats_log_ms = 0
+        _log.write("enter: stdin=%r" % sys.stdin)
         if not _HAS_SELECT:
             self._error = "select module not available"
             return
@@ -240,6 +305,21 @@ class DmxBridge(Show):
                     "%02x" % b for b in sample)
             except Exception:
                 pass
+            # Log the first 5 chunks verbatim with their raw hex so we
+            # can see exactly what's arriving on the cable. Cap so we
+            # don't spam the flash.
+            if self._chunks_logged < 5:
+                self._chunks_logged += 1
+                try:
+                    sample_hex = "".join("%02x" % b for b in chunk[:64])
+                    _log.write(
+                        "chunk %d: type=%s len=%d first64=%s"
+                        % (self._chunks_logged,
+                           "bytes" if isinstance(raw, (bytes, bytearray))
+                           else "str",
+                           len(chunk), sample_hex))
+                except Exception:
+                    pass
             self._line_buf.extend(chunk)
             # Pull off as many complete lines as we have. Each line is
             # one hex-encoded Enttec Pro frame terminated by `;`. (Was
@@ -259,11 +339,28 @@ class DmxBridge(Show):
                 line = line.strip()
                 if not line:
                     continue
+                # Log the first decoded line so we can see what a
+                # complete frame looks like in the stream.
+                if self._frames_decoded == 0:
+                    try:
+                        _log.write("first line: len=%d head=%s"
+                                   % (len(line),
+                                      line[:64].decode("ascii", "ignore")))
+                    except Exception:
+                        pass
                 # Hex-decode to raw frame bytes.
                 try:
                     frame_bytes = binascii.unhexlify(line)
-                except Exception:
+                except Exception as e:
                     self._bad_lines += 1
+                    if self._bad_lines <= 3:
+                        try:
+                            _log.write(
+                                "bad line %d: %r head=%s"
+                                % (self._bad_lines, e,
+                                   line[:32].decode("ascii", "ignore")))
+                        except Exception:
+                            pass
                     continue
                 self._frames_decoded += 1
                 # Feed the decoded binary bytes to the Enttec parser.
@@ -272,6 +369,17 @@ class DmxBridge(Show):
                         self._start_bytes_seen += 1
                     if self._parser.feed_byte(b) == FRAME_COMPLETE:
                         self._on_frame(ctx, now_ms)
+
+        # Periodic stats log: every 10 seconds while in DMX Bridge.
+        if now_ms >= self._next_stats_log_ms:
+            self._next_stats_log_ms = now_ms + 10000
+            _log.write(
+                "stats: bytes=%d decoded=%d bad=%d 0x7E=%d "
+                "parsed=%d pulses=%d washes=%d path=%s buf_len=%d"
+                % (self._byte_count, self._frames_decoded, self._bad_lines,
+                   self._start_bytes_seen, self._frames_received,
+                   self._pulses_sent, self._washes_sent,
+                   self._read_path, len(self._line_buf)))
 
     def _read_chunk(self, stream):
         """Read whatever bytes are available without blocking.
