@@ -319,23 +319,34 @@ class DmxBridge(Show):
                    len(self._line_buf)))
 
     async def _read_loop(self):
-        """Async byte reader. Spawned by enter(), cancelled by exit().
+        """Async byte reader + on-the-fly hex decoder.
 
-        Wraps sys.stdin in asyncio.StreamReader and pulls chunks
-        cooperatively - this is the canonical Tildagon pattern (ref:
-        benclifford/tildagon-usbserial-kbd). The await yields back to
-        the framework's scheduler so the REPL and our reader share
-        sys.stdin without the REPL eating our delimiters or hanging
-        under volume.
+        Bench-confirmed: the REPL cooperatively shares sys.stdin with
+        our asyncio reader (path='asyncio' works, chunks arrive), but
+        it eats the closing `"` and `\n` of our envelope. The
+        line-buffer approach falls apart because frame boundaries get
+        eaten.
 
-        Decoded bytes get fed straight into the parser; complete
-        frames trigger _on_frame which dispatches via the saved ctx.
+        Workaround: don't rely on delimiters at all. Decode incoming
+        hex characters (0-9 / a-f / A-F) to bytes byte-by-byte and
+        feed straight to the Enttec parser. The parser self-syncs on
+        0x7E start bytes and uses the length field, so it doesn't
+        need outer framing.
+
+        Non-hex characters (anything the REPL might inject or pass
+        through - `#`, `"`, `\n`, spaces, whatever) just reset the
+        half-decoded nibble accumulator, so a stray byte costs us at
+        most one pair (1 byte of payload). The parser drops a frame
+        if its end-byte check fails and resyncs on the next 0x7E.
+
+        Robust to arbitrary byte loss/insertion.
         """
         try:
             sr = asyncio.StreamReader(sys.stdin)
             self._read_path = "asyncio"
             _log.write("read loop: started, sr=%r" % sr)
             import time as _time
+            hex_high = None    # high nibble of an in-progress byte
             while True:
                 try:
                     chunk = await sr.read(64)
@@ -354,123 +365,56 @@ class DmxBridge(Show):
                 else:
                     raw = chunk
                 self._byte_count += len(raw)
-                self._on_chunk(raw, _time.ticks_ms())
+                # Diagnostic: snapshot first 16 bytes of every chunk
+                # so the operator can see what's arriving.
+                try:
+                    self._last_bytes_hex = "".join(
+                        "%02x" % b for b in raw[:16])
+                except Exception:
+                    pass
+                if self._chunks_logged < 5:
+                    self._chunks_logged += 1
+                    try:
+                        _log.write("chunk %d: len=%d first64=%s"
+                                   % (self._chunks_logged, len(raw),
+                                      "".join("%02x" % b for b in raw[:64])))
+                    except Exception:
+                        pass
+                now_ms = _time.ticks_ms()
+                # Decode hex nibbles inline, feed pairs to the parser.
+                for c in raw:
+                    if 0x30 <= c <= 0x39:        # '0'..'9'
+                        nibble = c - 0x30
+                    elif 0x61 <= c <= 0x66:      # 'a'..'f'
+                        nibble = c - 0x61 + 10
+                    elif 0x41 <= c <= 0x46:      # 'A'..'F'
+                        nibble = c - 0x41 + 10
+                    else:
+                        # Non-hex (envelope, whitespace, REPL noise) -
+                        # discard the in-progress nibble so we don't
+                        # pair across a gap.
+                        hex_high = None
+                        continue
+                    if hex_high is None:
+                        hex_high = nibble
+                    else:
+                        b = (hex_high << 4) | nibble
+                        hex_high = None
+                        if b == 0x7E:
+                            self._start_bytes_seen += 1
+                        if self._parser.feed_byte(b) == FRAME_COMPLETE:
+                            self._frames_decoded += 1
+                            self._on_frame(self._ctx, now_ms)
         except asyncio.CancelledError:
             _log.write("read loop: cancelled cleanly")
             raise
         except Exception as e:
             _log.write("read loop: fatal: %r" % e)
 
-    def _on_chunk(self, chunk, now_ms):
-        """Decode a freshly-read chunk: byte-by-byte state machine,
-        extracting frames bounded by '"' (python envelope) or ';'
-        (legacy hex envelope), hex-decoding each, feeding the parser,
-        dispatching events on FRAME_COMPLETE.
-
-        Uses bytearray.append() + bytearray.clear() instead of slice
-        deletion (`del buf[:n]`) because MicroPython doesn't support
-        bytearray item deletion - bench-confirmed failure mode that
-        killed the previous version of the read loop on the first
-        chunk.
-        """
-        if self._ctx is None:
-            return
-        # Diagnostic: snapshot the first 16 bytes of THIS chunk
-        # so the operator can see what's arriving on the cable.
-        try:
-            sample = bytes(chunk[:16])
-            self._last_bytes_hex = "".join("%02x" % b for b in sample)
-        except Exception:
-            pass
-        # Log the first 5 chunks verbatim with hex so we can see what
-        # the cable is actually carrying. Cap so we don't spam flash.
-        if self._chunks_logged < 5:
-            self._chunks_logged += 1
-            try:
-                sample_hex = "".join("%02x" % b for b in chunk[:64])
-                _log.write("chunk %d: len=%d first64=%s"
-                           % (self._chunks_logged, len(chunk), sample_hex))
-            except Exception:
-                pass
-        # State machine over the chunk bytes. self._line_buf carries
-        # state across chunks for partial frames at chunk boundaries.
-        QUOTE = 0x22   # "
-        SEMI  = 0x3B   # ;
-        HASH  = 0x23   # #
-        for b in chunk:
-            if self._in_quote:
-                if b == QUOTE:
-                    # End of quoted hex - process + reset.
-                    self._process_line(now_ms)
-                    self._line_buf = bytearray()  # reset; .clear() is
-                                                   # MicroPython-safe but
-                                                   # reassign is fine too
-                    self._in_quote = False
-                else:
-                    self._line_buf.append(b)
-            else:
-                if b == QUOTE:
-                    # Start of quoted hex.
-                    self._line_buf = bytearray()
-                    self._in_quote = True
-                elif b == SEMI:
-                    # Legacy ; delimiter - any accumulated bytes are
-                    # the hex line (with possible leading #).
-                    if self._line_buf:
-                        self._process_line(now_ms)
-                    self._line_buf = bytearray()
-                elif b == HASH:
-                    # Outside a quote a # is the python envelope's
-                    # comment prefix - skip it.
-                    pass
-                else:
-                    # Outside a quote and not a delimiter - probably
-                    # a legacy bare-hex frame still in progress.
-                    # Accumulate so ; processing finds it.
-                    self._line_buf.append(b)
-
-    def _process_line(self, now_ms):
-        """Hex-decode the accumulated line and feed bytes to the
-        parser. Called by _on_chunk when a complete frame boundary
-        is detected."""
-        hex_line = bytes(self._line_buf).strip()
-        # Trim a leading # if it survived (legacy ;-delimited frames
-        # might still have it).
-        while hex_line and hex_line[:1] == b"#":
-            hex_line = hex_line[1:].strip()
-        if not hex_line:
-            return
-        # Log the first decoded line so we can see what a complete
-        # frame looks like in the stream.
-        if self._frames_decoded == 0:
-            try:
-                _log.write("first line: len=%d head=%s"
-                           % (len(hex_line),
-                              hex_line[:64].decode("ascii", "ignore")))
-            except Exception:
-                pass
-        try:
-            frame_bytes = binascii.unhexlify(hex_line)
-        except Exception as e:
-            self._bad_lines += 1
-            if self._bad_lines <= 3:
-                try:
-                    _log.write("bad line %d: %r head=%s"
-                               % (self._bad_lines, e,
-                                  hex_line[:32].decode("ascii", "ignore")))
-                except Exception:
-                    pass
-            return
-        self._frames_decoded += 1
-        for b in frame_bytes:
-            if b == 0x7E:
-                self._start_bytes_seen += 1
-            if self._parser.feed_byte(b) == FRAME_COMPLETE:
-                self._on_frame(self._ctx, now_ms)
-
-    # _read_chunk() and the sync read paths (os.read, stream.buffer,
-    # stream.read) were removed - replaced by the async _read_loop()
-    # above. See module-level comments for the bench history.
+    # _on_chunk(), _process_line(), _read_chunk(), the line buffer +
+    # state machine + envelope parsing - all removed. The async
+    # _read_loop() above does on-the-fly hex-pair decoding straight
+    # into the parser, no buffering or envelope-finding required.
 
     def _on_frame(self, ctx, now_ms):
         self._frames_received += 1
