@@ -321,22 +321,30 @@ class DmxBridge(Show):
                 except Exception:
                     pass
             self._line_buf.extend(chunk)
-            # Pull off as many complete lines as we have. Each line is
-            # one hex-encoded Enttec Pro frame terminated by `;`. (Was
-            # `\n` - MicroPython text-mode reads strip newlines, so
-            # the device-side line buffer never saw the delimiter.
-            # `;` is non-newline ASCII outside the hex alphabet so
-            # MicroPython's line handling can't eat it.)
+            # Pull off as many complete frames as we have. The shim's
+            # Tildagon-specific envelope wraps each frame as a Python
+            # comment + newline: "#<hex>\n". The REPL parses these as
+            # no-op statements and stays alive (without the envelope
+            # the REPL tries to execute the hex string as Python code,
+            # NameErrors out, and we've seen the device hang).
+            #
+            # We accept either \n or ; as delimiter so the same parser
+            # works against legacy shim builds during the transition.
+            # Leading '#' (the comment prefix) is stripped after split.
             while True:
-                sep_idx = self._line_buf.find(b";")
+                sep_idx = self._line_buf.find(b"\n")
+                if sep_idx < 0:
+                    sep_idx = self._line_buf.find(b";")
                 if sep_idx < 0:
                     break
                 line = bytes(self._line_buf[:sep_idx])
                 # Mutate buffer in-place to drop the consumed line +
                 # delimiter; no whole-buffer reallocation.
                 del self._line_buf[:sep_idx + 1]
-                # Strip whitespace (CR or stray spaces).
+                # Trim CR / whitespace + the Python-comment prefix.
                 line = line.strip()
+                while line and line[:1] == b"#":
+                    line = line[1:].strip()
                 if not line:
                     continue
                 # Log the first decoded line so we can see what a
