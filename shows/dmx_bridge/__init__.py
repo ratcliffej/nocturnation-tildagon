@@ -43,14 +43,29 @@ except ImportError:
 # os.read() with sys.stdin.fileno() gives us raw bytes regardless of
 # MicroPython's text-mode I/O layer (which on the Tildagon filters
 # non-printable bytes and breaks the Enttec framing). Cache the fd
-# once at module load if both pieces work.
+# once at module load if both pieces work. Record the probe outcome
+# as a string so the operator can see on-screen WHY a path was
+# skipped.
+_OS_READ_PROBE = ""
 try:
     import os
-    _STDIN_FD = sys.stdin.fileno()
     _HAS_OS_READ = hasattr(os, "read")
-except Exception:
-    _STDIN_FD = None
+    if not _HAS_OS_READ:
+        _OS_READ_PROBE = "no os.read"
+except Exception as _e:
+    os = None
     _HAS_OS_READ = False
+    _OS_READ_PROBE = "no os: " + repr(_e)[:16]
+
+_STDIN_FD = None
+if _HAS_OS_READ:
+    try:
+        _STDIN_FD = sys.stdin.fileno()
+        if _STDIN_FD is None or _STDIN_FD < 0:
+            _OS_READ_PROBE = "fd=%r" % _STDIN_FD
+            _STDIN_FD = None
+    except Exception as _e:
+        _OS_READ_PROBE = "fileno: " + repr(_e)[:16]
 
 from nocturnation.shows import Show, InputAction
 from nocturnation.hal import CapabilityMask
@@ -124,14 +139,15 @@ class DmxBridge(Show):
         return ()
 
     def power(self):
-        # 50 Hz tick to drain USB-CDC promptly. Shim sends ~44 Hz of
-        # frames; 20 ms ticks give us comfortable margin without
-        # burning too much CPU. LCD refresh is slower (10 Hz) - the
-        # status view only needs that to look live.
+        # 25 Hz tick to drain USB-CDC; lower than the 50 Hz first cut
+        # to ease MicroPython GC pressure after the bench observed
+        # freeze at ~24 KB. LCD refresh stays slow (5 Hz). With the
+        # parser's pre-allocated buffer + a single bytes object per
+        # read, steady-state allocation is small.
         return PowerProfile(
             needs_audio_frames=False,
-            tick_hz=50,
-            lcd_refresh_hz_max=10,
+            tick_hz=25,
+            lcd_refresh_hz_max=5,
         )
 
     # ------------------------------------------------------------------
@@ -329,26 +345,30 @@ class DmxBridge(Show):
     def _render_combined(self, d, ctx):
         """Single view - status + diagnostics inline. No view toggle.
 
-        Five lines total, all within the -75..+75 safe range. Each
-        keeps to a single d.text() call so failures stay isolated.
+        Within the -75..+75 safe range used by Conductor. Each line
+        is a single d.text() call so failures stay isolated.
         """
-        # Truncate the hex line to 8 bytes (23 chars) to fit the
-        # screen width at size 10.
         hex_str = self._last_bytes_hex
         if len(hex_str) > 23:
             hex_str = hex_str[:23]
         d.text(0, -75, "DMX Bridge", size=14, r=255, g=255, b=255)
-        d.text(0, -45, "bytes:  %d" % self._byte_count,
-               size=12, r=255, g=255, b=255)
-        d.text(0, -25, "frames: %d" % self._frames_received,
-               size=12, r=255, g=255, b=255)
-        d.text(0,  -5, "0x7E:   %d  (%s)"
-               % (self._start_bytes_seen, self._read_path),
+        d.text(0, -55, "bytes:  %d" % self._byte_count,
+               size=10, r=255, g=255, b=255)
+        d.text(0, -40, "frames: %d" % self._frames_received,
+               size=10, r=255, g=255, b=255)
+        d.text(0, -25, "0x7E:   %d" % self._start_bytes_seen,
                size=10, r=200, g=200, b=200)
+        # Path used by the read + why os.read isn't being tried (if so).
+        # If "os.read" works, frames should climb; if "buffer"/"text",
+        # the probe field tells us why we couldn't fall back to binary.
+        d.text(0, -10, "path: %s" % self._read_path,
+               size=10, r=200, g=200, b=200)
+        d.text(0,   5, "probe: %s" % (_OS_READ_PROBE or "ok, fd=%s" % _STDIN_FD),
+               size=10, r=160, g=160, b=160)
         d.text(0,  25, hex_str if hex_str else "(no data)",
                size=10, r=255, g=255, b=160)
         if self._error:
-            d.text(0, 60, self._error[:24], size=10, r=255, g=80, b=80)
+            d.text(0, 50, self._error[:24], size=10, r=255, g=80, b=80)
 
 
 def make_show():
