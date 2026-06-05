@@ -84,6 +84,13 @@ class DmxBridge(Show):
         self._last_frame_ms = 0
         self._last_payload = b""
         self._error = ""
+        # Read-path diagnostics: which API is delivering bytes, what
+        # the bytes look like, how many 0x7E start markers we've seen.
+        # Surfaces in the diagnostics view to help debug text-mode /
+        # NULL-truncation issues on first MicroPython contact.
+        self._read_path = "?"      # "buffer" | "text" | "?"
+        self._last_bytes_hex = ""  # hex dump of the most recent chunk
+        self._start_bytes_seen = 0 # count of 0x7E bytes in stream
 
     # ------------------------------------------------------------------
     # Plugin identity
@@ -168,27 +175,50 @@ class DmxBridge(Show):
             if not raw:
                 continue
             self._byte_count += len(raw)
+            # Diagnostic: keep a hex dump of the most recent chunk so
+            # the operator can eyeball what's actually arriving.
+            try:
+                if isinstance(raw, str):
+                    sample = raw[-16:]
+                    self._last_bytes_hex = " ".join(
+                        "%02X" % ord(c) for c in sample)
+                else:
+                    sample = raw[-16:]
+                    self._last_bytes_hex = " ".join(
+                        "%02X" % b for b in sample)
+            except Exception:
+                pass
             for b in raw:
-                if isinstance(b, str):    # CPython quirk
-                    b = ord(b)
+                if isinstance(b, str):    # text-mode read
+                    b = ord(b) & 0xFF
+                else:
+                    b = b & 0xFF
+                if b == 0x7E:
+                    self._start_bytes_seen += 1
                 if self._parser.feed_byte(b) == FRAME_COMPLETE:
                     self._on_frame(ctx, now_ms)
 
-    @staticmethod
-    def _read_chunk(stream):
+    def _read_chunk(self, stream):
         """Read whatever bytes are available without blocking.
 
         MicroPython's sys.stdin is usually text-mode; .buffer.read()
-        gives raw bytes when present. Fall back to ord()-of-string
-        when not.
+        gives raw bytes when present (CPython 3 + some MicroPython
+        builds). Records which path was taken in self._read_path so
+        the diagnostics view can show it.
         """
         try:
             buf = stream.buffer
-            return buf.read(512)
+            data = buf.read(512)
+            if data is not None:
+                self._read_path = "buffer"
+                return data
         except AttributeError:
             pass
         try:
-            return stream.read(512)
+            data = stream.read(512)
+            if data is not None:
+                self._read_path = "text"
+            return data
         except Exception:
             return None
 
@@ -275,19 +305,47 @@ class DmxBridge(Show):
         d.text(0, 92, "press button: diag", size=10, r=120, g=120, b=120)
 
     def _render_diagnostics(self, d):
-        d.text(0, -100, "DMX channels", size=14, r=255, g=255, b=255)
+        d.text(0, -110, "Diagnostics", size=14, r=255, g=255, b=255)
+        # Read-path metadata - what API is delivering bytes, are start
+        # markers present.
+        d.text(0, -90, "path: %s" % self._read_path,
+               size=10, r=200, g=200, b=200)
+        d.text(0, -76, "0x7E seen: %d" % self._start_bytes_seen,
+               size=10, r=200, g=200, b=200)
+        # Last bytes received - 16 most recent, hex. If this looks like
+        # garbage / has unexpected ASCII translation, the read path is
+        # munging bytes.
+        d.text(0, -58, "last bytes:", size=10, r=200, g=200, b=200)
+        # Split the hex string into two lines (16 bytes = 47 chars).
+        if self._last_bytes_hex:
+            half = len(self._last_bytes_hex) // 2
+            d.text(0, -44, self._last_bytes_hex[:half],
+                   size=10, r=255, g=255, b=160)
+            d.text(0, -30, self._last_bytes_hex[half:],
+                   size=10, r=255, g=255, b=160)
+        else:
+            d.text(0, -44, "(none)", size=10, r=160, g=160, b=160)
+        # NocturNation channel slice from the most recent COMPLETED
+        # frame (only updates if a frame parsed; stays at 0 / no data
+        # if parsing isn't working).
+        d.text(0, -10, "last frame channels:",
+               size=10, r=200, g=200, b=200)
         if not self._last_payload:
-            d.text(0, -70, "no data yet", size=12, r=160, g=160, b=160)
+            d.text(0, 6, "(no frame parsed yet)",
+                   size=10, r=160, g=160, b=160)
             return
-        labels = ("Master", "Strobe", "PulseR", "PulseG", "PulseB",
-                  "PulseT", "WshAR", "WshAG", "WshAB",
-                  "WshBR", "WshBG", "WshBB")
-        for i, label in enumerate(labels):
-            if i >= len(self._last_payload):
-                break
-            val = self._last_payload[i]
-            y = -78 + i * 14
-            d.text(0, y, "%02d %s %3d" % (i + 1, label, val),
+        labels = ("M", "S", "PR", "PG", "PB",
+                  "PT", "AR", "AG", "AB", "BR", "BG", "BB")
+        # Pack 12 labels and values into 4 rows of 3.
+        for row in range(4):
+            cells = []
+            for col in range(3):
+                idx = row * 3 + col
+                if idx >= len(labels) or idx >= len(self._last_payload):
+                    break
+                cells.append("%s:%3d" % (labels[idx],
+                                         self._last_payload[idx]))
+            d.text(0, 6 + row * 14, "  ".join(cells),
                    size=10, r=255, g=255, b=255)
 
 
