@@ -264,6 +264,14 @@ class NocturNationApp(app.App):
         # Performance-range source_ids (0x40..0xFE) are eligible to
         # be locked. Lock expires after 10 s of inactivity.
         self._tofu = TofuLock()
+        # Render-cadence state. _render_now() resets _last_render_ms so
+        # the periodic tick in _receive_loop reschedules from "right now"
+        # rather than double-firing. Heartbeat + state-changing frames
+        # both call _render_now(), so all Lumes painting from the same
+        # broadcast re-align to ESP-NOW arrival time (sub-ms jitter)
+        # instead of free-running 20 Hz tick phase (up to 50 ms drift).
+        self._last_render_ms = 0
+        self._render_interval_ms = 50  # 20 Hz baseline tick
         # Bring the perimeter LEDs out of low-power before the first
         # tick. Harmless if tildagonos is None (host environment).
         if tildagonos is not None:
@@ -719,6 +727,19 @@ class NocturNationApp(app.App):
             # starts from black at the next dispatch rather than
             # holding any stale envelope.
             self._lcd_renderer.clear()
+
+    def _render_now(self, now_ms: int) -> None:
+        """Force an immediate perimeter render and reset the periodic
+        tick timer. Called from _observe_frame on every state-changing
+        frame (LIGHT_PULSE, LIGHT_WASH, LIGHT_WASH_END, LIGHT_WASH_PULSE)
+        AND on HEARTBEAT, so multiple Lumes painting from the same
+        broadcast re-align to ESP-NOW arrival time. Skipped while the
+        settings menu owns the screen (LEDs are dark anyway).
+        """
+        if self._settings_open:
+            return
+        self._render_perimeter()
+        self._last_render_ms = now_ms
 
     def _render_perimeter(self) -> None:
         """Advance perimeter LED envelopes and push to hardware.
@@ -1416,9 +1437,11 @@ class NocturNationApp(app.App):
         # cadence is the same in both states. update() is foreground-
         # only by Tildagon contract; this loop runs always.
         poll_ms = 5
-        render_interval_ms = 50  # ~20 Hz perimeter tick
-        last_render_ms = 0 if time is None else time.ticks_ms()
-        last_dbg_ms = last_render_ms
+        # Render cadence is held on self (_last_render_ms / _render_interval_ms)
+        # so _render_now() from _observe_frame can defer the periodic tick
+        # after a forced render. ~20 Hz baseline between forced renders.
+        self._last_render_ms = 0 if time is None else time.ticks_ms()
+        last_dbg_ms = self._last_render_ms
         # Return when the mode leaves "lume" so background_task can
         # switch to the Director session.
         while self._mode == "lume":
@@ -1461,11 +1484,15 @@ class NocturNationApp(app.App):
             # Tick the perimeter at ~20 Hz independent of foreground
             # state. The settings menu, if open, skips this tick (the
             # menu owns the screen visually and our LEDs stay dark).
+            # _render_now() (called from _observe_frame on every state-
+            # changing frame + HEARTBEAT) resets _last_render_ms, so a
+            # burst of frames doesn't trigger redundant periodic ticks
+            # right behind a just-forced render.
             if time is not None and not self._settings_open:
                 now = time.ticks_ms()
-                if now - last_render_ms >= render_interval_ms:
+                if now - self._last_render_ms >= self._render_interval_ms:
                     self._render_perimeter()
-                    last_render_ms = now
+                    self._last_render_ms = now
             await asyncio.sleep_ms(poll_ms)
 
     def _try_recv(self):
@@ -1504,6 +1531,14 @@ class NocturNationApp(app.App):
                        MessageType.LIGHT_WASH,
                        MessageType.LIGHT_WASH_END,
                        MessageType.LIGHT_WASH_PULSE):
+            # HEARTBEAT-anchored sync: every Director heartbeat (1 Hz)
+            # snaps the perimeter tick to the heartbeat arrival, so any
+            # interpolating wash (cycle_ms > 0) re-aligns its phase
+            # across all Lumes that received the broadcast. No-op for
+            # cycle_ms == 0 (DMX bridge default) - just re-paints the
+            # same pixels, which is harmless.
+            if mt == MessageType.HEARTBEAT:
+                self._render_now(now_ms)
             return
 
         # Group filter per protocol manual section 4.2: target_group == 0
@@ -1545,6 +1580,14 @@ class NocturNationApp(app.App):
                 self._renderer.on_light_wash_pulse(frame, now_ms)
             if cls in _LCD_CLASSES:
                 self._lcd_renderer.on_light_wash_pulse(frame, now_ms)
+
+        # Render immediately so the new envelope / wash anchor lands at
+        # ESP-NOW arrival time (~ms across all Lumes that received the
+        # same broadcast) rather than the next free-running 20 Hz tick
+        # (~50 ms phase drift between Lumes). Pulses need this most -
+        # an LD would clock a stagger of 30+ ms across the rig.
+        if cls in _PERIMETER_CLASSES:
+            self._render_now(now_ms)
 
     def _lcd_background_rgb01(self):
         """Return (r, g, b) in 0..1 floats for ctx.rgb() to paint as the
