@@ -44,6 +44,13 @@ FULL_BRIGHTNESS_CAP = 0.6
 # upper bound.
 LCD_MIN_INTERVAL_MS = 250
 
+# Chance enum index -> firing probability. Matches the perimeter
+# renderer's CHANCE_PROB table so a single global chance setting (set
+# on every LIGHT_PULSE by the sender) produces consistent semantics
+# across both surfaces. Order is pixmob::Chance:
+#   CHANCE_100, _88, _67, _50, _32, _16, _10, _4
+CHANCE_PROB = (1.00, 0.88, 0.67, 0.50, 0.32, 0.16, 0.10, 0.04)
+
 
 _WASH_INACTIVE = 0
 _WASH_ATTACK   = 1
@@ -84,9 +91,10 @@ class LcdRenderer:
         "_pulse",       # (start_ms, src_r, src_g, src_b, dst_r, dst_g, dst_b, atk, sus, rel, total)
         "_wash",
         "_last_rendered",  # (r, g, b) last output, for next pulse's src-lerp
+        "_rng",
     )
 
-    def __init__(self, calm_mode=True):
+    def __init__(self, calm_mode=True, rng=None):
         # Calm Mode disables LCD pulsing AND wash entirely; the renderer
         # is effectively a no-op until the operator opts into Full mode.
         self._enabled = not bool(calm_mode)
@@ -94,6 +102,10 @@ class LcdRenderer:
         self._pulse = None
         self._wash = None
         self._last_rendered = (0, 0, 0)
+        if rng is None:
+            import random
+            rng = random.random
+        self._rng = rng
 
     @property
     def enabled(self):
@@ -212,6 +224,14 @@ class LcdRenderer:
             anyway, and primers don't consume the rate-limit budget so
             the main fire that follows is allowed.
           - Zero-duration envelope (attack + sustain + release == 0).
+          - Chance roll failed - probability comes from frame.chance via
+            CHANCE_PROB. Without this the LCD would fire on every
+            admitted pulse regardless of probability and a low-chance
+            sparkle would still show the screen flashing at full rate.
+            One roll per screen (vs the perimeter renderer's per-LED
+            roll) since the LCD is a single surface; consumes the rate-
+            limit budget so a fast-arriving sequence of rolled-fail
+            pulses still gates as it would for a rolled-pass sequence.
         """
         if not self._enabled:
             return False
@@ -222,6 +242,9 @@ class LcdRenderer:
         if self._wash is not None and self._wash["phase"] in (_WASH_ATTACK, _WASH_HOLD):
             if self._wash["pulse_response"] == 0:
                 return False
+        if self._rng() >= CHANCE_PROB[frame.chance]:
+            self._last_dispatch_ms = now_ms
+            return False
         attack_ms = TIME_MS[frame.attack]
         sustain_ms = TIME_MS[frame.sustain]
         release_ms = TIME_MS[frame.release]

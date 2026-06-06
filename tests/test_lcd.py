@@ -97,6 +97,49 @@ class TestFrequencyCap:
         assert LCD_MIN_INTERVAL_MS == 250
 
 
+class TestChanceGate:
+    """LIGHT_PULSE.chance must gate LCD dispatch the same way it gates
+    the perimeter renderer - otherwise a low-chance sparkle setting
+    fires the full-screen flash on every admitted pulse, swamping the
+    intended sparse effect (bench-confirmed regression on a Tildagon
+    with Calm Mode disabled, Epic 7 B7)."""
+
+    def test_chance_100_always_fires(self):
+        # Even with a deterministic rng that returns the worst-case
+        # value (0.999), CHANCE_100 should always pass: 0.999 < 1.00.
+        r = LcdRenderer(calm_mode=False, rng=lambda: 0.999)
+        assert r.dispatch(FakeFrame(chance=Chance.CHANCE_100), now_ms=0) is True
+
+    def test_chance_4_rolled_fail_drops_dispatch(self):
+        # CHANCE_4 = 0.04. An rng returning 0.5 fails the roll (0.5 >= 0.04).
+        r = LcdRenderer(calm_mode=False, rng=lambda: 0.5)
+        assert r.dispatch(FakeFrame(chance=Chance.CHANCE_4), now_ms=0) is False
+
+    def test_chance_4_rolled_pass_accepts_dispatch(self):
+        # CHANCE_4 = 0.04. An rng returning 0.01 passes (0.01 < 0.04).
+        r = LcdRenderer(calm_mode=False, rng=lambda: 0.01)
+        assert r.dispatch(FakeFrame(chance=Chance.CHANCE_4), now_ms=0) is True
+
+    def test_rolled_fail_consumes_rate_limit(self):
+        # A rolled-fail dispatch still advances the rate-limit clock so
+        # a fast-arriving sequence of rolled-fails throttles the same as
+        # a sequence of rolled-passes. Otherwise low-chance sparkle at
+        # high cadence would deliver one rolled-pass right after the
+        # previous rolled-fail with no spacing.
+        rng = iter([0.5, 0.01])
+        r = LcdRenderer(calm_mode=False, rng=lambda: next(rng))
+        assert r.dispatch(FakeFrame(chance=Chance.CHANCE_4), now_ms=0) is False
+        assert r.dispatch(FakeFrame(chance=Chance.CHANCE_4),
+                          now_ms=LCD_MIN_INTERVAL_MS - 1) is False  # rate-limited
+
+    def test_rolled_pass_accepts_after_rate_window(self):
+        rng = iter([0.5, 0.01])
+        r = LcdRenderer(calm_mode=False, rng=lambda: next(rng))
+        r.dispatch(FakeFrame(chance=Chance.CHANCE_4), now_ms=0)  # rolled-fail
+        assert r.dispatch(FakeFrame(chance=Chance.CHANCE_4),
+                          now_ms=LCD_MIN_INTERVAL_MS) is True
+
+
 class TestEnvelopeShape:
     def test_attack_phase_ramps_up(self):
         r = LcdRenderer(calm_mode=False)
