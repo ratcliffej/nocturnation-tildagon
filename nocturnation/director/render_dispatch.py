@@ -133,7 +133,12 @@ class RenderDispatcher:
         self._perimeter = perimeter
         self._lcd = lcd
         self._source_id = source_id & 0xFF
-        self._sequence = 0
+        # Start at 1, not 0: sequence_number == 0 signals "no sequencing"
+        # per protocol manual section 3.1 and bypasses receiver dedup. The
+        # wrap helper (_advance_sequence) also skips 0, so the counter
+        # never emits a frame that the receiver would refuse to dedup.
+        # Mirrors the M5 EspNowBroadcastDriver::next_seq().
+        self._sequence = 1
         # How many times to repeat each LIGHT_PULSE broadcast. ESP-NOW
         # is fire-and-forget with no retransmission, so a single send is
         # lossy; the M5 master sends 3x for reliability and the receiver
@@ -155,6 +160,17 @@ class RenderDispatcher:
         """Update the Director's source_id (e.g. after Epic-5.5
         allocation completes). Takes effect on the next dispatch."""
         self._source_id = source_id & 0xFF
+
+    def _advance_sequence(self):
+        """Advance the sequence counter, wrapping 255 -> 1 (skipping 0).
+
+        sequence_number == 0 signals "no sequencing" per protocol manual
+        section 3.1 and bypasses receiver dedup; emitting it with the
+        Director's 3x redundancy triple-renders that frame. Skip 0 to
+        keep dedup live across the full counter range. Mirrors the M5
+        EspNowBroadcastDriver::next_seq() in espnow_broadcast_driver.cpp.
+        """
+        self._sequence = 1 if self._sequence == 255 else self._sequence + 1
 
     def dispatch(self, target, ev, now_ms):
         """Encode + broadcast + locally loop back one render event.
@@ -181,7 +197,7 @@ class RenderDispatcher:
             ev.release,
             ev.chance,
         )
-        self._sequence = (self._sequence + 1) & 0xFF
+        self._advance_sequence()
 
         sent = False
         if self._send_fn is not None:
@@ -254,7 +270,7 @@ class RenderDispatcher:
             ev.ttl_seconds,
             ev.pulse_response,
         )
-        self._sequence = (self._sequence + 1) & 0xFF
+        self._advance_sequence()
 
         sent = False
         if self._send_fn is not None:
@@ -311,7 +327,7 @@ class RenderDispatcher:
             target_group,
             release_time,
         )
-        self._sequence = (self._sequence + 1) & 0xFF
+        self._advance_sequence()
 
         sent = False
         if self._send_fn is not None:
@@ -367,7 +383,7 @@ class RenderDispatcher:
             ev.release,
             ev.chance,
         )
-        self._sequence = (self._sequence + 1) & 0xFF
+        self._advance_sequence()
 
         sent = False
         if self._send_fn is not None:
@@ -420,7 +436,7 @@ class RenderDispatcher:
         if self._last_tx_ms is not None and (now_ms - self._last_tx_ms) < interval_ms:
             return False
         payload = encode_heartbeat(self._source_id, self._sequence, tick=now_ms)
-        self._sequence = (self._sequence + 1) & 0xFF
+        self._advance_sequence()
         try:
             self._send_fn(payload)
         except Exception:
