@@ -18,6 +18,7 @@ from nocturnation.render.perimeter import (
     LED_COUNT,
     CALM_MIN_INTERVAL_MS,
     FULL_MIN_INTERVAL_MS,
+    WASH_MAX_HOLD_MS,
 )
 
 
@@ -406,3 +407,57 @@ class TestWashBaseline:
         # Pulse was dropped; LED is still showing the wash baseline.
         assert cap2[0][1] == baseline_red
         assert cap2[0][3] == 0   # no blue overlay landed
+
+
+class TestWashTtlFailsafe:
+    """Lost-WASH_END failsafe (not a protocol change). A ttl_seconds == 0
+    wash whose LIGHT_WASH_END frame is lost would otherwise hold forever;
+    with pulse_response == 0 the Lume would sit unresponsive. The
+    receiver releases itself after WASH_MAX_HOLD_MS."""
+
+    def _wash_frame(self, **overrides):
+        class F:
+            r1 = 255; g1 = 0; b1 = 0
+            r2 = 0;   g2 = 0; b2 = 200
+            wash_attack    = 0
+            wash_release   = 0   # instant release so post-failsafe is observable quickly
+            intensity      = 255
+            cycle_ms       = 0
+            ttl_seconds    = 0   # "infinite" per spec
+            pulse_response = 0   # blocks pulses while held - the bug case
+        f = F()
+        for k, v in overrides.items():
+            setattr(f, k, v)
+        return f
+
+    def test_ttl_zero_wash_self_releases_after_max_hold(self):
+        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r.on_light_wash(self._wash_frame(), now_ms=0)
+        # Just before the failsafe, the wash is still holding (no release).
+        cap_before, set_before = make_capture()
+        r.tick(now_ms=WASH_MAX_HOLD_MS - 1, set_led=set_before)
+        assert r.is_washing() is True
+        assert cap_before[0][1] == 255   # still red baseline
+        # At the failsafe boundary, release fires. With release == 0 the
+        # state collapses to "not washing" on the next tick.
+        cap_after, set_after = make_capture()
+        r.tick(now_ms=WASH_MAX_HOLD_MS + 10, set_led=set_after)
+        assert r.is_washing() is False
+
+    def test_explicit_short_ttl_still_honoured(self):
+        # An explicit ttl_seconds shorter than WASH_MAX_HOLD_MS must still
+        # release on the operator's schedule - the failsafe is the floor
+        # for "infinite", not a ceiling for everything.
+        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r.on_light_wash(self._wash_frame(ttl_seconds=5), now_ms=0)
+        r.tick(now_ms=4_000, set_led=make_capture()[1])
+        assert r.is_washing() is True   # still holding at 4s
+        r.tick(now_ms=6_000, set_led=make_capture()[1])
+        assert r.is_washing() is False  # released after 5s, not waiting 30 min
+
+    def test_failsafe_does_not_fire_before_its_time(self):
+        # Generous failsafe; at the 1-minute mark the wash must still hold.
+        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r.on_light_wash(self._wash_frame(), now_ms=0)
+        r.tick(now_ms=60_000, set_led=make_capture()[1])
+        assert r.is_washing() is True
