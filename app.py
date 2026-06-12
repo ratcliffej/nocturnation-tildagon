@@ -239,11 +239,6 @@ class NocturNationApp(app.App):
         self._controller = None
         self._director_host = None
         self._dispatcher = None
-        # Director runtime, built lazily on first Director-mode entry
-        # (_ensure_director). None in Lume mode / before first entry.
-        self._controller = None
-        self._director_host = None
-        self._dispatcher = None
         self._imu_adapter = None
         self._button_tap = None
         self._dir_buttons = DirectorButtonMapper()
