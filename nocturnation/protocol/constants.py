@@ -2,53 +2,29 @@
 
 Implemented as plain integer constants rather than IntEnum so the module runs
 unchanged under MicroPython, which doesn't ship enum in its trimmed stdlib.
+
+The header / magic / version / message-type / payload-length constants are
+generated from Docs/protocol/constants.yaml via Docs/tools/gen_protocol_constants.py
+and re-exported here unchanged. To regenerate, run tools/regen_constants.sh.
+The DeviceClass / Time / Chance tables and the MAX_FRAME_SIZE derivation
+remain manually authored (they have language-specific shape that is not
+worth templating).
 """
 
-# 2-byte magic prefix that discriminates NocturNation traffic from other
-# ESP-NOW users sharing the channel (a real concern at events like EMF).
-# Receivers MUST reject any frame whose first two bytes are not "NN"
-# before doing any further header validation.
-MAGIC_0 = 0x4E  # 'N'
-MAGIC_1 = 0x4E  # 'N'
+from ._generated import (
+    MAGIC_0,
+    MAGIC_1,
+    PROTOCOL_VERSION,
+    HEADER_SIZE,
+    MessageType,
+    PAYLOAD_LENGTHS,
+)
 
-PROTOCOL_VERSION = 0x02  # bumped from 0x01 for the magic-prefix wire change
-
-# 2 magic + 1 version + 5 metadata fields (source_id, sequence_number,
-# hop_count, message_type, payload_len).
-HEADER_SIZE = 8
+# ESP-NOW supports up to 250-byte payloads; NocturNation caps frames at 32
+# (the largest active payload is LIGHT_WASH at 16 bytes, so 32 leaves
+# room for future message types without burning radio time on padding).
 MAX_FRAME_SIZE = 32
 MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE - HEADER_SIZE
-
-
-class MessageType:
-    # Spec v0.29 §4.3 + Epic 6C Phase D additions. Active types: HEARTBEAT,
-    # LIGHT_PULSE, the WASH family (0x06/0x07/0x08), plus the EXTENSION
-    # slot. IDs 0x01 (BEAT_DETECTED), 0x02 (MODE_CHANGE), 0x04
-    # (CLOCK_SYNC), 0x05 (TIME_SYNC) remain RESERVED - removed in the
-    # protocol trim, MUST NOT be reused. 0x06 (was MUSIC_EVENT) is
-    # reclaimed by LIGHT_WASH; 0x07 and 0x08 were previously unassigned.
-    # Inbound frames carrying a reserved or unassigned message_type are
-    # silently dropped per the spec forward-compat note.
-    HEARTBEAT = 0x00
-    LIGHT_PULSE = 0x03
-    LIGHT_WASH = 0x06           # 16-byte payload: persistent two-colour drift baseline
-    LIGHT_WASH_END = 0x07       # 3-byte payload: explicit cancel with operator release_time
-    LIGHT_WASH_PULSE = 0x08     # 9-byte payload: pulse that fires only on washing Lumes
-    EXTENSION = 0xFF
-
-
-# Payload lengths per message type. Used to validate inbound frames before
-# unpacking; mismatches MUST be dropped silently per protocol manual section
-# 3.1. HEARTBEAT carries tick (u32 LE) + days_since_2026 (u16 LE) +
-# centiseconds_today (u24 LE) = 9 bytes per spec v0.29 §3.3.1.
-# WASH-family lengths per the Epic 6C design doc (16/3/9 bytes).
-PAYLOAD_LENGTHS = {
-    MessageType.HEARTBEAT:        9,
-    MessageType.LIGHT_PULSE:      9,
-    MessageType.LIGHT_WASH:       16,
-    MessageType.LIGHT_WASH_END:    3,
-    MessageType.LIGHT_WASH_PULSE:  9,
-}
 
 
 class DeviceClass:
