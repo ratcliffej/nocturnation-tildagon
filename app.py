@@ -985,9 +985,13 @@ class NocturNationApp(app.App):
             print("[nocturnation] radio acquire failed: %s" % exc)
             self._wlan = None
             return
-        # Fresh scan / lock state for this session.
+        # Fresh scan / lock / signal state for this session. Resetting
+        # the signal tracker means a re-entered session starts in the
+        # truthful NO SIGNAL state rather than carrying a stale
+        # last-frame timestamp from before the previous _release_radio.
         self._scanner = self._make_scanner()
         self._tofu.clear()
+        self._signal_tracker.reset()
         self._radio_held = True
         self._dbg_radio("acquire")
 
