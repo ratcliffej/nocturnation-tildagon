@@ -126,7 +126,13 @@ except ImportError:
 from .nocturnation.channel_scan import ChannelScanner
 from .nocturnation.protocol import DedupRing, MessageType
 from .nocturnation.receive import process_frame
-from .nocturnation.render import LcdRenderer, PerimeterRenderer, CtxDisplay
+from .nocturnation.render import (
+    LcdRenderer,
+    PerimeterRenderer,
+    CtxDisplay,
+    PERIMETER_CLASSES,
+    LCD_CLASSES,
+)
 from .nocturnation.settings import Settings
 from .nocturnation.signal_tracker import SignalTracker
 from .nocturnation.tofu import TofuLock, format_lock_label
@@ -166,13 +172,6 @@ DIRECTOR_CHANNEL = 1
 # for the hobby channel; the Epic 5.5 random-per-boot allocation is a
 # channel-11 concern and the Tildagon never transmits there.
 DIRECTOR_SOURCE_ID = 0x20
-
-# Class-to-surface routing per Epic 5 Q1. The Tildagon advertises as
-# MultiLedScreen (0x03) but renders Light-class commands (0x01) on the
-# perimeter too because the LED ring is a wristband-analogue. Screen
-# (0x02) targets the LCD only; All (0x00) targets both surfaces.
-_PERIMETER_CLASSES = (0x00, 0x01, 0x03)
-_LCD_CLASSES = (0x00, 0x02, 0x03)
 
 
 class NocturNationApp(app.App):
@@ -1528,30 +1527,30 @@ class NocturNationApp(app.App):
         cls = frame.target_class
 
         if mt == MessageType.LIGHT_PULSE:
-            if cls in _PERIMETER_CLASSES:
+            if cls in PERIMETER_CLASSES:
                 self._renderer.dispatch(frame, now_ms)
-            if cls in _LCD_CLASSES:
+            if cls in LCD_CLASSES:
                 self._lcd_renderer.dispatch(frame, now_ms)
         elif mt == MessageType.LIGHT_WASH:
             # Tildagon is wash-capable on both surfaces (can_pulse +
             # can_wash + can_overlay). Hand the wash to whichever
             # surface(s) match the target class.
-            if cls in _PERIMETER_CLASSES:
+            if cls in PERIMETER_CLASSES:
                 self._renderer.on_light_wash(frame, now_ms)
-            if cls in _LCD_CLASSES:
+            if cls in LCD_CLASSES:
                 self._lcd_renderer.on_light_wash(frame, now_ms)
         elif mt == MessageType.LIGHT_WASH_END:
-            if cls in _PERIMETER_CLASSES:
+            if cls in PERIMETER_CLASSES:
                 self._renderer.on_light_wash_end(frame, now_ms)
-            if cls in _LCD_CLASSES:
+            if cls in LCD_CLASSES:
                 self._lcd_renderer.on_light_wash_end(frame, now_ms)
         elif mt == MessageType.LIGHT_WASH_PULSE:
             # The renderer's on_light_wash_pulse handler internally
             # drops the frame if it has no active wash (per design),
             # so the receive-side dispatch routes unconditionally.
-            if cls in _PERIMETER_CLASSES:
+            if cls in PERIMETER_CLASSES:
                 self._renderer.on_light_wash_pulse(frame, now_ms)
-            if cls in _LCD_CLASSES:
+            if cls in LCD_CLASSES:
                 self._lcd_renderer.on_light_wash_pulse(frame, now_ms)
 
     def _lcd_background_rgb01(self):

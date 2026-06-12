@@ -38,15 +38,7 @@ from ..protocol import (
     make_light_wash_end_frame,
     make_light_wash_pulse_frame,
 )
-from ..protocol.constants import DeviceClass
-
-
-# target_class values that drive each local surface. Mirrors the
-# receive-side routing the Lume already uses (see app.py _observe_frame):
-# perimeter accepts All/Light/MultiLedScreen, LCD accepts
-# All/Screen/MultiLedScreen.
-_PERIMETER_CLASSES = (DeviceClass.ALL, DeviceClass.LIGHT, DeviceClass.MULTI_LED_SCREEN)
-_LCD_CLASSES = (DeviceClass.ALL, DeviceClass.SCREEN, DeviceClass.MULTI_LED_SCREEN)
+from ..render.class_routing import PERIMETER_CLASSES, LCD_CLASSES
 
 
 def parse_target(target):
@@ -218,8 +210,8 @@ class RenderDispatcher:
         #    round-trip) and feed the renderers that match the class.
         perimeter_lit = 0
         lcd_armed = False
-        if (self._perimeter is not None and target_class in _PERIMETER_CLASSES) or (
-            self._lcd is not None and target_class in _LCD_CLASSES
+        if (self._perimeter is not None and target_class in PERIMETER_CLASSES) or (
+            self._lcd is not None and target_class in LCD_CLASSES
         ):
             frame = make_light_pulse_frame(
                 target_class,
@@ -233,9 +225,9 @@ class RenderDispatcher:
                 ev.chance,
                 source_id=self._source_id,
             )
-            if self._perimeter is not None and target_class in _PERIMETER_CLASSES:
+            if self._perimeter is not None and target_class in PERIMETER_CLASSES:
                 perimeter_lit = self._perimeter.dispatch(frame, now_ms)
-            if self._lcd is not None and target_class in _LCD_CLASSES:
+            if self._lcd is not None and target_class in LCD_CLASSES:
                 lcd_armed = self._lcd.dispatch(frame, now_ms)
 
         return DispatchResult(sent, perimeter_lit, lcd_armed)
@@ -285,8 +277,8 @@ class RenderDispatcher:
 
         perimeter_lit = 0
         lcd_armed = False
-        if (self._perimeter is not None and target_class in _PERIMETER_CLASSES) or (
-            self._lcd is not None and target_class in _LCD_CLASSES
+        if (self._perimeter is not None and target_class in PERIMETER_CLASSES) or (
+            self._lcd is not None and target_class in LCD_CLASSES
         ):
             frame = make_light_wash_frame(
                 target_class,
@@ -301,12 +293,12 @@ class RenderDispatcher:
                 ev.pulse_response,
                 source_id=self._source_id,
             )
-            if self._perimeter is not None and target_class in _PERIMETER_CLASSES:
+            if self._perimeter is not None and target_class in PERIMETER_CLASSES:
                 self._perimeter.on_light_wash(frame, now_ms)
                 # on_light_wash is a state setter, not a per-LED count.
                 # Report "loopback fired" as 1 for DispatchResult truthiness.
                 perimeter_lit = 1
-            if self._lcd is not None and target_class in _LCD_CLASSES:
+            if self._lcd is not None and target_class in LCD_CLASSES:
                 self._lcd.on_light_wash(frame, now_ms)
                 lcd_armed = True
 
@@ -342,8 +334,8 @@ class RenderDispatcher:
 
         perimeter_lit = 0
         lcd_armed = False
-        if (self._perimeter is not None and target_class in _PERIMETER_CLASSES) or (
-            self._lcd is not None and target_class in _LCD_CLASSES
+        if (self._perimeter is not None and target_class in PERIMETER_CLASSES) or (
+            self._lcd is not None and target_class in LCD_CLASSES
         ):
             frame = make_light_wash_end_frame(
                 target_class,
@@ -351,10 +343,10 @@ class RenderDispatcher:
                 release_time,
                 source_id=self._source_id,
             )
-            if self._perimeter is not None and target_class in _PERIMETER_CLASSES:
+            if self._perimeter is not None and target_class in PERIMETER_CLASSES:
                 self._perimeter.on_light_wash_end(frame, now_ms)
                 perimeter_lit = 1
-            if self._lcd is not None and target_class in _LCD_CLASSES:
+            if self._lcd is not None and target_class in LCD_CLASSES:
                 self._lcd.on_light_wash_end(frame, now_ms)
                 lcd_armed = True
 
@@ -398,8 +390,8 @@ class RenderDispatcher:
 
         perimeter_lit = 0
         lcd_armed = False
-        if (self._perimeter is not None and target_class in _PERIMETER_CLASSES) or (
-            self._lcd is not None and target_class in _LCD_CLASSES
+        if (self._perimeter is not None and target_class in PERIMETER_CLASSES) or (
+            self._lcd is not None and target_class in LCD_CLASSES
         ):
             frame = make_light_wash_pulse_frame(
                 target_class,
@@ -413,9 +405,9 @@ class RenderDispatcher:
                 ev.chance,
                 source_id=self._source_id,
             )
-            if self._perimeter is not None and target_class in _PERIMETER_CLASSES:
+            if self._perimeter is not None and target_class in PERIMETER_CLASSES:
                 perimeter_lit = self._perimeter.on_light_wash_pulse(frame, now_ms)
-            if self._lcd is not None and target_class in _LCD_CLASSES:
+            if self._lcd is not None and target_class in LCD_CLASSES:
                 lcd_armed = bool(self._lcd.on_light_wash_pulse(frame, now_ms))
 
         return DispatchResult(sent, perimeter_lit, lcd_armed)
