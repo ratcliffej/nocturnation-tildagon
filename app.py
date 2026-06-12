@@ -971,6 +971,19 @@ class NocturNationApp(app.App):
         try:
             self._wlan = network.WLAN(network.STA_IF)
             self._wlan.active(True)
+            # Disable Wi-Fi modem power-save. Per the MicroPython espnow
+            # docs ("ESPNow and Wifi Operation"), the STA defaults to a
+            # duty-cycled PM mode that sleeps through short ESP-NOW
+            # bursts (the Director sends 3x retransmits within ~2 ms),
+            # so receivers must set PM_NONE for reliable receive. This
+            # raises idle current; any future light-sleep work must keep
+            # the radio awake for heartbeat windows or this bug returns.
+            # Older firmware may not expose `pm`; swallow the error so
+            # acquisition still proceeds.
+            try:
+                self._wlan.config(pm=network.WLAN.PM_NONE)
+            except Exception as exc:
+                print("[nocturnation] wlan.config(pm=PM_NONE) failed: %s" % exc)
             if self._esp is None:
                 self._esp = espnow.ESPNow()
             self._esp.active(True)
