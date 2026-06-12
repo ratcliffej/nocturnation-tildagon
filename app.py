@@ -124,6 +124,7 @@ except ImportError:
 # Host-side pytest never imports this file (only the nocturnation/
 # package below), so the dot prefix is invisible to the test suite.
 from .nocturnation.channel_scan import ChannelScanner
+from .nocturnation.clock import ticks_diff
 from .nocturnation.protocol import DedupRing, MessageType
 from .nocturnation.receive import process_frame
 from .nocturnation.render import (
@@ -1105,11 +1106,11 @@ class NocturNationApp(app.App):
             if self._director_overlay is None:
                 # IMU tap-to-beat at ~50 Hz (button tap is polled in
                 # update()).
-                if time is not None and now - last_imu >= imu_interval_ms:
+                if time is not None and ticks_diff(now, last_imu) >= imu_interval_ms:
                     self._controller.poll_inputs(now, button_pressed=None)
                     last_imu = now
                 self._controller.tick(now)
-                if time is not None and now - last_render >= render_interval_ms:
+                if time is not None and ticks_diff(now, last_render) >= render_interval_ms:
                     self._render_perimeter()
                     last_render = now
             await asyncio.sleep_ms(poll_ms)
@@ -1460,7 +1461,7 @@ class NocturNationApp(app.App):
             # channel drifts from what the app believes (B9 debug).
             if _DEBUG and time is not None:
                 now = time.ticks_ms()
-                if now - last_dbg_ms >= 2000:
+                if ticks_diff(now, last_dbg_ms) >= 2000:
                     self._dbg_radio("rx-loop")
                     last_dbg_ms = now
             # Expire the TOFU lock on extended silence. The signal_tracker
@@ -1474,7 +1475,7 @@ class NocturNationApp(app.App):
             # menu owns the screen visually and our LEDs stay dark).
             if time is not None and not self._settings_open:
                 now = time.ticks_ms()
-                if now - last_render_ms >= render_interval_ms:
+                if ticks_diff(now, last_render_ms) >= render_interval_ms:
                     self._render_perimeter()
                     last_render_ms = now
             await asyncio.sleep_ms(poll_ms)

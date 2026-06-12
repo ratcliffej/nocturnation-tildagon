@@ -24,6 +24,7 @@ Pure logic: no I/O, no clock; the caller injects ``now_ms`` and the
 current channel. Unit-tested host-side; runs unchanged on the badge.
 """
 
+from .clock import ticks_diff
 from .protocol import MessageType
 from .protocol.source_id import SourceId, is_community_range, is_performance_range
 
@@ -112,10 +113,7 @@ class TofuLock:
         """
         if self._locked_id is None or self._last_frame_ms is None:
             return False
-        # ticks_ms wraps at 30 bits on MicroPython, but the wrap window
-        # (~12.4 days) is far beyond any reasonable lock duration so a
-        # plain subtraction is fine in practice.
-        if now_ms - self._last_frame_ms >= self._timeout_ms:
+        if ticks_diff(now_ms, self._last_frame_ms) >= self._timeout_ms:
             self._locked_id     = None
             self._last_frame_ms = None
             return True

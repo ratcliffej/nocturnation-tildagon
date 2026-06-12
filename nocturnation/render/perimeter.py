@@ -22,6 +22,7 @@ Reference manuals:
 
 import math
 
+from ..clock import ticks_diff
 from .envelope import TIME_MS, envelope_brightness  # noqa: F401 (re-exported)
 
 # Map the protocol's Chance enum (0..7) to a probability 0..1.
@@ -278,7 +279,7 @@ class PerimeterRenderer:
         # Frequency cap. Primers and zero-duration envelopes don't count
         # against the cap so they don't consume the budget that the
         # subsequent main fire needs.
-        if now_ms - self._last_dispatch_ms < self._min_interval_ms:
+        if ticks_diff(now_ms, self._last_dispatch_ms) < self._min_interval_ms:
             return 0
 
         if frame.r == 0 and frame.g == 0 and frame.b == 0:

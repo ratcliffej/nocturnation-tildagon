@@ -30,6 +30,7 @@ Reference manuals:
 
 import math
 
+from ..clock import ticks_diff
 from .envelope import TIME_MS, envelope_brightness  # noqa: F401 (re-exported)
 
 
@@ -217,7 +218,7 @@ class LcdRenderer:
             return False
         if frame.r == 0 and frame.g == 0 and frame.b == 0:
             return False
-        if now_ms - self._last_dispatch_ms < LCD_MIN_INTERVAL_MS:
+        if ticks_diff(now_ms, self._last_dispatch_ms) < LCD_MIN_INTERVAL_MS:
             return False
         if self._wash is not None and self._wash["phase"] in (_WASH_ATTACK, _WASH_HOLD):
             if self._wash["pulse_response"] == 0:
