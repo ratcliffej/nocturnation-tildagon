@@ -20,6 +20,14 @@ from ._generated import (
     PAYLOAD_LENGTHS,
 )
 
+# Flag bits inside LIGHT_FX_RUN.flags (byte 3 of the payload).
+# Stable wire surface; defined here rather than in _generated.py because
+# they are receiver-side interpretation rules, not source-of-truth wire
+# numerics.
+FX_FLAG_START           = 0x01   # bit0: start fresh (cancel any running FX)
+FX_FLAG_REPLACE_RUNNING = 0x02   # bit1: replace running, even if same fx_id
+FX_FLAG_LAYERED         = 0x04   # bit2: reserved - layered FX (future)
+
 # ESP-NOW supports up to 250-byte payloads; NocturNation caps frames at 32
 # (the largest active payload is LIGHT_WASH at 16 bytes, so 32 leaves
 # room for future message types without burning radio time on padding).

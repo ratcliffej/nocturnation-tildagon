@@ -74,6 +74,13 @@ class Frame:
         "pulse_response",     # 0 = drop PULSE while washing; 1 = additive overlay
         # LIGHT_WASH_END-specific
         "release_time",       # 100 ms units; overrides wash's own release
+        # LIGHT_FX_RUN-specific (Epic 10)
+        "fx_id",              # 0 = cancel; 1-254 = registered FX; 255 reserved
+        "bpm",                # 0 = receiver default; 1-255 = override
+        "buildup_s",          # 0-255 seconds of ramp-in
+        "flags",              # bit0 = start, bit1 = replace-running, bit2 = layered (rsvd)
+        "position_ms",        # u16 LE; ms into the FX's own timeline (late-join seek)
+        "params",             # tuple of six u8s; FX-specific
     )
 
     def __init__(self):
@@ -101,6 +108,13 @@ class Frame:
         self.ttl_seconds = None
         self.pulse_response = None
         self.release_time = None
+        # LIGHT_FX_RUN-specific (Epic 10).
+        self.fx_id = None
+        self.bpm = None
+        self.buildup_s = None
+        self.flags = None
+        self.position_ms = None
+        self.params = None     # tuple of six u8s
 
 
 def parse_frame(buf):
@@ -191,6 +205,24 @@ def parse_frame(buf):
         f.sustain = p[6]
         f.release = p[7]
         f.chance  = p[8]
+    elif f.message_type == MessageType.LIGHT_FX_RUN:
+        # Epic 10 13-byte layout. See Docs/epics/epic-10-fx-library-and-orchestrator.md
+        #
+        #   0   fx_id          1 B   0 = cancel; 1-254 = registered FX
+        #   1   bpm            1 B   0 = receiver default
+        #   2   buildup_s      1 B
+        #   3   flags          1 B   bit0=start, bit1=replace-running, bit2=layered
+        #   4-5 position_lo+hi 2 B   u16 LE; ms into FX timeline
+        #   6-11 params[1..6]  6 B
+        #   12  reserved       1 B
+        p = f.payload
+        f.fx_id       = p[0]
+        f.bpm         = p[1]
+        f.buildup_s   = p[2]
+        f.flags       = p[3]
+        f.position_ms = p[4] | (p[5] << 8)
+        f.params      = (p[6], p[7], p[8], p[9], p[10], p[11])
+        # p[12] is reserved; ignored on receive.
 
     return f
 
@@ -549,3 +581,95 @@ def encode_heartbeat(
         (cs >> 8) & 0xFF,
         (cs >> 16) & 0xFF,
     ))
+
+
+_LIGHT_FX_RUN_PAYLOAD_LEN = PAYLOAD_LENGTHS[MessageType.LIGHT_FX_RUN]
+
+
+def encode_light_fx_run(
+    source_id,
+    sequence_number,
+    fx_id,
+    bpm=0,
+    buildup_s=0,
+    flags=0x01,            # default = bit0 (start fresh) only
+    position_ms=0,
+    params=(0, 0, 0, 0, 0, 0),
+    hop_count=0,
+):
+    """Build the wire bytes for a LIGHT_FX_RUN frame (Epic 10).
+
+    8-byte header + 13-byte payload:
+        fx_id        u8
+        bpm          u8
+        buildup_s    u8
+        flags        u8
+        position     u16 LE
+        param 1-6    6 x u8
+        reserved     u8 (zero on send)
+
+    ``params`` may be any iterable of six ints; values >255 are masked.
+    ``flags`` defaults to FX_FLAG_START (the common case: replace any
+    running FX with this one).
+    """
+    p = tuple(params)
+    if len(p) != 6:
+        raise FrameError("LIGHT_FX_RUN params must be 6 elements")
+    pos = position_ms & 0xFFFF
+    return bytes((
+        MAGIC_0,
+        MAGIC_1,
+        PROTOCOL_VERSION,
+        source_id & 0xFF,
+        sequence_number & 0xFF,
+        hop_count & 0xFF,
+        MessageType.LIGHT_FX_RUN,
+        _LIGHT_FX_RUN_PAYLOAD_LEN,
+        fx_id & 0xFF,
+        bpm & 0xFF,
+        buildup_s & 0xFF,
+        flags & 0xFF,
+        pos & 0xFF,
+        (pos >> 8) & 0xFF,
+        p[0] & 0xFF,
+        p[1] & 0xFF,
+        p[2] & 0xFF,
+        p[3] & 0xFF,
+        p[4] & 0xFF,
+        p[5] & 0xFF,
+        0,   # reserved
+    ))
+
+
+def make_light_fx_run_frame(
+    fx_id,
+    bpm=0,
+    buildup_s=0,
+    flags=0x01,
+    position_ms=0,
+    params=(0, 0, 0, 0, 0, 0),
+    source_id=0,
+    sequence_number=0,
+    hop_count=0,
+):
+    """Build a Frame populated as a LIGHT_FX_RUN (zero-copy alternative
+    to encode + parse_frame). Useful for the dispatcher's local
+    loopback path on the Director side."""
+    p = tuple(params)
+    if len(p) != 6:
+        raise FrameError("LIGHT_FX_RUN params must be 6 elements")
+    f = Frame()
+    f.protocol_version = PROTOCOL_VERSION
+    f.source_id        = source_id & 0xFF
+    f.sequence_number  = sequence_number & 0xFF
+    f.hop_count        = hop_count & 0xFF
+    f.message_type     = MessageType.LIGHT_FX_RUN
+    f.payload_len      = _LIGHT_FX_RUN_PAYLOAD_LEN
+    f.payload          = None
+    f.fx_id       = fx_id & 0xFF
+    f.bpm         = bpm & 0xFF
+    f.buildup_s   = buildup_s & 0xFF
+    f.flags       = flags & 0xFF
+    f.position_ms = position_ms & 0xFFFF
+    f.params      = tuple(x & 0xFF for x in p)
+    return f

@@ -10,6 +10,9 @@ from .constants import (
     HEADER_SIZE,
     MessageType,
     DeviceClass,
+    FX_FLAG_START,
+    FX_FLAG_REPLACE_RUNNING,
+    FX_FLAG_LAYERED,
 )
 from .dedup import DedupRing
 from .frame import (
@@ -20,11 +23,13 @@ from .frame import (
     encode_light_wash,
     encode_light_wash_end,
     encode_light_wash_pulse,
+    encode_light_fx_run,
     encode_heartbeat,
     make_light_pulse_frame,
     make_light_wash_frame,
     make_light_wash_end_frame,
     make_light_wash_pulse_frame,
+    make_light_fx_run_frame,
 )
 from .source_id import SourceId, is_community_range, is_performance_range
 
@@ -34,6 +39,9 @@ __all__ = [
     "HEADER_SIZE",
     "MessageType",
     "DeviceClass",
+    "FX_FLAG_START",
+    "FX_FLAG_REPLACE_RUNNING",
+    "FX_FLAG_LAYERED",
     "DedupRing",
     "Frame",
     "parse_frame",
@@ -42,11 +50,13 @@ __all__ = [
     "encode_light_wash",
     "encode_light_wash_end",
     "encode_light_wash_pulse",
+    "encode_light_fx_run",
     "encode_heartbeat",
     "make_light_pulse_frame",
     "make_light_wash_frame",
     "make_light_wash_end_frame",
     "make_light_wash_pulse_frame",
+    "make_light_fx_run_frame",
     "SourceId",
     "is_community_range",
     "is_performance_range",

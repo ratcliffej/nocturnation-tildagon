@@ -19,6 +19,7 @@ class MessageType:
     LIGHT_WASH       = 0x06
     LIGHT_WASH_END   = 0x07
     LIGHT_WASH_PULSE = 0x08
+    LIGHT_FX_RUN     = 0x09
     EXTENSION        = 0xFF
 
 
@@ -28,4 +29,5 @@ PAYLOAD_LENGTHS = {
     MessageType.LIGHT_WASH      : 16,
     MessageType.LIGHT_WASH_END  : 3,
     MessageType.LIGHT_WASH_PULSE: 9,
+    MessageType.LIGHT_FX_RUN    : 13,
 }
