@@ -218,10 +218,12 @@ class NocturNationApp(app.App):
         # Epic 6B: app role. "idle" (no radio, WiFi left up so the badge
         # stays connected while the operator is in the start menu),
         # "lume" (receive), or "director" (Show framework + IMU + TX).
-        # Always launch into idle; the operator starts a mode from the
-        # idle menu, at which point we take the radio (wifi.stop) - so
-        # WiFi only goes down when a mode is actively running.
-        self._mode = "idle"
+        # Epic 12: launch straight into Lume - the background loop sees
+        # the mode change on its first iteration and acquires the radio
+        # (stopping WiFi). F (CANCEL) in Lume calls _stop_to_idle, which
+        # restores WiFi and opens the idle menu as the route to Director
+        # / settings / help.
+        self._mode = "lume"
         # Idle start-menu (Menu component); built lazily on first idle
         # tick. None while a mode is running.
         self._idle_menu = None
