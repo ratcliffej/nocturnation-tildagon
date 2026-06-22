@@ -111,10 +111,11 @@ class TestFrequencyCap:
         r.dispatch(FakeFrame(), now_ms=0)
         assert r.dispatch(FakeFrame(), now_ms=LCD_MIN_INTERVAL_MS) is True
 
-    def test_cap_matches_4_hz(self):
-        # The cap should be the Full-mode 4 Hz spec from architecture
-        # spec section 15.1 - 250 ms minimum interval.
-        assert LCD_MIN_INTERVAL_MS == 250
+    def test_cap_value(self):
+        # Was 250 ms (4 Hz) per architecture spec section 15.1, but
+        # silently dropped every other sparkle at 140 BPM tempo. Bumped
+        # to 60 ms (~16 Hz) so per-beat sparkles land through 200+ BPM.
+        assert LCD_MIN_INTERVAL_MS == 60
 
 
 class TestEnvelopeShape:

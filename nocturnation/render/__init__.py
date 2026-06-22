@@ -28,6 +28,7 @@ from .pulse import RgbPulse
 from .wash import RgbWash
 from .display import CtxDisplay, SCREEN_W, SCREEN_H
 from .class_routing import PERIMETER_CLASSES, LCD_CLASSES
+from .lume_text import LumeTextRenderer
 
 __all__ = [
     "PERIMETER_CLASSES",
@@ -48,4 +49,5 @@ __all__ = [
     "CtxDisplay",
     "SCREEN_W",
     "SCREEN_H",
+    "LumeTextRenderer",
 ]

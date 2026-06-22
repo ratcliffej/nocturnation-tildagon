@@ -20,6 +20,10 @@ from .constants import (
     PROTOCOL_VERSION,
     PAYLOAD_LENGTHS,
     MessageType,
+    TEXT_DISPLAY_MAX_HEADER_LEN,
+    TEXT_DISPLAY_MAX_BODY_LEN,
+    TEXT_DISPLAY_FIXED_PREFIX,
+    TEXT_DISPLAY_MIN_PAYLOAD_LEN,
 )
 
 
@@ -74,13 +78,18 @@ class Frame:
         "pulse_response",     # 0 = drop PULSE while washing; 1 = additive overlay
         # LIGHT_WASH_END-specific
         "release_time",       # 100 ms units; overrides wash's own release
-        # LIGHT_FX_RUN-specific (Epic 10)
-        "fx_id",              # 0 = cancel; 1-254 = registered FX; 255 reserved
-        "bpm",                # 0 = receiver default; 1-255 = override
-        "buildup_s",          # 0-255 seconds of ramp-in
-        "flags",              # bit0 = start, bit1 = replace-running, bit2 = layered (rsvd)
-        "position_ms",        # u16 LE; ms into the FX's own timeline (late-join seek)
-        "params",             # tuple of six u8s; FX-specific
+        # TEXT_DISPLAY-specific (Epic 13). Display family has no
+        # target_class on the wire (message type IS the class signal);
+        # `target_group` here is the dedicated display-side group ID.
+        "text_target_group",
+        "text_r", "text_g", "text_b",
+        "ttl_ms",             # u16 LE; 0 = sticky until CLEAR_SCREEN
+        "header",             # decoded str (UTF-8); empty if header_len == 0
+        "body",               # decoded str (UTF-8); empty if body_len == 0
+        # CLEAR_SCREEN-specific (Epic 13)
+        "clear_target_group",
+        "clear_text",         # bool: clear the text surface
+        "clear_bitmap",       # bool: clear the bitmap surface
     )
 
     def __init__(self):
@@ -108,13 +117,21 @@ class Frame:
         self.ttl_seconds = None
         self.pulse_response = None
         self.release_time = None
-        # LIGHT_FX_RUN-specific (Epic 10).
-        self.fx_id = None
-        self.bpm = None
-        self.buildup_s = None
-        self.flags = None
-        self.position_ms = None
-        self.params = None     # tuple of six u8s
+        # TEXT_DISPLAY (Epic 13). Display-family attrs default to None
+        # so a Frame instance representing a non-text message type
+        # doesn't carry stale state. ClearScreen reuses target_group
+        # via its own attr because the two payloads can co-exist at
+        # the receive layer (e.g. when render code peeks).
+        self.text_target_group = None
+        self.text_r = None
+        self.text_g = None
+        self.text_b = None
+        self.ttl_ms = None
+        self.header = None
+        self.body = None
+        self.clear_target_group = None
+        self.clear_text = None
+        self.clear_bitmap = None
 
 
 def parse_frame(buf):
@@ -205,24 +222,60 @@ def parse_frame(buf):
         f.sustain = p[6]
         f.release = p[7]
         f.chance  = p[8]
-    elif f.message_type == MessageType.LIGHT_FX_RUN:
-        # Epic 10 13-byte layout. See Docs/epics/epic-10-fx-library-and-orchestrator.md
+    elif f.message_type == MessageType.TEXT_DISPLAY:
+        # Epic 13 variable-length layout. See protocol manual §3.3.6.
         #
-        #   0   fx_id          1 B   0 = cancel; 1-254 = registered FX
-        #   1   bpm            1 B   0 = receiver default
-        #   2   buildup_s      1 B
-        #   3   flags          1 B   bit0=start, bit1=replace-running, bit2=layered
-        #   4-5 position_lo+hi 2 B   u16 LE; ms into FX timeline
-        #   6-11 params[1..6]  6 B
-        #   12  reserved       1 B
+        #   0   target_group    1 B
+        #   1   r               1 B
+        #   2   g               1 B
+        #   3   b               1 B
+        #   4-5 ttl_ms          2 B   u16 LE; 0 = sticky
+        #   6   header_len      1 B   0..64
+        #   7   header_bytes    header_len B   UTF-8
+        #   ... body_len        1 B   0..128
+        #   ... body_bytes      body_len B     UTF-8
         p = f.payload
-        f.fx_id       = p[0]
-        f.bpm         = p[1]
-        f.buildup_s   = p[2]
-        f.flags       = p[3]
-        f.position_ms = p[4] | (p[5] << 8)
-        f.params      = (p[6], p[7], p[8], p[9], p[10], p[11])
-        # p[12] is reserved; ignored on receive.
+        if len(p) < TEXT_DISPLAY_MIN_PAYLOAD_LEN:
+            raise FrameError("TEXT_DISPLAY payload too short")
+        f.text_target_group = p[0]
+        f.text_r = p[1]
+        f.text_g = p[2]
+        f.text_b = p[3]
+        f.ttl_ms = p[4] | (p[5] << 8)
+        header_len = p[6]
+        if header_len > TEXT_DISPLAY_MAX_HEADER_LEN:
+            raise FrameError("TEXT_DISPLAY header_len exceeds cap")
+        if len(p) < TEXT_DISPLAY_FIXED_PREFIX + 1 + header_len + 1:
+            raise FrameError("TEXT_DISPLAY payload truncated mid-header")
+        header_end = TEXT_DISPLAY_FIXED_PREFIX + 1 + header_len
+        body_len = p[header_end]
+        if body_len > TEXT_DISPLAY_MAX_BODY_LEN:
+            raise FrameError("TEXT_DISPLAY body_len exceeds cap")
+        if len(p) != header_end + 1 + body_len:
+            raise FrameError("TEXT_DISPLAY trailing bytes mismatch body_len")
+        header_bytes = p[TEXT_DISPLAY_FIXED_PREFIX + 1 : header_end]
+        body_bytes   = p[header_end + 1 : header_end + 1 + body_len]
+        # UTF-8 decode with replacement; a malformed string from a
+        # buggy sender shouldn't take the receiver down. The orchestrator
+        # validates UTF-8 before sending, so this is belt-and-braces.
+        try:
+            f.header = bytes(header_bytes).decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            f.header = ""
+        try:
+            f.body = bytes(body_bytes).decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            f.body = ""
+    elif f.message_type == MessageType.CLEAR_SCREEN:
+        # Epic 13 3-byte layout.
+        #
+        #   0   target_group    1 B
+        #   1   clear_text      1 B   0 = leave, 1 = clear
+        #   2   clear_bitmap    1 B   0 = leave, 1 = clear
+        p = f.payload
+        f.clear_target_group = p[0]
+        f.clear_text   = bool(p[1])
+        f.clear_bitmap = bool(p[2])
 
     return f
 
@@ -583,39 +636,82 @@ def encode_heartbeat(
     ))
 
 
-_LIGHT_FX_RUN_PAYLOAD_LEN = PAYLOAD_LENGTHS[MessageType.LIGHT_FX_RUN]
+_CLEAR_SCREEN_PAYLOAD_LEN = PAYLOAD_LENGTHS[MessageType.CLEAR_SCREEN]
 
 
-def encode_light_fx_run(
+def encode_text_display(
     source_id,
     sequence_number,
-    fx_id,
-    bpm=0,
-    buildup_s=0,
-    flags=0x01,            # default = bit0 (start fresh) only
-    position_ms=0,
-    params=(0, 0, 0, 0, 0, 0),
+    target_group,
+    r,
+    g,
+    b,
+    ttl_ms,
+    header,
+    body,
     hop_count=0,
 ):
-    """Build the wire bytes for a LIGHT_FX_RUN frame (Epic 10).
+    """Build the wire bytes for a TEXT_DISPLAY frame (Epic 13).
 
-    8-byte header + 13-byte payload:
-        fx_id        u8
-        bpm          u8
-        buildup_s    u8
-        flags        u8
-        position     u16 LE
-        param 1-6    6 x u8
-        reserved     u8 (zero on send)
-
-    ``params`` may be any iterable of six ints; values >255 are masked.
-    ``flags`` defaults to FX_FLAG_START (the common case: replace any
-    running FX with this one).
+    8-byte header + variable-length payload (TEXT_DISPLAY_MIN_PAYLOAD_LEN
+    when both strings empty, up to ~200 bytes with the maxima). Strings
+    are encoded UTF-8 and length-checked against the wire caps.
     """
-    p = tuple(params)
-    if len(p) != 6:
-        raise FrameError("LIGHT_FX_RUN params must be 6 elements")
-    pos = position_ms & 0xFFFF
+    if isinstance(header, str):
+        header_bytes = header.encode("utf-8")
+    else:
+        header_bytes = bytes(header)
+    if isinstance(body, str):
+        body_bytes = body.encode("utf-8")
+    else:
+        body_bytes = bytes(body)
+    if len(header_bytes) > TEXT_DISPLAY_MAX_HEADER_LEN:
+        raise FrameError("TEXT_DISPLAY header exceeds cap")
+    if len(body_bytes) > TEXT_DISPLAY_MAX_BODY_LEN:
+        raise FrameError("TEXT_DISPLAY body exceeds cap")
+    payload_len = TEXT_DISPLAY_FIXED_PREFIX + 1 + len(header_bytes) + 1 + len(body_bytes)
+    if payload_len > 255:
+        raise FrameError("TEXT_DISPLAY payload overflows u8 payload_len")
+    ttl = ttl_ms & 0xFFFF
+    out = bytearray()
+    out.extend((
+        MAGIC_0,
+        MAGIC_1,
+        PROTOCOL_VERSION,
+        source_id & 0xFF,
+        sequence_number & 0xFF,
+        hop_count & 0xFF,
+        MessageType.TEXT_DISPLAY,
+        payload_len & 0xFF,
+        target_group & 0xFF,
+        r & 0xFF,
+        g & 0xFF,
+        b & 0xFF,
+        ttl & 0xFF,
+        (ttl >> 8) & 0xFF,
+        len(header_bytes) & 0xFF,
+    ))
+    out.extend(header_bytes)
+    out.append(len(body_bytes) & 0xFF)
+    out.extend(body_bytes)
+    return bytes(out)
+
+
+def encode_clear_screen(
+    source_id,
+    sequence_number,
+    target_group,
+    clear_text=True,
+    clear_bitmap=True,
+    hop_count=0,
+):
+    """Build the wire bytes for a CLEAR_SCREEN frame (Epic 13).
+
+    8-byte header + 3-byte payload (target_group, clear_text flag,
+    clear_bitmap flag). The two flags are independent so the orchestrator
+    can clear just the text layer (e.g. lyric off-screen between verses)
+    without disturbing a sticky bitmap, and vice versa.
+    """
     return bytes((
         MAGIC_0,
         MAGIC_1,
@@ -623,53 +719,9 @@ def encode_light_fx_run(
         source_id & 0xFF,
         sequence_number & 0xFF,
         hop_count & 0xFF,
-        MessageType.LIGHT_FX_RUN,
-        _LIGHT_FX_RUN_PAYLOAD_LEN,
-        fx_id & 0xFF,
-        bpm & 0xFF,
-        buildup_s & 0xFF,
-        flags & 0xFF,
-        pos & 0xFF,
-        (pos >> 8) & 0xFF,
-        p[0] & 0xFF,
-        p[1] & 0xFF,
-        p[2] & 0xFF,
-        p[3] & 0xFF,
-        p[4] & 0xFF,
-        p[5] & 0xFF,
-        0,   # reserved
+        MessageType.CLEAR_SCREEN,
+        _CLEAR_SCREEN_PAYLOAD_LEN,
+        target_group & 0xFF,
+        1 if clear_text else 0,
+        1 if clear_bitmap else 0,
     ))
-
-
-def make_light_fx_run_frame(
-    fx_id,
-    bpm=0,
-    buildup_s=0,
-    flags=0x01,
-    position_ms=0,
-    params=(0, 0, 0, 0, 0, 0),
-    source_id=0,
-    sequence_number=0,
-    hop_count=0,
-):
-    """Build a Frame populated as a LIGHT_FX_RUN (zero-copy alternative
-    to encode + parse_frame). Useful for the dispatcher's local
-    loopback path on the Director side."""
-    p = tuple(params)
-    if len(p) != 6:
-        raise FrameError("LIGHT_FX_RUN params must be 6 elements")
-    f = Frame()
-    f.protocol_version = PROTOCOL_VERSION
-    f.source_id        = source_id & 0xFF
-    f.sequence_number  = sequence_number & 0xFF
-    f.hop_count        = hop_count & 0xFF
-    f.message_type     = MessageType.LIGHT_FX_RUN
-    f.payload_len      = _LIGHT_FX_RUN_PAYLOAD_LEN
-    f.payload          = None
-    f.fx_id       = fx_id & 0xFF
-    f.bpm         = bpm & 0xFF
-    f.buildup_s   = buildup_s & 0xFF
-    f.flags       = flags & 0xFF
-    f.position_ms = position_ms & 0xFFFF
-    f.params      = tuple(x & 0xFF for x in p)
-    return f

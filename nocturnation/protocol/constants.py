@@ -20,19 +20,24 @@ from ._generated import (
     PAYLOAD_LENGTHS,
 )
 
-# Flag bits inside LIGHT_FX_RUN.flags (byte 3 of the payload).
-# Stable wire surface; defined here rather than in _generated.py because
-# they are receiver-side interpretation rules, not source-of-truth wire
-# numerics.
-FX_FLAG_START           = 0x01   # bit0: start fresh (cancel any running FX)
-FX_FLAG_REPLACE_RUNNING = 0x02   # bit1: replace running, even if same fx_id
-FX_FLAG_LAYERED         = 0x04   # bit2: reserved - layered FX (future)
-
-# ESP-NOW supports up to 250-byte payloads; NocturNation caps frames at 32
-# (the largest active payload is LIGHT_WASH at 16 bytes, so 32 leaves
-# room for future message types without burning radio time on padding).
-MAX_FRAME_SIZE = 32
+# ESP-NOW supports up to 250-byte payloads; Epic 13 raised the
+# NocturNation cap from 32 to 250 to fit the new display family.
+# TEXT_DISPLAY's max payload is 200 bytes (6 prefix + 1 + 64 header
+# + 1 + 128 body); BITMAP_PLANE chunks can push close to the radio
+# ceiling. LIGHT_PULSE / LIGHT_WASH frames remain well under 32 so
+# the bump costs nothing on their airtime - the ceiling only matters
+# for what the parser will accept.
+MAX_FRAME_SIZE = 250
 MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE - HEADER_SIZE
+
+# Epic 13 TEXT_DISPLAY wire constants. Validated by parse_frame on
+# receive; kept here rather than in _generated.py because the string-
+# encoding rules are receiver-side interpretation and don't appear in
+# the auto-generated YAML.
+TEXT_DISPLAY_MAX_HEADER_LEN  = 64
+TEXT_DISPLAY_MAX_BODY_LEN    = 128
+TEXT_DISPLAY_FIXED_PREFIX    = 6   # target_group + r + g + b + ttl_ms(2 LE)
+TEXT_DISPLAY_MIN_PAYLOAD_LEN = TEXT_DISPLAY_FIXED_PREFIX + 1 + 1  # both strings empty
 
 
 class DeviceClass:
@@ -40,7 +45,12 @@ class DeviceClass:
     LIGHT = 0x01            # PixMob bracelets, LED wristbands
     SCREEN = 0x02           # Stick LCD
     MULTI_LED_SCREEN = 0x03  # Tildagon (this device)
-    # 0x04..0xFF reserved
+    DISPLAY = 0x04           # Epic 13 - text/bitmap surface (Stick LCD,
+                             # Tildagon round LCD). Routing for the
+                             # display family is by message type rather
+                             # than target_class, but the enum value is
+                             # kept here for parity with the C++ side.
+    # 0x05..0xFF reserved
 
 
 # PixMob Time enum values; the LIGHT_PULSE attack/sustain/release bytes

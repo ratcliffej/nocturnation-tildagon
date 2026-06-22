@@ -38,8 +38,16 @@ LED_MAX_INDEX = 12
 LED_COUNT = LED_MAX_INDEX - LED_MIN_INDEX + 1
 
 # Frequency caps: minimum milliseconds between accepted dispatch calls.
-CALM_MIN_INTERVAL_MS = 500   # 2 Hz
-FULL_MIN_INTERVAL_MS = 250   # 4 Hz
+# Calm mode keeps the 500 ms (2 Hz) Harding-safe floor for badges worn
+# by non-consenting audience. Full mode was 250 ms (4 Hz) but that
+# silently dropped every other sparkle at 140 BPM (sparkle_on_beat at
+# 7 Hz = 143 ms gap); raised to 60 ms (~16 Hz) so per-beat sparkles
+# land through 200+ BPM and sub-beat sparkles still fit. The operator
+# opts into Full mode knowing it's bright; the cap exists only to
+# protect against pathological back-to-back dispatches, not to throttle
+# legitimate music tempo.
+CALM_MIN_INTERVAL_MS = 500   # 2 Hz - Harding-safe for audience badges
+FULL_MIN_INTERVAL_MS = 60    # ~16 Hz - covers per-beat sparkles to 200+ BPM
 
 # Peak brightness multiplier applied per Calm Mode.
 CALM_BRIGHTNESS_CAP = 0.5

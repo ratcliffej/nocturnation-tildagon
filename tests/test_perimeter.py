@@ -112,20 +112,23 @@ class TestFrequencyCap:
         r.dispatch(FakeFrame(), now_ms=0)
         assert r.dispatch(FakeFrame(), now_ms=500) == LED_COUNT  # allowed
 
-    def test_full_mode_cap_250ms(self):
+    def test_full_mode_cap_60ms(self):
+        """Full-mode cap was 250 ms (4 Hz) and silently dropped every
+        other sparkle at 140 BPM tempo. Bumped to 60 ms (~16 Hz) so
+        per-beat sparkles land through 200+ BPM."""
         r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
         r.dispatch(FakeFrame(), now_ms=0)
-        assert r.dispatch(FakeFrame(), now_ms=249) == 0       # blocked
-        assert r.dispatch(FakeFrame(), now_ms=250) == LED_COUNT  # allowed
+        assert r.dispatch(FakeFrame(), now_ms=FULL_MIN_INTERVAL_MS - 1) == 0       # blocked
+        assert r.dispatch(FakeFrame(), now_ms=FULL_MIN_INTERVAL_MS) == LED_COUNT  # allowed
 
     def test_set_calm_mode_switches_cap(self):
         r = PerimeterRenderer(rng=always_pass_rng, calm_mode=True)
         assert CALM_MIN_INTERVAL_MS == 500
         r.set_calm_mode(False)
-        assert FULL_MIN_INTERVAL_MS == 250
+        assert FULL_MIN_INTERVAL_MS == 60
         # First dispatch is always allowed after the switch (re-init of state).
         r.dispatch(FakeFrame(), now_ms=0)
-        assert r.dispatch(FakeFrame(), now_ms=250) == LED_COUNT
+        assert r.dispatch(FakeFrame(), now_ms=FULL_MIN_INTERVAL_MS) == LED_COUNT
 
 
 class TestEnvelope:
@@ -265,9 +268,9 @@ class TestAdrCrossfade:
         r.tick(now_ms=10, set_led=set_led1)
         assert cap1[0][1] == 200  # red at full
 
-        # Now arm a second pulse to blue with a 96ms attack (rate-limit
-        # is 250ms but Full mode allows back-to-back beyond that; the
-        # frequency cap is bypassed by advancing now).
+        # Now arm a second pulse to blue with a 96ms attack (frequency
+        # cap is bypassed by advancing now well beyond the Full-mode
+        # FULL_MIN_INTERVAL_MS interval).
         r.dispatch(
             FakeFrame(r=0, g=0, b=200,
                       attack=Time.T_96_MS, sustain=Time.T_0_MS, release=Time.T_0_MS),

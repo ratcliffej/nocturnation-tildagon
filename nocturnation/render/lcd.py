@@ -41,9 +41,10 @@ FULL_BRIGHTNESS_CAP = 0.6
 
 # Frequency cap: minimum milliseconds between accepted PULSE dispatches
 # when the renderer is enabled (Full mode). Matches the perimeter
-# renderer's Full-mode interval so both surfaces respect the same 4 Hz
-# upper bound.
-LCD_MIN_INTERVAL_MS = 250
+# renderer's Full-mode interval (~16 Hz) so both surfaces accept per-
+# beat sparkles up to 200+ BPM. Was 250 ms (4 Hz), which silently
+# dropped every other sparkle at 140 BPM sparkle_on_beat tempo.
+LCD_MIN_INTERVAL_MS = 60
 
 # Lost-WASH_END failsafe (not a protocol change). A LIGHT_WASH with
 # ttl_seconds == 0 is "infinite" per the spec: it holds until an

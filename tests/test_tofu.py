@@ -294,3 +294,82 @@ class TestFormatLockLabel:
         # but the label surface stays informative if it does.
         assert format_lock_label(11, scanner_locked=True,
                                  tofu_locked_id=0xFF) == "ch 11 ?:FF"
+
+
+# =============================================================================
+# Display-family broadcast admission (Epic 13)
+# =============================================================================
+
+class TestDisplayFamilyBroadcast:
+    """The orchestrator emits TEXT_DISPLAY / CLEAR_SCREEN / BITMAP_*
+    with source_id=0xFF (it isn't a Director, just an upstream sender
+    bridged through the Director's passthrough). A locked Lume must
+    accept these as content from its in-session Director's data
+    stream, without taking them as a lock candidate or resetting the
+    liveness timer."""
+
+    def test_text_display_broadcast_dropped_when_not_locked(self):
+        """No lock yet -> reject. Display content shouldn't drive
+        lock establishment - it doesn't identify a Director."""
+        t = TofuLock()
+        f = make_frame(source_id=0xFF, message_type=MessageType.TEXT_DISPLAY)
+        assert t.admit(f, channel=1, now_ms=0) is False
+        assert t.is_locked() is False
+
+    def test_text_display_broadcast_admitted_when_locked(self):
+        """Lock held -> admit the broadcast display frame."""
+        t = TofuLock()
+        # Establish lock via a real Director frame.
+        t.admit(make_frame(source_id=0x42), channel=1, now_ms=100)
+        # Display broadcast: admitted.
+        f = make_frame(source_id=0xFF, message_type=MessageType.TEXT_DISPLAY)
+        assert t.admit(f, channel=1, now_ms=200) is True
+        # And the lock still names the Director, not 0xFF.
+        assert t.locked_id == 0x42
+
+    def test_clear_screen_broadcast_admitted_when_locked(self):
+        t = TofuLock()
+        t.admit(make_frame(source_id=0x42), channel=1, now_ms=100)
+        f = make_frame(source_id=0xFF, message_type=MessageType.CLEAR_SCREEN)
+        assert t.admit(f, channel=1, now_ms=200) is True
+
+    def test_bitmap_header_and_plane_broadcasts_admitted_when_locked(self):
+        t = TofuLock()
+        t.admit(make_frame(source_id=0x42), channel=1, now_ms=100)
+        assert t.admit(
+            make_frame(source_id=0xFF, message_type=MessageType.BITMAP_HEADER),
+            channel=1, now_ms=200,
+        ) is True
+        assert t.admit(
+            make_frame(source_id=0xFF, message_type=MessageType.BITMAP_PLANE),
+            channel=1, now_ms=201,
+        ) is True
+
+    def test_display_broadcast_does_not_reset_liveness_timer(self):
+        """Liveness is the LOCKED Director's responsibility (heartbeat
+        / wash / pulse). An orchestrator-bridged display frame must
+        not extend the lock - otherwise a Director that's gone silent
+        could appear alive simply because the orchestrator is still
+        emitting cues."""
+        t = TofuLock(timeout_ms=1000)
+        t.admit(make_frame(source_id=0x42), channel=1, now_ms=0)
+        # Display broadcast at t=500: admitted, but mustn't bump the
+        # last-frame-from-lock timestamp.
+        t.admit(
+            make_frame(source_id=0xFF, message_type=MessageType.TEXT_DISPLAY),
+            channel=1, now_ms=500,
+        )
+        # tick at t=1100 (1100 ms after the original Director frame):
+        # past the 1000 ms timeout -> lock expires.
+        expired = t.tick(now_ms=1100)
+        assert expired is True
+        assert t.is_locked() is False
+
+    def test_non_display_broadcast_still_rejected_when_locked(self):
+        """LIGHT_PULSE from source_id 0xFF is misconfigured anonymous
+        traffic - reject even when a lock is held. The Epic 13 carve-
+        out applies ONLY to the display family."""
+        t = TofuLock()
+        t.admit(make_frame(source_id=0x42), channel=1, now_ms=100)
+        f = make_frame(source_id=0xFF, message_type=MessageType.LIGHT_PULSE)
+        assert t.admit(f, channel=1, now_ms=200) is False

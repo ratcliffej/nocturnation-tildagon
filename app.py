@@ -129,6 +129,7 @@ from .nocturnation.protocol import DedupRing, MessageType
 from .nocturnation.receive import process_frame
 from .nocturnation.render import (
     LcdRenderer,
+    LumeTextRenderer,
     PerimeterRenderer,
     CtxDisplay,
     PERIMETER_CLASSES,
@@ -167,7 +168,18 @@ _DEBUG = False
 
 # Director mode transmits on the hobby channel only (Epic 5.5: the
 # Tildagon must not broadcast on the channel-11 Performance band).
+# Channel 11 is reserved for commercial / show Directors with random-
+# per-boot Performance-range source IDs (Epic 5.5 §3.4). A swarm of
+# Tildagons at EMF transmitting on ch 11 would compete with the
+# orchestrator's StickC Director and drown out cue traffic.
 DIRECTOR_CHANNEL = 1
+
+# Channels a Tildagon is FORBIDDEN to broadcast Director on. The
+# constant above is the only authorised channel today, but this
+# explicit blocklist gives us a hard runtime gate that catches any
+# accidental change to DIRECTOR_CHANNEL (future bug, fork divergence,
+# settings-file injection) before the radio is brought up.
+DIRECTOR_FORBIDDEN_TX_CHANNELS = frozenset((11,))
 
 # Director's source_id. A fixed community-range id (0x00-0x3F) is fine
 # for the hobby channel; the Epic 5.5 random-per-boot allocation is a
@@ -212,6 +224,12 @@ class NocturNationApp(app.App):
         # LCD pulse renderer. Calm Mode disables the LCD wash entirely
         # per architecture spec section 15.3.
         self._lcd_renderer = LcdRenderer(calm_mode=self._settings.calm_mode)
+        # Epic 13: LCD text renderer. Layers TEXT_DISPLAY content (header
+        # + body) on top of the wash background. Independent of the
+        # pulse/wash state machine - operator-paced display content,
+        # not music-paced visuals. Lifecycle is event-driven (no calm-
+        # mode gate; lyric content is the point of declaring DisplayText).
+        self._lume_text_renderer = LumeTextRenderer()
         # In-app settings menu state.
         self._settings_open = False
         self._settings_menu = None
@@ -309,6 +327,7 @@ class NocturNationApp(app.App):
         self._is_foreground = True
         self._inhibit_patterns()
         self._lcd_renderer.clear()
+        self._lume_text_renderer.clear()
         print("[nocturnation] foreground push - LCD wash resumed")
 
     def _on_foreground_pop(self, event) -> None:
@@ -505,6 +524,7 @@ class NocturNationApp(app.App):
         self._mode = "idle"
         self._renderer.clear()
         self._lcd_renderer.clear()
+        self._lume_text_renderer.clear()
         self._dark_perimeter()
         self._open_idle_menu()
         print("[nocturnation] stopped to idle")
@@ -595,6 +615,7 @@ class NocturNationApp(app.App):
         self._settings_open = True
         self._renderer.clear()
         self._lcd_renderer.clear()
+        self._lume_text_renderer.clear()
         self._dark_perimeter()
         self._settings_menu = Menu(
             self,
@@ -768,6 +789,32 @@ class NocturNationApp(app.App):
         # quiet so the badge stays comfortable face-distance).
         bg_r, bg_g, bg_b = self._lcd_background_rgb01()
         ctx.rgb(bg_r, bg_g, bg_b).rectangle(-120, -120, 240, 240).fill()
+
+        # Epic 13: once we've locked to a Director, the Lume LCD is
+        # a content surface (mirrors the StickC's "LCD is content in
+        # Lume" role per project memory). Suppress the diagnostic
+        # HUD - brand mark / channel / frame count would be noise
+        # against operator-paced text content, and the gaps between
+        # explicit text cues (e.g. between lyric lines, or before the
+        # @ShowSongInfo card fires) shouldn't surface the HUD either.
+        # The wash background is the only visual during those gaps.
+        # NO SIGNAL still surfaces as a small footer because radio
+        # liveness matters even when a lyric is on the screen.
+        # The HUD remains shown when scanning / unlocked so the
+        # operator can confirm the badge is hunting for a Director.
+        if self._tofu.is_locked():
+            now_ms_local = time.ticks_ms() if time is not None else 0
+            if self._lume_text_renderer.has_content():
+                self._display.set_ctx(ctx)
+                self._lume_text_renderer.paint(self._display, now_ms_local)
+            if time is not None and self._signal_tracker.is_lost(now_ms_local):
+                ctx.rgb(0.6, 0.1, 0.1)
+                ctx.text_align = ctx.CENTER
+                ctx.text_baseline = ctx.MIDDLE
+                ctx.font_size = 12
+                ctx.move_to(0, 95).text("NO SIGNAL")
+            return
+
         ctx.rgb(1, 1, 1)
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
@@ -1071,6 +1118,25 @@ class NocturNationApp(app.App):
         self._ensure_director()
         if self._controller is None or not self._controller.show_ids():
             print("[nocturnation] no Director shows available; back to idle")
+            self._stop_to_idle()
+            return
+
+        # Hard guard: a Tildagon must never broadcast as Director on a
+        # forbidden channel (channel 11 is the commercial / show band,
+        # reserved for Performance-range Directors with random-per-boot
+        # source IDs - a Tildagon swarm transmitting there at EMF would
+        # compete with the orchestrator's StickC Director). Today
+        # DIRECTOR_CHANNEL is hardcoded to 1 so this gate is belt-and-
+        # braces; if the constant ever drifts to 11 (settings injection,
+        # fork divergence, future bug), we refuse to acquire the radio
+        # and return to idle. Logged so it's visible at the console.
+        if DIRECTOR_CHANNEL in DIRECTOR_FORBIDDEN_TX_CHANNELS:
+            print(
+                "[nocturnation] director TX refused on forbidden channel %d "
+                "(reserved for commercial Directors); back to idle"
+                % DIRECTOR_CHANNEL
+            )
+            self._status = "ch %d off-limits" % DIRECTOR_CHANNEL
             self._stop_to_idle()
             return
 
@@ -1512,12 +1578,35 @@ class NocturNationApp(app.App):
 
         # HEARTBEAT and unknown / reserved-id frames just bump the frame
         # counter without further per-surface dispatch. LIGHT_PULSE plus
-        # the LIGHT_WASH family (Epic 6C Phase G) are the routed types.
+        # the LIGHT_WASH family (Epic 6C Phase G) are the routed types;
+        # Epic 13 adds TEXT_DISPLAY + CLEAR_SCREEN for display content.
         mt = frame.message_type
         if mt not in (MessageType.LIGHT_PULSE,
                        MessageType.LIGHT_WASH,
                        MessageType.LIGHT_WASH_END,
-                       MessageType.LIGHT_WASH_PULSE):
+                       MessageType.LIGHT_WASH_PULSE,
+                       MessageType.TEXT_DISPLAY,
+                       MessageType.CLEAR_SCREEN):
+            return
+
+        # Epic 13 display family carries its own target_group on the
+        # payload rather than reusing the wash-family field. Apply the
+        # group filter against the right attribute and dispatch directly
+        # to the text renderer - no target_class routing (the message
+        # type IS the class signal). Done here before the wash-family
+        # target_class lookup so we don't accidentally fall through
+        # to a missing-class branch.
+        if mt == MessageType.TEXT_DISPLAY:
+            if frame.text_target_group != 0 \
+               and frame.text_target_group != self._settings.group:
+                return
+            self._lume_text_renderer.on_text_display(frame, now_ms)
+            return
+        if mt == MessageType.CLEAR_SCREEN:
+            if frame.clear_target_group != 0 \
+               and frame.clear_target_group != self._settings.group:
+                return
+            self._lume_text_renderer.on_clear_screen(frame, now_ms)
             return
 
         # Group filter per protocol manual section 4.2: target_group == 0

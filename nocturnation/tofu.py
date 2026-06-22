@@ -32,6 +32,22 @@ from .protocol.source_id import SourceId, is_community_range, is_performance_ran
 DEFAULT_TIMEOUT_MS = 10000   # mirrors the M5 firmware's kRescanMs
 
 
+# Epic 13 display family. The orchestrator emits these with
+# source_id = BROADCAST (it isn't a Director, just an upstream sender
+# whose bytes get bridged through the Director Stick's passthrough). A
+# TOFU-locked Lume should accept them as content from the in-session
+# Director's data stream WITHOUT taking them as a lock candidate -
+# they don't identify a Director and they shouldn't reset the lock's
+# liveness timer (heartbeat / wash / pulse from the actual locked
+# source remain the only liveness signal).
+_DISPLAY_FAMILY_TYPES = frozenset((
+    MessageType.TEXT_DISPLAY,
+    MessageType.BITMAP_HEADER,
+    MessageType.BITMAP_PLANE,
+    MessageType.CLEAR_SCREEN,
+))
+
+
 class TofuLock:
     """TOFU state for a single Lume instance.
 
@@ -72,10 +88,23 @@ class TofuLock:
         * Updates the "last frame from locked source" timestamp on
           every admitted frame, deferring the timeout expiry.
         """
+        # Epic 13: display-family frames from the broadcast source_id
+        # are upstream-orchestrator content bridged through the locked
+        # Director's passthrough. Admit them once a Director session
+        # exists (lock held) without taking them as a lock candidate
+        # or resetting the liveness timer - those remain the locked
+        # Director's responsibility via heartbeat / wash / pulse.
+        if (frame.source_id == SourceId.BROADCAST
+                and frame.message_type in _DISPLAY_FAMILY_TYPES
+                and self._locked_id is not None):
+            return True
+
         # Broadcast / wildcard source_id is never a valid Director peer.
         # (A Director never emits 0xFF as its own id; broadcast is for
         # senders that intentionally identify as anonymous, which a
-        # Lume MUST NOT lock to.)
+        # Lume MUST NOT lock to.) Display-family broadcasts were
+        # already handled above; this gate now applies to wash / pulse
+        # / heartbeat from a misconfigured anonymous sender.
         if frame.source_id == SourceId.BROADCAST:
             return False
 
