@@ -126,6 +126,9 @@ except ImportError:
 from .nocturnation.channel_scan import ChannelScanner
 from .nocturnation.clock import ticks_diff
 from .nocturnation.protocol import DedupRing, MessageType
+from .nocturnation.protocol.frame import (
+    make_light_wash_frame, make_light_wash_end_frame,
+)
 from .nocturnation.receive import process_frame
 from .nocturnation.render import (
     LcdRenderer,
@@ -185,6 +188,33 @@ DIRECTOR_FORBIDDEN_TX_CHANNELS = frozenset((11,))
 # for the hobby channel; the Epic 5.5 random-per-boot allocation is a
 # channel-11 concern and the Tildagon never transmits there.
 DIRECTOR_SOURCE_ID = 0x20
+
+# Signal-loss fallback wash (EMF prep). Same timings as the StickC
+# LumeMode constants so the fleet converges on the same idle effect
+# at the same moment:
+#
+#   3 s   silence -> NO SIGNAL diagnostic text (SignalTracker.is_lost)
+#  10 s   silence -> synthesised LIGHT_WASH (blue<->purple ping-pong)
+#                    with attack=FALLBACK_ATTACK_TICKS, intensity=
+#                    FALLBACK_INTENSITY, cycle_ms=FALLBACK_CYCLE_PERIOD_MS
+#  40 s   silence -> synthesised LIGHT_WASH_END (release_time=
+#                    FALLBACK_FADE_TICKS in 100 ms units) starts the
+#                    fade-to-black. release_time is u8 (~25.5 s cap)
+#                    so the "30 s fade" the operator asked for is
+#                    served by the maximum the wash state machine
+#                    accepts - functionally equivalent to the eye.
+# Any inbound frame cancels the fallback with a short-release END so
+# the Director's returning wash/pulse traffic isn't fighting the
+# synthetic baseline.
+FALLBACK_ENTER_MS         = 10000
+FALLBACK_FADE_START_MS    = 40000
+FALLBACK_CYCLE_PERIOD_MS  = 10000
+FALLBACK_ATTACK_TICKS     = 30    # 100 ms units = 3 s
+FALLBACK_FADE_TICKS       = 255   # 100 ms units, ~25.5 s
+FALLBACK_INTENSITY        = 60    # 0..255; ~24 % brightness
+FALLBACK_RECOVERY_TICKS   = 5     # 100 ms units = 500 ms
+FALLBACK_COLOUR_A         = (20, 0, 80)    # dark violet
+FALLBACK_COLOUR_B         = (0, 20, 80)    # dark navy
 
 
 class NocturNationApp(app.App):
@@ -272,6 +302,16 @@ class NocturNationApp(app.App):
         # frame; the draw loop overlays NO SIGNAL when the gap exceeds
         # 3 s per protocol manual section 6.2.
         self._signal_tracker = SignalTracker()
+        # Signal-loss fallback wash (EMF prep). After kFallbackEnterMs
+        # of silence we synthesise a LIGHT_WASH locally (blue<->purple
+        # cycle, muted intensity) and feed it to the renderers via the
+        # same on_light_wash path real frames take; after a further
+        # kFallbackFadeStartMs we emit a synthetic LIGHT_WASH_END to
+        # fade to black. Any inbound frame cancels the fallback with
+        # a short-release END. _fallback_last_check_ms suppresses
+        # repeated emission while in the same state.
+        self._fallback_active = False
+        self._fallback_faded  = False
         # Epic 5.5 B6: Trust-On-First-Use lock on Director source_id.
         # Locks to the first valid frame from a non-broadcast source
         # after construction or clear(); subsequent frames from other
@@ -525,6 +565,8 @@ class NocturNationApp(app.App):
         self._renderer.clear()
         self._lcd_renderer.clear()
         self._lume_text_renderer.clear()
+        self._fallback_active = False
+        self._fallback_faded  = False
         self._dark_perimeter()
         self._open_idle_menu()
         print("[nocturnation] stopped to idle")
@@ -1538,6 +1580,12 @@ class NocturNationApp(app.App):
             # Director and treat the next frame as a fresh lock".
             if time is not None and self._tofu.tick(time.ticks_ms()):
                 print("[nocturnation] TOFU lock expired; ready to relock")
+            # Signal-loss fallback transitions. Evaluated every poll
+            # tick so the 10 s / 40 s edges fire promptly without
+            # waiting for an inbound frame (which is the whole point -
+            # they fire BECAUSE no frames are coming).
+            if time is not None:
+                self._evaluate_fallback(time.ticks_ms())
             # Tick the perimeter at ~20 Hz independent of foreground
             # state. The settings menu, if open, skips this tick (the
             # menu owns the screen visually and our LEDs stay dark).
@@ -1562,6 +1610,66 @@ class NocturNationApp(app.App):
             return None
         return bytes(msg)
 
+    # -- Signal-loss fallback wash ----------------------------------
+
+    def _emit_fallback_wash_start(self, now_ms):
+        """Synthesise the calm blue/purple cycle wash + push it to
+        both perimeter and LCD renderers as if it had arrived from the
+        Director. Local dispatch only - never broadcast."""
+        f = make_light_wash_frame(
+            target_class=0, target_group=0,
+            r1=FALLBACK_COLOUR_A[0], g1=FALLBACK_COLOUR_A[1], b1=FALLBACK_COLOUR_A[2],
+            r2=FALLBACK_COLOUR_B[0], g2=FALLBACK_COLOUR_B[1], b2=FALLBACK_COLOUR_B[2],
+            attack=FALLBACK_ATTACK_TICKS, release=50,
+            intensity=FALLBACK_INTENSITY,
+            cycle_ms=FALLBACK_CYCLE_PERIOD_MS,
+            ttl_seconds=0, pulse_response=0,
+        )
+        self._renderer.on_light_wash(f, now_ms)
+        self._lcd_renderer.on_light_wash(f, now_ms)
+        print("[nocturnation] FALLBACK wash start (blue/purple cycle)")
+
+    def _emit_fallback_wash_fade(self, now_ms):
+        """Begin the ~25.5 s fade-to-black phase of the fallback. u8
+        release_time caps the fade duration at the wash state machine's
+        ceiling; functionally equivalent to the 30 s the operator
+        asked for to the eye."""
+        f = make_light_wash_end_frame(
+            target_class=0, target_group=0,
+            release_time=FALLBACK_FADE_TICKS,
+        )
+        self._renderer.on_light_wash_end(f, now_ms)
+        self._lcd_renderer.on_light_wash_end(f, now_ms)
+        print("[nocturnation] FALLBACK fade-to-black begin")
+
+    def _emit_fallback_wash_recovery(self, now_ms):
+        """Short, sharp fade-out when the Director comes back so the
+        returning wash/pulse traffic isn't competing with the
+        synthetic baseline."""
+        f = make_light_wash_end_frame(
+            target_class=0, target_group=0,
+            release_time=FALLBACK_RECOVERY_TICKS,
+        )
+        self._renderer.on_light_wash_end(f, now_ms)
+        self._lcd_renderer.on_light_wash_end(f, now_ms)
+        print("[nocturnation] FALLBACK wash recovery (signal returned)")
+
+    def _evaluate_fallback(self, now_ms):
+        """Drive the fallback state machine off the SignalTracker's
+        elapsed-since-last-frame value. Called once per receive-loop
+        iteration so the transitions are bench-deterministic regardless
+        of inbound traffic cadence."""
+        if self._signal_tracker._last_frame_ms is None:
+            return   # cold boot, never seen a Director
+        age = ticks_diff(now_ms, self._signal_tracker._last_frame_ms)
+        if not self._fallback_active and age > FALLBACK_ENTER_MS:
+            self._fallback_active = True
+            self._emit_fallback_wash_start(now_ms)
+        if (self._fallback_active and not self._fallback_faded
+                and age > FALLBACK_FADE_START_MS):
+            self._fallback_faded = True
+            self._emit_fallback_wash_fade(now_ms)
+
     def _observe_frame(self, frame) -> None:
         self._frame_count += 1
         self._last_frame = frame
@@ -1569,7 +1677,15 @@ class NocturNationApp(app.App):
         # NO SIGNAL detector, regardless of message type. Heartbeats
         # are just as good as LIGHT_PULSEs here.
         if time is not None:
-            self._signal_tracker.record_frame(time.ticks_ms())
+            now_ms_record = time.ticks_ms()
+            self._signal_tracker.record_frame(now_ms_record)
+            # Cancel any fallback wash that was running. Short-release
+            # END fades the synthetic baseline out before the Director's
+            # returning traffic starts to compete with it.
+            if self._fallback_active:
+                self._fallback_active = False
+                self._fallback_faded  = False
+                self._emit_fallback_wash_recovery(now_ms_record)
 
         if time is None:
             return
