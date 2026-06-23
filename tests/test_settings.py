@@ -122,11 +122,46 @@ class TestPersistence:
         finally:
             os.unlink(path)
 
-    def test_load_missing_file_returns_defaults(self):
-        loaded = Settings.load("/tmp/does-not-exist-nocturnation.json")
-        assert loaded == Settings()
+    def test_load_missing_file_assigns_random_group_in_range(self):
+        # EMF stage-team feature: first install gets a random group in
+        # [1, 3]. Use a unique path so this test doesn't trip over the
+        # persisted file from a previous run.
+        path = "/tmp/test-noct-first-install-%d.json" % os.getpid()
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+            loaded = Settings.load(path)
+            # Group is randomised into [1, 3] inclusive.
+            assert 1 <= loaded.group <= 3
+            # Other fields are still default.
+            assert loaded.calm_mode is True
+            assert loaded.channel == "auto"
+            assert loaded.mode == "lume"
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
 
-    def test_load_corrupt_json_returns_defaults(self):
+    def test_load_missing_file_persists_random_group(self):
+        # After a first-install random pick, the next load() must
+        # return the SAME group (persisted to disk); otherwise the
+        # group would reshuffle every boot.
+        path = "/tmp/test-noct-first-install-persist-%d.json" % os.getpid()
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+            first = Settings.load(path)
+            assert 1 <= first.group <= 3
+            assert os.path.exists(path), "first-install Settings.load should write the file"
+            # Re-load and confirm stability.
+            second = Settings.load(path)
+            assert second.group == first.group
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_load_corrupt_json_assigns_random_group(self):
+        # Corrupt file is treated as first install (the operator's
+        # recourse is to re-set the group via the in-app menu).
         with tempfile.NamedTemporaryFile(
             mode="w", delete=False, suffix=".json"
         ) as f:
@@ -134,7 +169,7 @@ class TestPersistence:
             path = f.name
         try:
             loaded = Settings.load(path)
-            assert loaded == Settings()
+            assert 1 <= loaded.group <= 3
         finally:
             os.unlink(path)
 
