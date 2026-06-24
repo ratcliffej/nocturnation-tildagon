@@ -25,27 +25,20 @@ current channel. Unit-tested host-side; runs unchanged on the badge.
 """
 
 from .clock import ticks_diff
-from .protocol import MessageType
 from .protocol.source_id import SourceId, is_community_range, is_performance_range
 
 
 DEFAULT_TIMEOUT_MS = 10000   # mirrors the M5 firmware's kRescanMs
 
-
-# Epic 13 display family. The orchestrator emits these with
-# source_id = BROADCAST (it isn't a Director, just an upstream sender
-# whose bytes get bridged through the Director Stick's passthrough). A
-# TOFU-locked Lume should accept them as content from the in-session
-# Director's data stream WITHOUT taking them as a lock candidate -
-# they don't identify a Director and they shouldn't reset the lock's
-# liveness timer (heartbeat / wash / pulse from the actual locked
-# source remain the only liveness signal).
-_DISPLAY_FAMILY_TYPES = frozenset((
-    MessageType.TEXT_DISPLAY,
-    MessageType.BITMAP_HEADER,
-    MessageType.BITMAP_PLANE,
-    MessageType.CLEAR_SCREEN,
-))
+# Display-family carve-out removed 2026-06-24 (EMF multi-show phase 3):
+# the Director Stick's bridge passthrough now re-stamps display frames
+# (TEXT_DISPLAY / BITMAP_HEADER / BITMAP_PLANE / CLEAR_SCREEN) with the
+# Director's own source_id before broadcasting, so they arrive
+# identified and pass through the same source-match gate as wash /
+# pulse / heartbeat. The old "admit BROADCAST display family when
+# locked" path would have admitted display frames from ALL Directors
+# at a multi-show venue instead of just the locked one - the
+# partitioning bug this phase fixes.
 
 
 class TofuLock:
@@ -88,23 +81,14 @@ class TofuLock:
         * Updates the "last frame from locked source" timestamp on
           every admitted frame, deferring the timeout expiry.
         """
-        # Epic 13: display-family frames from the broadcast source_id
-        # are upstream-orchestrator content bridged through the locked
-        # Director's passthrough. Admit them once a Director session
-        # exists (lock held) without taking them as a lock candidate
-        # or resetting the liveness timer - those remain the locked
-        # Director's responsibility via heartbeat / wash / pulse.
-        if (frame.source_id == SourceId.BROADCAST
-                and frame.message_type in _DISPLAY_FAMILY_TYPES
-                and self._locked_id is not None):
-            return True
-
         # Broadcast / wildcard source_id is never a valid Director peer.
-        # (A Director never emits 0xFF as its own id; broadcast is for
+        # A Director never emits 0xFF as its own id; broadcast is for
         # senders that intentionally identify as anonymous, which a
-        # Lume MUST NOT lock to.) Display-family broadcasts were
-        # already handled above; this gate now applies to wash / pulse
-        # / heartbeat from a misconfigured anonymous sender.
+        # Lume MUST NOT lock to. The Director's bridge re-stamps
+        # display frames with its own source_id before broadcasting
+        # (EMF multi-show phase 3) so display traffic now arrives
+        # identified and goes through the same source-match gate as
+        # wash / pulse / heartbeat below.
         if frame.source_id == SourceId.BROADCAST:
             return False
 

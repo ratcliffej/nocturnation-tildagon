@@ -297,78 +297,80 @@ class TestFormatLockLabel:
 
 
 # =============================================================================
-# Display-family broadcast admission (Epic 13)
+# Display-family source-match admission (EMF multi-show phase 3, 2026-06-24)
 # =============================================================================
+#
+# Pre-phase-3: the orchestrator emitted display frames with source_id =
+# 0xFF (broadcast) because it didn't know which Director it was bridged
+# through. A carve-out admitted these when a TOFU lock was held.
+#
+# Post-phase-3: the Director Stick's bridge passthrough re-stamps the
+# source_id of bridged display frames to its own id BEFORE broadcasting,
+# so display frames arrive identified and go through the same source-
+# match gate as wash / pulse / heartbeat. The carve-out is gone.
+#
+# The multi-show property this gains: show A's Lume locked to Director A
+# now rejects show B's display frames (they arrive with B's source_id),
+# so show B's lyric overlay no longer leaks onto show A's audience.
 
-class TestDisplayFamilyBroadcast:
-    """The orchestrator emits TEXT_DISPLAY / CLEAR_SCREEN / BITMAP_*
-    with source_id=0xFF (it isn't a Director, just an upstream sender
-    bridged through the Director's passthrough). A locked Lume must
-    accept these as content from its in-session Director's data
-    stream, without taking them as a lock candidate or resetting the
-    liveness timer."""
+class TestDisplayFamilySourceMatch:
 
-    def test_text_display_broadcast_dropped_when_not_locked(self):
-        """No lock yet -> reject. Display content shouldn't drive
-        lock establishment - it doesn't identify a Director."""
-        t = TofuLock()
-        f = make_frame(source_id=0xFF, message_type=MessageType.TEXT_DISPLAY)
-        assert t.admit(f, channel=1, now_ms=0) is False
-        assert t.is_locked() is False
-
-    def test_text_display_broadcast_admitted_when_locked(self):
-        """Lock held -> admit the broadcast display frame."""
-        t = TofuLock()
-        # Establish lock via a real Director frame.
-        t.admit(make_frame(source_id=0x42), channel=1, now_ms=100)
-        # Display broadcast: admitted.
-        f = make_frame(source_id=0xFF, message_type=MessageType.TEXT_DISPLAY)
-        assert t.admit(f, channel=1, now_ms=200) is True
-        # And the lock still names the Director, not 0xFF.
-        assert t.locked_id == 0x42
-
-    def test_clear_screen_broadcast_admitted_when_locked(self):
+    def test_any_broadcast_source_dropped_even_for_display_family(self):
+        """Pre-phase-3 admitted these when locked. Post-phase-3 the
+        Director re-stamps source_id, so a frame arriving with 0xFF
+        means an unstamped / misconfigured upstream - drop it."""
         t = TofuLock()
         t.admit(make_frame(source_id=0x42), channel=1, now_ms=100)
-        f = make_frame(source_id=0xFF, message_type=MessageType.CLEAR_SCREEN)
-        assert t.admit(f, channel=1, now_ms=200) is True
+        for mt in (
+            MessageType.TEXT_DISPLAY,
+            MessageType.CLEAR_SCREEN,
+            MessageType.BITMAP_HEADER,
+            MessageType.BITMAP_PLANE,
+        ):
+            f = make_frame(source_id=0xFF, message_type=mt)
+            assert t.admit(f, channel=1, now_ms=200) is False, mt
 
-    def test_bitmap_header_and_plane_broadcasts_admitted_when_locked(self):
+    def test_display_frame_from_locked_director_admitted(self):
+        """Director-stamped display frame (source_id == locked
+        Director's id) admits through the normal post-lock filter."""
         t = TofuLock()
         t.admit(make_frame(source_id=0x42), channel=1, now_ms=100)
-        assert t.admit(
-            make_frame(source_id=0xFF, message_type=MessageType.BITMAP_HEADER),
-            channel=1, now_ms=200,
-        ) is True
-        assert t.admit(
-            make_frame(source_id=0xFF, message_type=MessageType.BITMAP_PLANE),
-            channel=1, now_ms=201,
-        ) is True
+        for mt in (
+            MessageType.TEXT_DISPLAY,
+            MessageType.BITMAP_HEADER,
+            MessageType.BITMAP_PLANE,
+            MessageType.CLEAR_SCREEN,
+        ):
+            f = make_frame(source_id=0x42, message_type=mt)
+            assert t.admit(f, channel=1, now_ms=200) is True, mt
 
-    def test_display_broadcast_does_not_reset_liveness_timer(self):
-        """Liveness is the LOCKED Director's responsibility (heartbeat
-        / wash / pulse). An orchestrator-bridged display frame must
-        not extend the lock - otherwise a Director that's gone silent
-        could appear alive simply because the orchestrator is still
-        emitting cues."""
+    def test_display_frame_from_different_director_dropped(self):
+        """Multi-show partitioning property: show A's Lume locked to
+        Director A must NOT render show B's lyric overlays."""
+        t = TofuLock()
+        t.admit(make_frame(source_id=0x42), channel=1, now_ms=100)
+        f = make_frame(source_id=0x43, message_type=MessageType.TEXT_DISPLAY)
+        assert t.admit(f, channel=1, now_ms=200) is False
+        f = make_frame(source_id=0x43, message_type=MessageType.BITMAP_PLANE)
+        assert t.admit(f, channel=1, now_ms=201) is False
+
+    def test_display_frame_from_locked_director_resets_liveness(self):
+        """Behaviour change at phase 3: display frames from the locked
+        Director DO count toward liveness. Arrival of a bridged display
+        frame is evidence the Director is up enough to forward."""
         t = TofuLock(timeout_ms=1000)
         t.admit(make_frame(source_id=0x42), channel=1, now_ms=0)
-        # Display broadcast at t=500: admitted, but mustn't bump the
-        # last-frame-from-lock timestamp.
+        # Display frame from locked Director at t=500 -> extends timer.
         t.admit(
-            make_frame(source_id=0xFF, message_type=MessageType.TEXT_DISPLAY),
+            make_frame(source_id=0x42, message_type=MessageType.TEXT_DISPLAY),
             channel=1, now_ms=500,
         )
-        # tick at t=1100 (1100 ms after the original Director frame):
-        # past the 1000 ms timeout -> lock expires.
-        expired = t.tick(now_ms=1100)
-        assert expired is True
-        assert t.is_locked() is False
+        # tick at t=1100: 1100 ms after original wash, but only 600 ms
+        # since the display frame -> still within timeout.
+        assert t.tick(now_ms=1100) is False
+        assert t.is_locked() is True
 
     def test_non_display_broadcast_still_rejected_when_locked(self):
-        """LIGHT_PULSE from source_id 0xFF is misconfigured anonymous
-        traffic - reject even when a lock is held. The Epic 13 carve-
-        out applies ONLY to the display family."""
         t = TofuLock()
         t.admit(make_frame(source_id=0x42), channel=1, now_ms=100)
         f = make_frame(source_id=0xFF, message_type=MessageType.LIGHT_PULSE)
