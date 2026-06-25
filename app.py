@@ -281,6 +281,10 @@ class NocturNationApp(app.App):
         # draw frame.
         self._help_open = False
         self._help_matrix = None
+        # Epic 13 Phase 2A: latch that suppresses console spam from
+        # the per-frame image-render try/except. Reset whenever
+        # _help_matrix is reset so a mode flip can re-attempt + log.
+        self._bg_render_logged = False
         # True while we hold the radio (WiFi stopped + ESP-NOW up). The
         # background loop acquires it on entering a mode and releases it
         # (restoring WiFi) on returning to idle.
@@ -597,6 +601,10 @@ class NocturNationApp(app.App):
     def _close_help(self) -> None:
         self._help_open = False
         self._help_matrix = None
+        # Epic 13 Phase 2A: latch that suppresses console spam from
+        # the per-frame image-render try/except. Reset whenever
+        # _help_matrix is reset so a mode flip can re-attempt + log.
+        self._bg_render_logged = False
         self.button_states.clear()
         if self._mode == "idle":
             self._open_idle_menu()
@@ -837,19 +845,34 @@ class NocturNationApp(app.App):
         # paint the solid colour underneath as before".
         bg_images.load_for_dir_id(self._tofu.locked_id)
         bg_buf, bg_w, bg_h, bg_stride = bg_images.current()
+        bg_rendered = False
         if bg_buf is not None:
-            # Texture-fill a centred rectangle at native image size.
-            # ctx.texture sets the current paint source; the following
-            # rectangle().fill() paints that source onto pixels. The
-            # translate() positions the texture origin at the top-left
-            # of the centred rect so the image renders unstretched.
-            ctx.save()
-            ctx.translate(-bg_w / 2, -bg_h / 2)
-            ctx.texture(bg_buf, ctx.RGB565, bg_w, bg_h, bg_stride)
-            ctx.rectangle(0, 0, bg_w, bg_h).fill()
-            ctx.restore()
-        else:
-            # No image -> the pre-Epic-13 solid wash/black background.
+            # Texture-blit a centred rectangle at native image size.
+            #
+            # Defensive against the Tildagon Ctx binding doing
+            # something unexpected with the texture API (which is
+            # what hard-reset the badge on the first bench attempt
+            # at this code - the abort path went through a stack
+            # that wasn't survivable). Catch BaseException so even
+            # MemoryError / system exits get logged rather than
+            # killing the launcher; print once and stash the
+            # condition so we don't spam the console at 20 Hz.
+            try:
+                ctx.save()
+                ctx.translate(-bg_w / 2, -bg_h / 2)
+                ctx.texture(bg_buf, ctx.RGB565, bg_w, bg_h, bg_stride)
+                ctx.rectangle(0, 0, bg_w, bg_h).fill()
+                ctx.restore()
+                bg_rendered = True
+            except BaseException as exc:    # noqa: BLE001
+                if not self._bg_render_logged:
+                    print("[nocturnation.images] render failed: %s: %s"
+                          % (type(exc).__name__, exc))
+                    self._bg_render_logged = True
+        if not bg_rendered:
+            # Pre-Epic-13 solid wash/black fallback. Used when:
+            #   * No image loaded (no DirID match + no default.raw)
+            #   * The texture render path raised an exception above
             # LCD pulse wash if Full mode is on and there's an active
             # envelope; otherwise black (Calm Mode keeps the LCD
             # quiet so the badge stays comfortable face-distance).
