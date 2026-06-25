@@ -835,27 +835,26 @@ class NocturNationApp(app.App):
         # caches the next image; an unknown DirID falls back to a
         # bundled default logo, and missing default means "no image,
         # paint the solid colour underneath as before".
-        # Epic 13 Phase 2A image-render layer disabled at the bench
-        # 2026-06-25. The badge's Ctx texture API
-        # (ctx.texture(buf, ctx.RGB565, w, h, stride) +
-        # rectangle().fill()) hard-faults the chip on the first call
-        # - reset propagates through the USB-CDC link and mpremote
-        # loses serial. The fault is below the MicroPython exception
-        # layer (a try/except around the call still resets the
-        # badge), so we can't recover at the Python level.
+        # Epic 13 Phase 2A: DirID-keyed background image (JPG) via
+        # the documented ctx.image() API. The Tildagon Ctx reference
+        # at https://tildagon.badge.emfcamp.org/tildagon-apps/reference/ctx/
+        # documents image(path, x, y, w, h) as the supported path
+        # for displaying JPG/PNG files; Ctx caches the decoded image
+        # internally by path so we can call it every frame without
+        # re-decoding.
         #
-        # The loader module (nocturnation/images/__init__.py) stays
-        # in place so the infrastructure is ready to wire back up
-        # once the texture-vs-image API question is resolved off-
-        # bench. Until then the LCD background reverts to the pre-
-        # Epic-13 solid wash colour - the same behaviour as before
-        # any of this work landed.
-        #
-        # Pulse wash if Full mode is on and there's an active
-        # envelope; otherwise black (Calm Mode keeps the LCD quiet
-        # so the badge stays comfortable face-distance).
-        bg_r, bg_g, bg_b = self._lcd_background_rgb01()
-        ctx.rgb(bg_r, bg_g, bg_b).rectangle(-120, -120, 240, 240).fill()
+        # If no image is resolvable (no DirID-specific file, no
+        # default.jpg) we fall through to the pre-Epic-13 solid
+        # wash colour.
+        bg_path = bg_images.path_for_dir_id(self._tofu.locked_id)
+        if bg_path is not None:
+            ctx.image(bg_path, -120, -120, 240, 240)
+        else:
+            # Pulse wash if Full mode is on and there's an active
+            # envelope; otherwise black (Calm Mode keeps the LCD
+            # quiet so the badge stays comfortable face-distance).
+            bg_r, bg_g, bg_b = self._lcd_background_rgb01()
+            ctx.rgb(bg_r, bg_g, bg_b).rectangle(-120, -120, 240, 240).fill()
 
         # Epic 13: once we've locked to a Director, the Lume LCD is
         # a content surface (mirrors the StickC's "LCD is content in

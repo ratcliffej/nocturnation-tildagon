@@ -7,38 +7,32 @@ hex editor. That stability is what makes it useful as a *content*
 key: a Tildagon show can pick which background logo to render based
 on which Director its TOFU lock named. Stage D's Director runs with
 DirID 0xD0; the badge sees that id on every accepted frame, and the
-LCD renders ``images/dirid_d0.raw`` as a background layer.
+LCD renders ``images/dirid_d0.jpg`` as a background layer.
 
-Storage convention: each pre-rendered image lives at
-``nocturnation/images/dirid_<hex>.raw`` (lowercase hex, no ``0x``
-prefix, exactly two digits, e.g. ``dirid_d0.raw``). The file is a
-flat little-endian RGB565 binary blob at the configured display
-dimensions (default 240 x 240 = 115200 bytes per image; see
-``png_to_rgb565.py`` in the docs repo for offline authoring).
+Storage convention: each image lives at
+``nocturnation/images/dirid_<hex>.jpg`` (lowercase hex, no ``0x``
+prefix, exactly two digits, e.g. ``dirid_d0.jpg``). JPEG is the
+documented Ctx-supported format on the Tildagon - see the badge
+docs at https://tildagon.badge.emfcamp.org/tildagon-apps/reference/ctx/
+for the canonical API surface. Authoring is "save as JPG at 240x240"
+in any image editor; no firmware-side conversion step needed.
 
 Fallback: an unknown DirID OR no current lock falls back to
-``nocturnation/images/default.raw`` (bundled NocturNation logo, always
-present in the firmware deploy). Missing default file is treated as
-"no background image", which the renderer handles by drawing the
-existing solid wash colour.
+``nocturnation/images/default.jpg`` (bundled NocturNation logo). If
+neither file exists the loader returns ``None`` and the renderer
+falls back to the solid wash background.
 
-The loader is intentionally tiny - one cached image at a time, on-
-demand load via ``load_for_dirid()``. ``current()`` returns the bytes
-+ dimensions to render this tick (or ``None`` if no image to draw).
+The loader is intentionally tiny: it just resolves DirID to a
+filesystem path. The actual file decode + caching happens inside
+Ctx's ``ctx.image(path, ...)`` call, which the renderer invokes
+every frame with the same path - Ctx caches internally by path so
+the file isn't re-decoded each tick.
 
-Memory note: each 240x240 image is ~115 KB. We keep only the active
-image in RAM, not a cache, because the badge is RAM-constrained and
-TOFU lock changes are infrequent (10 s scale, not 100 ms scale).
+This module replaced an earlier RGB565-binary-blob approach that
+relied on the ``ctx.texture()`` API. That API hard-faulted the
+chip on first call on this badge build; switching to the
+documented ``ctx.image()`` path side-stepped the issue.
 """
-
-# Display dimensions of the Tildagon's framebuffer-addressable area.
-# The bezel masks the corners, but the framebuffer is square and the
-# image author can leave safe-zone padding so important content
-# centres within the visible circle.
-DISPLAY_W = 240
-DISPLAY_H = 240
-BYTES_PER_PIXEL = 2   # RGB565 = 2 bytes/pixel
-EXPECTED_SIZE = DISPLAY_W * DISPLAY_H * BYTES_PER_PIXEL
 
 
 def _dirname(path):
@@ -58,24 +52,22 @@ def _dirname(path):
     return path[:idx]
 
 
-# Directory containing the .raw blobs. The loader lives at
-# ``nocturnation/images/__init__.py`` (the .raw files are package
+# Directory containing the image files. The loader lives at
+# ``nocturnation/images/__init__.py`` (the .jpg files are package
 # data sitting alongside this file), so the image directory IS the
-# directory containing __file__. The package-with-data layout
-# replaced an earlier images.py + sibling images/ directory layout
-# whose name collision crashed the badge at import time - the
-# directory shadowed the module file in MicroPython's resolver.
+# directory containing __file__.
 _THIS_DIR = _dirname(__file__) if "__file__" in globals() else "."
 _IMAGE_DIR = _THIS_DIR
 
-DEFAULT_FILENAME = "default.raw"
+DEFAULT_FILENAME = "default.jpg"
+IMAGE_EXTENSION  = ".jpg"
 
 
 class _State:
     """Module-level singleton (MicroPython has no class properties)."""
-    current_buf = None       # bytes object of the active image, or None
-    current_dir_id = None    # int 0..255 of the locked DirID, or None
-    current_path = None      # absolute path that produced current_buf
+    current_path = None      # path to the active image, or None (no file found)
+    current_dir_id = None    # int 0..255 of the locked DirID at last load
+    has_cache = False        # distinguishes "never called" from "cached None"
     last_load_failed_path = None   # cache to avoid retry-spam on missing files
 
 
@@ -85,110 +77,83 @@ _state = _State()
 def _filename_for_dir_id(dir_id):
     """Filename convention for a given DirID byte (no path).
 
-    ``0xD0`` -> ``"dirid_d0.raw"``. Lowercase hex, no prefix, exactly
-    two digits. Out-of-range inputs are treated as "no specific
-    image", returning None (caller falls back to the default).
+    ``0xD0`` -> ``"dirid_d0.jpg"``. Lowercase hex, no prefix,
+    exactly two digits. Out-of-range / None returns None - caller
+    falls back to the default.
     """
     if dir_id is None:
         return None
     if not (0x00 <= dir_id <= 0xFF):
         return None
-    return "dirid_%02x.raw" % dir_id
+    return "dirid_%02x%s" % (dir_id, IMAGE_EXTENSION)
 
 
-def _read_image(path):
-    """Open + size-validate an image file.
+def _file_exists(path):
+    """Cheap existence check via open()-and-close.
 
-    Returns the bytes object on success, ``None`` on any failure
-    (missing file, wrong size, IO error). Logs the failure once per
-    distinct path so a repeatedly-tried-and-missing default doesn't
-    spam the console.
+    MicroPython doesn't have ``os.path.exists`` and ``os.stat`` is
+    available but its exception types vary across builds. ``open()``
+    raises OSError on any failure path (missing, permission, IO);
+    we treat all of those as "no file".
     """
     try:
-        with open(path, "rb") as f:
-            buf = f.read()
+        f = open(path, "rb")
     except OSError:
         if path != _state.last_load_failed_path:
             print("[nocturnation.images] not found: %s" % path)
             _state.last_load_failed_path = path
-        return None
-    if len(buf) != EXPECTED_SIZE:
-        # Wrong size = wrong format. Refuse to render rather than
-        # producing scrambled output. The encoder enforces size on
-        # write, so this should only fire if the file is hand-edited
-        # or transferred with a content-mangling tool.
-        print(
-            "[nocturnation.images] %s: bad size %d (expected %d); skipping"
-            % (path, len(buf), EXPECTED_SIZE)
-        )
-        return None
-    return buf
+        return False
+    f.close()
+    return True
 
 
-def load_for_dir_id(dir_id):
-    """Load the image for ``dir_id``, falling back to the default.
+def path_for_dir_id(dir_id):
+    """Resolve ``dir_id`` to a renderable file path.
 
-    ``dir_id``: int 0x00..0xFF (the Performance-range Director id, or
-    ``None`` if no lock is held). The lookup is:
+    Lookup:
 
-      1. If ``dir_id`` is not None and ``dirid_<hex>.raw`` exists,
-         use it.
-      2. Otherwise fall back to ``default.raw``.
-      3. If neither exists, return None - the renderer should fall
-         back to the solid-colour background layer.
+      1. If ``dir_id`` is not None and ``dirid_<hex>.jpg`` exists,
+         return its absolute path.
+      2. Else if ``default.jpg`` exists, return that path.
+      3. Else return ``None`` (caller falls back to solid colour).
 
-    Caches the loaded buffer in the module singleton; subsequent calls
-    with the same ``dir_id`` are no-ops and return the cached bytes.
-    Returns the bytes object (or ``None`` if no image is renderable).
+    The path is cached in the module singleton; subsequent calls
+    with the same ``dir_id`` skip the filesystem check entirely and
+    return the cached path. A different ``dir_id`` re-resolves
+    (because the user has TOFU-re-locked to a different Director).
     """
-    # Cache hit: same DirID as last call.
-    if dir_id == _state.current_dir_id and _state.current_buf is not None:
-        return _state.current_buf
+    if _state.has_cache and dir_id == _state.current_dir_id:
+        return _state.current_path
 
-    # Try the DirID-specific file first.
-    buf = None
-    chosen_path = None
+    chosen = None
+
     fname = _filename_for_dir_id(dir_id)
     if fname is not None:
         candidate = _IMAGE_DIR + "/" + fname
-        buf = _read_image(candidate)
-        if buf is not None:
-            chosen_path = candidate
+        if _file_exists(candidate):
+            chosen = candidate
 
-    # Fall back to default.
-    if buf is None:
+    if chosen is None:
         default_path = _IMAGE_DIR + "/" + DEFAULT_FILENAME
-        buf = _read_image(default_path)
-        if buf is not None:
-            chosen_path = default_path
+        if _file_exists(default_path):
+            chosen = default_path
 
-    # Update cache (even on None to skip re-trying every tick).
-    _state.current_buf    = buf
+    _state.current_path   = chosen
     _state.current_dir_id = dir_id
-    _state.current_path   = chosen_path
-    if buf is not None:
-        print("[nocturnation.images] loaded %s (DirID=%s)"
-              % (chosen_path, ("0x%02X" % dir_id) if dir_id is not None else "none"))
-    return buf
+    _state.has_cache      = True
+    if chosen is not None:
+        print("[nocturnation.images] resolved %s (DirID=%s)"
+              % (chosen, ("0x%02X" % dir_id) if dir_id is not None else "none"))
+    return chosen
 
 
-def current():
-    """Return the active background image as ``(buf, w, h, stride)``.
-
-    Returns the cached image. If no image is loaded (or the last load
-    failed), returns ``(None, 0, 0, 0)`` - the caller should fall back
-    to the solid-colour background layer.
-
-    Pair with ``ctx.texture(buf, ctx.FORMAT_RGB565, w, h, stride)``
-    followed by ``ctx.rectangle(...).fill()`` in the render loop.
-    """
-    if _state.current_buf is None:
-        return (None, 0, 0, 0)
-    return (_state.current_buf, DISPLAY_W, DISPLAY_H, DISPLAY_W * BYTES_PER_PIXEL)
+def current_path():
+    """Return the cached path, or None if no image is resolvable."""
+    return _state.current_path
 
 
 def clear():
-    """Drop the cached image - used on Lume mode exit / reset."""
-    _state.current_buf    = None
-    _state.current_dir_id = None
+    """Drop the cached path - used on Lume mode exit / reset."""
     _state.current_path   = None
+    _state.current_dir_id = None
+    _state.has_cache      = False
