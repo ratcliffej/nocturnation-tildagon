@@ -125,6 +125,7 @@ except ImportError:
 # package below), so the dot prefix is invisible to the test suite.
 from .nocturnation.channel_scan import ChannelScanner
 from .nocturnation.clock import ticks_diff
+from .nocturnation import images as bg_images
 from .nocturnation.protocol import DedupRing, MessageType
 from .nocturnation.protocol.frame import (
     make_light_wash_frame, make_light_wash_end_frame,
@@ -826,11 +827,34 @@ class NocturNationApp(app.App):
             self._draw_director(ctx)
             return
 
-        # Background: LCD pulse wash if Full mode is on and there's an
-        # active envelope; otherwise black (Calm Mode keeps the LCD
-        # quiet so the badge stays comfortable face-distance).
-        bg_r, bg_g, bg_b = self._lcd_background_rgb01()
-        ctx.rgb(bg_r, bg_g, bg_b).rectangle(-120, -120, 240, 240).fill()
+        # Background: layered, with DirID-keyed image (Epic 13 Phase 2A)
+        # as the lowest layer when available.
+        #
+        # The image layer is keyed off the current TOFU lock. As the
+        # badge re-locks to a different Director, ``bg_images.load_for_dir_id``
+        # caches the next image; an unknown DirID falls back to a
+        # bundled default logo, and missing default means "no image,
+        # paint the solid colour underneath as before".
+        bg_images.load_for_dir_id(self._tofu.locked_id)
+        bg_buf, bg_w, bg_h, bg_stride = bg_images.current()
+        if bg_buf is not None:
+            # Texture-fill a centred rectangle at native image size.
+            # ctx.texture sets the current paint source; the following
+            # rectangle().fill() paints that source onto pixels. The
+            # translate() positions the texture origin at the top-left
+            # of the centred rect so the image renders unstretched.
+            ctx.save()
+            ctx.translate(-bg_w / 2, -bg_h / 2)
+            ctx.texture(bg_buf, ctx.RGB565, bg_w, bg_h, bg_stride)
+            ctx.rectangle(0, 0, bg_w, bg_h).fill()
+            ctx.restore()
+        else:
+            # No image -> the pre-Epic-13 solid wash/black background.
+            # LCD pulse wash if Full mode is on and there's an active
+            # envelope; otherwise black (Calm Mode keeps the LCD
+            # quiet so the badge stays comfortable face-distance).
+            bg_r, bg_g, bg_b = self._lcd_background_rgb01()
+            ctx.rgb(bg_r, bg_g, bg_b).rectangle(-120, -120, 240, 240).fill()
 
         # Epic 13: once we've locked to a Director, the Lume LCD is
         # a content surface (mirrors the StickC's "LCD is content in
