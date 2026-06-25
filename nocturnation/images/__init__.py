@@ -49,10 +49,15 @@ DISPLAY_H = 240
 BYTES_PER_PIXEL = 2   # RGB565 = 2 bytes/pixel
 EXPECTED_SIZE = DISPLAY_W * DISPLAY_H * BYTES_PER_PIXEL
 
-# Directory containing the .raw blobs. Resolved at module-import time
-# relative to this file so the firmware bundle layout is preserved.
+# Directory containing the .raw blobs. The loader lives at
+# ``nocturnation/images/__init__.py`` (the .raw files are package
+# data sitting alongside this file), so the image directory IS the
+# directory containing __file__. The package-with-data layout
+# replaced an earlier images.py + sibling images/ directory layout
+# whose name collision crashed the badge at import time - the
+# directory shadowed the module file in MicroPython's resolver.
 _THIS_DIR = os.path.dirname(__file__) if "__file__" in globals() else "."
-_IMAGE_DIR = _THIS_DIR + "/images"
+_IMAGE_DIR = _THIS_DIR
 
 DEFAULT_FILENAME = "default.raw"
 
