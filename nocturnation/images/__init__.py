@@ -31,15 +31,6 @@ image in RAM, not a cache, because the badge is RAM-constrained and
 TOFU lock changes are infrequent (10 s scale, not 100 ms scale).
 """
 
-# We avoid micropython-only imports here so the module is host-
-# importable for unit tests. ``os`` for path existence is in both
-# CPython and MicroPython.
-try:
-    import uos as os  # type: ignore[import-not-found]
-except ImportError:
-    import os  # type: ignore[no-redef]
-
-
 # Display dimensions of the Tildagon's framebuffer-addressable area.
 # The bezel masks the corners, but the framebuffer is square and the
 # image author can leave safe-zone padding so important content
@@ -49,6 +40,24 @@ DISPLAY_H = 240
 BYTES_PER_PIXEL = 2   # RGB565 = 2 bytes/pixel
 EXPECTED_SIZE = DISPLAY_W * DISPLAY_H * BYTES_PER_PIXEL
 
+
+def _dirname(path):
+    """Manual ``os.path.dirname`` equivalent.
+
+    MicroPython on the Tildagon doesn't ship ``os.path`` (it's a
+    CPython convenience module not present in standard MicroPython
+    embedded builds; first attempt to use it crashed the app at
+    import). String-slicing on the last "/" matches CPython
+    behaviour for the cases we hit (absolute paths from __file__).
+    """
+    idx = path.rfind("/")
+    if idx < 0:
+        return "."
+    if idx == 0:
+        return "/"
+    return path[:idx]
+
+
 # Directory containing the .raw blobs. The loader lives at
 # ``nocturnation/images/__init__.py`` (the .raw files are package
 # data sitting alongside this file), so the image directory IS the
@@ -56,7 +65,7 @@ EXPECTED_SIZE = DISPLAY_W * DISPLAY_H * BYTES_PER_PIXEL
 # replaced an earlier images.py + sibling images/ directory layout
 # whose name collision crashed the badge at import time - the
 # directory shadowed the module file in MicroPython's resolver.
-_THIS_DIR = os.path.dirname(__file__) if "__file__" in globals() else "."
+_THIS_DIR = _dirname(__file__) if "__file__" in globals() else "."
 _IMAGE_DIR = _THIS_DIR
 
 DEFAULT_FILENAME = "default.raw"
