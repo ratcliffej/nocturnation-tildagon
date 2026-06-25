@@ -281,10 +281,6 @@ class NocturNationApp(app.App):
         # draw frame.
         self._help_open = False
         self._help_matrix = None
-        # Epic 13 Phase 2A: latch that suppresses console spam from
-        # the per-frame image-render try/except. Reset whenever
-        # _help_matrix is reset so a mode flip can re-attempt + log.
-        self._bg_render_logged = False
         # True while we hold the radio (WiFi stopped + ESP-NOW up). The
         # background loop acquires it on entering a mode and releases it
         # (restoring WiFi) on returning to idle.
@@ -601,10 +597,6 @@ class NocturNationApp(app.App):
     def _close_help(self) -> None:
         self._help_open = False
         self._help_matrix = None
-        # Epic 13 Phase 2A: latch that suppresses console spam from
-        # the per-frame image-render try/except. Reset whenever
-        # _help_matrix is reset so a mode flip can re-attempt + log.
-        self._bg_render_logged = False
         self.button_states.clear()
         if self._mode == "idle":
             self._open_idle_menu()
@@ -843,41 +835,27 @@ class NocturNationApp(app.App):
         # caches the next image; an unknown DirID falls back to a
         # bundled default logo, and missing default means "no image,
         # paint the solid colour underneath as before".
-        bg_images.load_for_dir_id(self._tofu.locked_id)
-        bg_buf, bg_w, bg_h, bg_stride = bg_images.current()
-        bg_rendered = False
-        if bg_buf is not None:
-            # Texture-blit a centred rectangle at native image size.
-            #
-            # Defensive against the Tildagon Ctx binding doing
-            # something unexpected with the texture API (which is
-            # what hard-reset the badge on the first bench attempt
-            # at this code - the abort path went through a stack
-            # that wasn't survivable). Catch BaseException so even
-            # MemoryError / system exits get logged rather than
-            # killing the launcher; print once and stash the
-            # condition so we don't spam the console at 20 Hz.
-            try:
-                ctx.save()
-                ctx.translate(-bg_w / 2, -bg_h / 2)
-                ctx.texture(bg_buf, ctx.RGB565, bg_w, bg_h, bg_stride)
-                ctx.rectangle(0, 0, bg_w, bg_h).fill()
-                ctx.restore()
-                bg_rendered = True
-            except BaseException as exc:    # noqa: BLE001
-                if not self._bg_render_logged:
-                    print("[nocturnation.images] render failed: %s: %s"
-                          % (type(exc).__name__, exc))
-                    self._bg_render_logged = True
-        if not bg_rendered:
-            # Pre-Epic-13 solid wash/black fallback. Used when:
-            #   * No image loaded (no DirID match + no default.raw)
-            #   * The texture render path raised an exception above
-            # LCD pulse wash if Full mode is on and there's an active
-            # envelope; otherwise black (Calm Mode keeps the LCD
-            # quiet so the badge stays comfortable face-distance).
-            bg_r, bg_g, bg_b = self._lcd_background_rgb01()
-            ctx.rgb(bg_r, bg_g, bg_b).rectangle(-120, -120, 240, 240).fill()
+        # Epic 13 Phase 2A image-render layer disabled at the bench
+        # 2026-06-25. The badge's Ctx texture API
+        # (ctx.texture(buf, ctx.RGB565, w, h, stride) +
+        # rectangle().fill()) hard-faults the chip on the first call
+        # - reset propagates through the USB-CDC link and mpremote
+        # loses serial. The fault is below the MicroPython exception
+        # layer (a try/except around the call still resets the
+        # badge), so we can't recover at the Python level.
+        #
+        # The loader module (nocturnation/images/__init__.py) stays
+        # in place so the infrastructure is ready to wire back up
+        # once the texture-vs-image API question is resolved off-
+        # bench. Until then the LCD background reverts to the pre-
+        # Epic-13 solid wash colour - the same behaviour as before
+        # any of this work landed.
+        #
+        # Pulse wash if Full mode is on and there's an active
+        # envelope; otherwise black (Calm Mode keeps the LCD quiet
+        # so the badge stays comfortable face-distance).
+        bg_r, bg_g, bg_b = self._lcd_background_rgb01()
+        ctx.rgb(bg_r, bg_g, bg_b).rectangle(-120, -120, 240, 240).fill()
 
         # Epic 13: once we've locked to a Director, the Lume LCD is
         # a content surface (mirrors the StickC's "LCD is content in
