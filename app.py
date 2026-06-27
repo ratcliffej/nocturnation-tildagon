@@ -1081,15 +1081,33 @@ class NocturNationApp(app.App):
         try:
             self._wlan = network.WLAN(network.STA_IF)
             self._wlan.active(True)
+            # Epic 15: switch the PHY to ESP-NOW Long Range mode.
+            # Halves the bitrate (500 kbps vs 1 Mbps) in exchange for
+            # 2.5-7x open-air range. Fleet-wide commitment - LR-only
+            # peers cannot decode standard 802.11b/g/n peers, so every
+            # Director and Lume must enable this together.
+            # Integer 8 = WIFI_PROTOCOL_LR in ESP-IDF v5.x. We pass it
+            # as a raw int rather than network.WLAN.PROTOCOL_LR because
+            # the badge's MicroPython (5114f2c-dirty, March 2024 base)
+            # has the protocol setter but not the named LR constant;
+            # the setter accepts any int and forwards to esp_wifi_set_
+            # protocol() which knows the value. Bench-confirmed
+            # 2026-06-27: wlan.config(protocol=8) succeeds and
+            # wlan.config("protocol") reads back 8.
+            try:
+                self._wlan.config(protocol=8)
+            except Exception as exc:
+                print("[nocturnation] wlan.config(protocol=8/LR) failed: %s" % exc)
             # Disable Wi-Fi modem power-save. Per the MicroPython espnow
             # docs ("ESPNow and Wifi Operation"), the STA defaults to a
             # duty-cycled PM mode that sleeps through short ESP-NOW
-            # bursts (the Director sends 3x retransmits within ~2 ms),
-            # so receivers must set PM_NONE for reliable receive. This
-            # raises idle current; any future light-sleep work must keep
-            # the radio awake for heartbeat windows or this bug returns.
-            # Older firmware may not expose `pm`; swallow the error so
-            # acquisition still proceeds.
+            # bursts (the Director sends 2x retransmits within ~2 ms;
+            # was 3x pre-Epic-15), so receivers must set PM_NONE for
+            # reliable receive. This raises idle current; any future
+            # light-sleep work must keep the radio awake for heartbeat
+            # windows or this bug returns. Older firmware may not
+            # expose `pm`; swallow the error so acquisition still
+            # proceeds.
             try:
                 self._wlan.config(pm=network.WLAN.PM_NONE)
             except Exception as exc:
