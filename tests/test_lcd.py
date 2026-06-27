@@ -14,7 +14,27 @@ from nocturnation.render.lcd import (
     LcdRenderer,
     LCD_MIN_INTERVAL_MS,
     FULL_BRIGHTNESS_CAP,
+    WASH_MAX_HOLD_MS,
 )
+
+
+class FakeWashFrame:
+    """Stand-in for protocol.Frame carrying just the LIGHT_WASH fields
+    the LCD renderer reads. Defaults match the lost-WASH_END failure
+    case: ttl_seconds = 0 ("infinite") + pulse_response = 0."""
+
+    def __init__(self, r1=255, g1=0, b1=0, r2=0, g2=0, b2=200,
+                 wash_attack=0, wash_release=0,
+                 intensity=255, cycle_ms=0,
+                 ttl_seconds=0, pulse_response=0):
+        self.r1 = r1; self.g1 = g1; self.b1 = b1
+        self.r2 = r2; self.g2 = g2; self.b2 = b2
+        self.wash_attack = wash_attack
+        self.wash_release = wash_release
+        self.intensity = intensity
+        self.cycle_ms = cycle_ms
+        self.ttl_seconds = ttl_seconds
+        self.pulse_response = pulse_response
 
 
 class FakeFrame:
@@ -91,10 +111,11 @@ class TestFrequencyCap:
         r.dispatch(FakeFrame(), now_ms=0)
         assert r.dispatch(FakeFrame(), now_ms=LCD_MIN_INTERVAL_MS) is True
 
-    def test_cap_matches_4_hz(self):
-        # The cap should be the Full-mode 4 Hz spec from architecture
-        # spec section 15.1 - 250 ms minimum interval.
-        assert LCD_MIN_INTERVAL_MS == 250
+    def test_cap_value(self):
+        # Was 250 ms (4 Hz) per architecture spec section 15.1, but
+        # silently dropped every other sparkle at 140 BPM tempo. Bumped
+        # to 60 ms (~16 Hz) so per-beat sparkles land through 200+ BPM.
+        assert LCD_MIN_INTERVAL_MS == 60
 
 
 class TestEnvelopeShape:
@@ -156,3 +177,36 @@ class TestClear:
         assert r.current_colour(now_ms=100) is not None
         r.clear()
         assert r.current_colour(now_ms=100) is None
+
+
+class TestWashTtlFailsafe:
+    """Lost-WASH_END failsafe: a LIGHT_WASH with ttl_seconds == 0 whose
+    LIGHT_WASH_END is lost would otherwise hold forever; with
+    pulse_response == 0 the renderer would also gate pulses. After
+    WASH_MAX_HOLD_MS the receiver self-releases."""
+
+    def test_ttl_zero_wash_self_releases_after_max_hold(self):
+        r = LcdRenderer(calm_mode=False)
+        r.on_light_wash(FakeWashFrame(), now_ms=0)
+        # Just before the failsafe, still washing.
+        assert r.is_washing() is True
+        _ = r.current_colour(now_ms=WASH_MAX_HOLD_MS - 1)
+        assert r.is_washing() is True
+        # At the failsafe boundary (release == 0 so the release phase
+        # collapses immediately), the wash is gone on the next tick.
+        _ = r.current_colour(now_ms=WASH_MAX_HOLD_MS + 10)
+        assert r.is_washing() is False
+
+    def test_explicit_short_ttl_still_honoured(self):
+        r = LcdRenderer(calm_mode=False)
+        r.on_light_wash(FakeWashFrame(ttl_seconds=5), now_ms=0)
+        _ = r.current_colour(now_ms=4_000)
+        assert r.is_washing() is True
+        _ = r.current_colour(now_ms=6_000)
+        assert r.is_washing() is False
+
+    def test_failsafe_does_not_fire_before_its_time(self):
+        r = LcdRenderer(calm_mode=False)
+        r.on_light_wash(FakeWashFrame(), now_ms=0)
+        _ = r.current_colour(now_ms=60_000)
+        assert r.is_washing() is True

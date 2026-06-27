@@ -124,9 +124,21 @@ except ImportError:
 # Host-side pytest never imports this file (only the nocturnation/
 # package below), so the dot prefix is invisible to the test suite.
 from .nocturnation.channel_scan import ChannelScanner
+from .nocturnation.clock import ticks_diff
+from .nocturnation import images as bg_images
 from .nocturnation.protocol import DedupRing, MessageType
+from .nocturnation.protocol.frame import (
+    make_light_wash_frame, make_light_wash_end_frame,
+)
 from .nocturnation.receive import process_frame
-from .nocturnation.render import LcdRenderer, PerimeterRenderer, CtxDisplay
+from .nocturnation.render import (
+    LcdRenderer,
+    LumeTextRenderer,
+    PerimeterRenderer,
+    CtxDisplay,
+    PERIMETER_CLASSES,
+    LCD_CLASSES,
+)
 from .nocturnation.settings import Settings
 from .nocturnation.signal_tracker import SignalTracker
 from .nocturnation.tofu import TofuLock, format_lock_label
@@ -160,19 +172,50 @@ _DEBUG = False
 
 # Director mode transmits on the hobby channel only (Epic 5.5: the
 # Tildagon must not broadcast on the channel-11 Performance band).
+# Channel 11 is reserved for commercial / show Directors with random-
+# per-boot Performance-range source IDs (Epic 5.5 §3.4). A swarm of
+# Tildagons at EMF transmitting on ch 11 would compete with the
+# orchestrator's StickC Director and drown out cue traffic.
 DIRECTOR_CHANNEL = 1
+
+# Channels a Tildagon is FORBIDDEN to broadcast Director on. The
+# constant above is the only authorised channel today, but this
+# explicit blocklist gives us a hard runtime gate that catches any
+# accidental change to DIRECTOR_CHANNEL (future bug, fork divergence,
+# settings-file injection) before the radio is brought up.
+DIRECTOR_FORBIDDEN_TX_CHANNELS = frozenset((11,))
 
 # Director's source_id. A fixed community-range id (0x00-0x3F) is fine
 # for the hobby channel; the Epic 5.5 random-per-boot allocation is a
 # channel-11 concern and the Tildagon never transmits there.
 DIRECTOR_SOURCE_ID = 0x20
 
-# Class-to-surface routing per Epic 5 Q1. The Tildagon advertises as
-# MultiLedScreen (0x03) but renders Light-class commands (0x01) on the
-# perimeter too because the LED ring is a wristband-analogue. Screen
-# (0x02) targets the LCD only; All (0x00) targets both surfaces.
-_PERIMETER_CLASSES = (0x00, 0x01, 0x03)
-_LCD_CLASSES = (0x00, 0x02, 0x03)
+# Signal-loss fallback wash (EMF prep). Same timings as the StickC
+# LumeMode constants so the fleet converges on the same idle effect
+# at the same moment:
+#
+#   3 s   silence -> NO SIGNAL diagnostic text (SignalTracker.is_lost)
+#  10 s   silence -> synthesised LIGHT_WASH (blue<->purple ping-pong)
+#                    with attack=FALLBACK_ATTACK_TICKS, intensity=
+#                    FALLBACK_INTENSITY, cycle_ms=FALLBACK_CYCLE_PERIOD_MS
+#  40 s   silence -> synthesised LIGHT_WASH_END (release_time=
+#                    FALLBACK_FADE_TICKS in 100 ms units) starts the
+#                    fade-to-black. release_time is u8 (~25.5 s cap)
+#                    so the "30 s fade" the operator asked for is
+#                    served by the maximum the wash state machine
+#                    accepts - functionally equivalent to the eye.
+# Any inbound frame cancels the fallback with a short-release END so
+# the Director's returning wash/pulse traffic isn't fighting the
+# synthetic baseline.
+FALLBACK_ENTER_MS         = 10000
+FALLBACK_FADE_START_MS    = 40000
+FALLBACK_CYCLE_PERIOD_MS  = 10000
+FALLBACK_ATTACK_TICKS     = 30    # 100 ms units = 3 s
+FALLBACK_FADE_TICKS       = 255   # 100 ms units, ~25.5 s
+FALLBACK_INTENSITY        = 60    # 0..255; ~24 % brightness
+FALLBACK_RECOVERY_TICKS   = 5     # 100 ms units = 500 ms
+FALLBACK_COLOUR_A         = (20, 0, 80)    # dark violet
+FALLBACK_COLOUR_B         = (0, 20, 80)    # dark navy
 
 
 class NocturNationApp(app.App):
@@ -212,16 +255,24 @@ class NocturNationApp(app.App):
         # LCD pulse renderer. Calm Mode disables the LCD wash entirely
         # per architecture spec section 15.3.
         self._lcd_renderer = LcdRenderer(calm_mode=self._settings.calm_mode)
+        # Epic 13: LCD text renderer. Layers TEXT_DISPLAY content (header
+        # + body) on top of the wash background. Independent of the
+        # pulse/wash state machine - operator-paced display content,
+        # not music-paced visuals. Lifecycle is event-driven (no calm-
+        # mode gate; lyric content is the point of declaring DisplayText).
+        self._lume_text_renderer = LumeTextRenderer()
         # In-app settings menu state.
         self._settings_open = False
         self._settings_menu = None
         # Epic 6B: app role. "idle" (no radio, WiFi left up so the badge
         # stays connected while the operator is in the start menu),
         # "lume" (receive), or "director" (Show framework + IMU + TX).
-        # Always launch into idle; the operator starts a mode from the
-        # idle menu, at which point we take the radio (wifi.stop) - so
-        # WiFi only goes down when a mode is actively running.
-        self._mode = "idle"
+        # Epic 12: launch straight into Lume - the background loop sees
+        # the mode change on its first iteration and acquires the radio
+        # (stopping WiFi). F (CANCEL) in Lume calls _stop_to_idle, which
+        # restores WiFi and opens the idle menu as the route to Director
+        # / settings / help.
+        self._mode = "lume"
         # Idle start-menu (Menu component); built lazily on first idle
         # tick. None while a mode is running.
         self._idle_menu = None
@@ -234,11 +285,6 @@ class NocturNationApp(app.App):
         # background loop acquires it on entering a mode and releases it
         # (restoring WiFi) on returning to idle.
         self._radio_held = False
-        # Director runtime, built lazily on first Director-mode entry
-        # (_ensure_director). None in Lume mode / before first entry.
-        self._controller = None
-        self._director_host = None
-        self._dispatcher = None
         # Director runtime, built lazily on first Director-mode entry
         # (_ensure_director). None in Lume mode / before first entry.
         self._controller = None
@@ -257,6 +303,16 @@ class NocturNationApp(app.App):
         # frame; the draw loop overlays NO SIGNAL when the gap exceeds
         # 3 s per protocol manual section 6.2.
         self._signal_tracker = SignalTracker()
+        # Signal-loss fallback wash (EMF prep). After kFallbackEnterMs
+        # of silence we synthesise a LIGHT_WASH locally (blue<->purple
+        # cycle, muted intensity) and feed it to the renderers via the
+        # same on_light_wash path real frames take; after a further
+        # kFallbackFadeStartMs we emit a synthetic LIGHT_WASH_END to
+        # fade to black. Any inbound frame cancels the fallback with
+        # a short-release END. _fallback_last_check_ms suppresses
+        # repeated emission while in the same state.
+        self._fallback_active = False
+        self._fallback_faded  = False
         # Epic 5.5 B6: Trust-On-First-Use lock on Director source_id.
         # Locks to the first valid frame from a non-broadcast source
         # after construction or clear(); subsequent frames from other
@@ -312,6 +368,7 @@ class NocturNationApp(app.App):
         self._is_foreground = True
         self._inhibit_patterns()
         self._lcd_renderer.clear()
+        self._lume_text_renderer.clear()
         print("[nocturnation] foreground push - LCD wash resumed")
 
     def _on_foreground_pop(self, event) -> None:
@@ -508,6 +565,9 @@ class NocturNationApp(app.App):
         self._mode = "idle"
         self._renderer.clear()
         self._lcd_renderer.clear()
+        self._lume_text_renderer.clear()
+        self._fallback_active = False
+        self._fallback_faded  = False
         self._dark_perimeter()
         self._open_idle_menu()
         print("[nocturnation] stopped to idle")
@@ -598,6 +658,7 @@ class NocturNationApp(app.App):
         self._settings_open = True
         self._renderer.clear()
         self._lcd_renderer.clear()
+        self._lume_text_renderer.clear()
         self._dark_perimeter()
         self._settings_menu = Menu(
             self,
@@ -766,11 +827,60 @@ class NocturNationApp(app.App):
             self._draw_director(ctx)
             return
 
-        # Background: LCD pulse wash if Full mode is on and there's an
-        # active envelope; otherwise black (Calm Mode keeps the LCD
-        # quiet so the badge stays comfortable face-distance).
-        bg_r, bg_g, bg_b = self._lcd_background_rgb01()
-        ctx.rgb(bg_r, bg_g, bg_b).rectangle(-120, -120, 240, 240).fill()
+        # Background: layered, with DirID-keyed image (Epic 13 Phase 2A)
+        # as the lowest layer when available.
+        #
+        # The image layer is keyed off the current TOFU lock. As the
+        # badge re-locks to a different Director, ``bg_images.load_for_dir_id``
+        # caches the next image; an unknown DirID falls back to a
+        # bundled default logo, and missing default means "no image,
+        # paint the solid colour underneath as before".
+        # Epic 13 Phase 2A: DirID-keyed background image (JPG) via
+        # the documented ctx.image() API. The Tildagon Ctx reference
+        # at https://tildagon.badge.emfcamp.org/tildagon-apps/reference/ctx/
+        # documents image(path, x, y, w, h) as the supported path
+        # for displaying JPG/PNG files; Ctx caches the decoded image
+        # internally by path so we can call it every frame without
+        # re-decoding.
+        #
+        # If no image is resolvable (no DirID-specific file, no
+        # default.jpg) we fall through to the pre-Epic-13 solid
+        # wash colour.
+        bg_path = bg_images.path_for_dir_id(self._tofu.locked_id)
+        if bg_path is not None:
+            ctx.image(bg_path, -120, -120, 240, 240)
+        else:
+            # Pulse wash if Full mode is on and there's an active
+            # envelope; otherwise black (Calm Mode keeps the LCD
+            # quiet so the badge stays comfortable face-distance).
+            bg_r, bg_g, bg_b = self._lcd_background_rgb01()
+            ctx.rgb(bg_r, bg_g, bg_b).rectangle(-120, -120, 240, 240).fill()
+
+        # Epic 13: once we've locked to a Director, the Lume LCD is
+        # a content surface (mirrors the StickC's "LCD is content in
+        # Lume" role per project memory). Suppress the diagnostic
+        # HUD - brand mark / channel / frame count would be noise
+        # against operator-paced text content, and the gaps between
+        # explicit text cues (e.g. between lyric lines, or before the
+        # @ShowSongInfo card fires) shouldn't surface the HUD either.
+        # The wash background is the only visual during those gaps.
+        # NO SIGNAL still surfaces as a small footer because radio
+        # liveness matters even when a lyric is on the screen.
+        # The HUD remains shown when scanning / unlocked so the
+        # operator can confirm the badge is hunting for a Director.
+        if self._tofu.is_locked():
+            now_ms_local = time.ticks_ms() if time is not None else 0
+            if self._lume_text_renderer.has_content():
+                self._display.set_ctx(ctx)
+                self._lume_text_renderer.paint(self._display, now_ms_local)
+            if time is not None and self._signal_tracker.is_lost(now_ms_local):
+                ctx.rgb(0.6, 0.1, 0.1)
+                ctx.text_align = ctx.CENTER
+                ctx.text_baseline = ctx.MIDDLE
+                ctx.font_size = 12
+                ctx.move_to(0, 95).text("NO SIGNAL")
+            return
+
         ctx.rgb(1, 1, 1)
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
@@ -971,6 +1081,19 @@ class NocturNationApp(app.App):
         try:
             self._wlan = network.WLAN(network.STA_IF)
             self._wlan.active(True)
+            # Disable Wi-Fi modem power-save. Per the MicroPython espnow
+            # docs ("ESPNow and Wifi Operation"), the STA defaults to a
+            # duty-cycled PM mode that sleeps through short ESP-NOW
+            # bursts (the Director sends 3x retransmits within ~2 ms),
+            # so receivers must set PM_NONE for reliable receive. This
+            # raises idle current; any future light-sleep work must keep
+            # the radio awake for heartbeat windows or this bug returns.
+            # Older firmware may not expose `pm`; swallow the error so
+            # acquisition still proceeds.
+            try:
+                self._wlan.config(pm=network.WLAN.PM_NONE)
+            except Exception as exc:
+                print("[nocturnation] wlan.config(pm=PM_NONE) failed: %s" % exc)
             if self._esp is None:
                 self._esp = espnow.ESPNow()
             self._esp.active(True)
@@ -978,9 +1101,13 @@ class NocturNationApp(app.App):
             print("[nocturnation] radio acquire failed: %s" % exc)
             self._wlan = None
             return
-        # Fresh scan / lock state for this session.
+        # Fresh scan / lock / signal state for this session. Resetting
+        # the signal tracker means a re-entered session starts in the
+        # truthful NO SIGNAL state rather than carrying a stale
+        # last-frame timestamp from before the previous _release_radio.
         self._scanner = self._make_scanner()
         self._tofu.clear()
+        self._signal_tracker.reset()
         self._radio_held = True
         self._dbg_radio("acquire")
 
@@ -1060,6 +1187,25 @@ class NocturNationApp(app.App):
             self._stop_to_idle()
             return
 
+        # Hard guard: a Tildagon must never broadcast as Director on a
+        # forbidden channel (channel 11 is the commercial / show band,
+        # reserved for Performance-range Directors with random-per-boot
+        # source IDs - a Tildagon swarm transmitting there at EMF would
+        # compete with the orchestrator's StickC Director). Today
+        # DIRECTOR_CHANNEL is hardcoded to 1 so this gate is belt-and-
+        # braces; if the constant ever drifts to 11 (settings injection,
+        # fork divergence, future bug), we refuse to acquire the radio
+        # and return to idle. Logged so it's visible at the console.
+        if DIRECTOR_CHANNEL in DIRECTOR_FORBIDDEN_TX_CHANNELS:
+            print(
+                "[nocturnation] director TX refused on forbidden channel %d "
+                "(reserved for commercial Directors); back to idle"
+                % DIRECTOR_CHANNEL
+            )
+            self._status = "ch %d off-limits" % DIRECTOR_CHANNEL
+            self._stop_to_idle()
+            return
+
         # Director transmits on the hobby channel only (Epic 5.5).
         try:
             wlan.config(channel=DIRECTOR_CHANNEL)
@@ -1094,11 +1240,11 @@ class NocturNationApp(app.App):
             if self._director_overlay is None:
                 # IMU tap-to-beat at ~50 Hz (button tap is polled in
                 # update()).
-                if time is not None and now - last_imu >= imu_interval_ms:
+                if time is not None and ticks_diff(now, last_imu) >= imu_interval_ms:
                     self._controller.poll_inputs(now, button_pressed=None)
                     last_imu = now
                 self._controller.tick(now)
-                if time is not None and now - last_render >= render_interval_ms:
+                if time is not None and ticks_diff(now, last_render) >= render_interval_ms:
                     self._render_perimeter()
                     last_render = now
             await asyncio.sleep_ms(poll_ms)
@@ -1449,7 +1595,7 @@ class NocturNationApp(app.App):
             # channel drifts from what the app believes (B9 debug).
             if _DEBUG and time is not None:
                 now = time.ticks_ms()
-                if now - last_dbg_ms >= 2000:
+                if ticks_diff(now, last_dbg_ms) >= 2000:
                     self._dbg_radio("rx-loop")
                     last_dbg_ms = now
             # Expire the TOFU lock on extended silence. The signal_tracker
@@ -1458,12 +1604,18 @@ class NocturNationApp(app.App):
             # Director and treat the next frame as a fresh lock".
             if time is not None and self._tofu.tick(time.ticks_ms()):
                 print("[nocturnation] TOFU lock expired; ready to relock")
+            # Signal-loss fallback transitions. Evaluated every poll
+            # tick so the 10 s / 40 s edges fire promptly without
+            # waiting for an inbound frame (which is the whole point -
+            # they fire BECAUSE no frames are coming).
+            if time is not None:
+                self._evaluate_fallback(time.ticks_ms())
             # Tick the perimeter at ~20 Hz independent of foreground
             # state. The settings menu, if open, skips this tick (the
             # menu owns the screen visually and our LEDs stay dark).
             if time is not None and not self._settings_open:
                 now = time.ticks_ms()
-                if now - last_render_ms >= render_interval_ms:
+                if ticks_diff(now, last_render_ms) >= render_interval_ms:
                     self._render_perimeter()
                     last_render_ms = now
             await asyncio.sleep_ms(poll_ms)
@@ -1482,6 +1634,66 @@ class NocturNationApp(app.App):
             return None
         return bytes(msg)
 
+    # -- Signal-loss fallback wash ----------------------------------
+
+    def _emit_fallback_wash_start(self, now_ms):
+        """Synthesise the calm blue/purple cycle wash + push it to
+        both perimeter and LCD renderers as if it had arrived from the
+        Director. Local dispatch only - never broadcast."""
+        f = make_light_wash_frame(
+            target_class=0, target_group=0,
+            r1=FALLBACK_COLOUR_A[0], g1=FALLBACK_COLOUR_A[1], b1=FALLBACK_COLOUR_A[2],
+            r2=FALLBACK_COLOUR_B[0], g2=FALLBACK_COLOUR_B[1], b2=FALLBACK_COLOUR_B[2],
+            attack=FALLBACK_ATTACK_TICKS, release=50,
+            intensity=FALLBACK_INTENSITY,
+            cycle_ms=FALLBACK_CYCLE_PERIOD_MS,
+            ttl_seconds=0, pulse_response=0,
+        )
+        self._renderer.on_light_wash(f, now_ms)
+        self._lcd_renderer.on_light_wash(f, now_ms)
+        print("[nocturnation] FALLBACK wash start (blue/purple cycle)")
+
+    def _emit_fallback_wash_fade(self, now_ms):
+        """Begin the ~25.5 s fade-to-black phase of the fallback. u8
+        release_time caps the fade duration at the wash state machine's
+        ceiling; functionally equivalent to the 30 s the operator
+        asked for to the eye."""
+        f = make_light_wash_end_frame(
+            target_class=0, target_group=0,
+            release_time=FALLBACK_FADE_TICKS,
+        )
+        self._renderer.on_light_wash_end(f, now_ms)
+        self._lcd_renderer.on_light_wash_end(f, now_ms)
+        print("[nocturnation] FALLBACK fade-to-black begin")
+
+    def _emit_fallback_wash_recovery(self, now_ms):
+        """Short, sharp fade-out when the Director comes back so the
+        returning wash/pulse traffic isn't competing with the
+        synthetic baseline."""
+        f = make_light_wash_end_frame(
+            target_class=0, target_group=0,
+            release_time=FALLBACK_RECOVERY_TICKS,
+        )
+        self._renderer.on_light_wash_end(f, now_ms)
+        self._lcd_renderer.on_light_wash_end(f, now_ms)
+        print("[nocturnation] FALLBACK wash recovery (signal returned)")
+
+    def _evaluate_fallback(self, now_ms):
+        """Drive the fallback state machine off the SignalTracker's
+        elapsed-since-last-frame value. Called once per receive-loop
+        iteration so the transitions are bench-deterministic regardless
+        of inbound traffic cadence."""
+        if self._signal_tracker._last_frame_ms is None:
+            return   # cold boot, never seen a Director
+        age = ticks_diff(now_ms, self._signal_tracker._last_frame_ms)
+        if not self._fallback_active and age > FALLBACK_ENTER_MS:
+            self._fallback_active = True
+            self._emit_fallback_wash_start(now_ms)
+        if (self._fallback_active and not self._fallback_faded
+                and age > FALLBACK_FADE_START_MS):
+            self._fallback_faded = True
+            self._emit_fallback_wash_fade(now_ms)
+
     def _observe_frame(self, frame) -> None:
         self._frame_count += 1
         self._last_frame = frame
@@ -1489,7 +1701,15 @@ class NocturNationApp(app.App):
         # NO SIGNAL detector, regardless of message type. Heartbeats
         # are just as good as LIGHT_PULSEs here.
         if time is not None:
-            self._signal_tracker.record_frame(time.ticks_ms())
+            now_ms_record = time.ticks_ms()
+            self._signal_tracker.record_frame(now_ms_record)
+            # Cancel any fallback wash that was running. Short-release
+            # END fades the synthetic baseline out before the Director's
+            # returning traffic starts to compete with it.
+            if self._fallback_active:
+                self._fallback_active = False
+                self._fallback_faded  = False
+                self._emit_fallback_wash_recovery(now_ms_record)
 
         if time is None:
             return
@@ -1498,12 +1718,35 @@ class NocturNationApp(app.App):
 
         # HEARTBEAT and unknown / reserved-id frames just bump the frame
         # counter without further per-surface dispatch. LIGHT_PULSE plus
-        # the LIGHT_WASH family (Epic 6C Phase G) are the routed types.
+        # the LIGHT_WASH family (Epic 6C Phase G) are the routed types;
+        # Epic 13 adds TEXT_DISPLAY + CLEAR_SCREEN for display content.
         mt = frame.message_type
         if mt not in (MessageType.LIGHT_PULSE,
                        MessageType.LIGHT_WASH,
                        MessageType.LIGHT_WASH_END,
-                       MessageType.LIGHT_WASH_PULSE):
+                       MessageType.LIGHT_WASH_PULSE,
+                       MessageType.TEXT_DISPLAY,
+                       MessageType.CLEAR_SCREEN):
+            return
+
+        # Epic 13 display family carries its own target_group on the
+        # payload rather than reusing the wash-family field. Apply the
+        # group filter against the right attribute and dispatch directly
+        # to the text renderer - no target_class routing (the message
+        # type IS the class signal). Done here before the wash-family
+        # target_class lookup so we don't accidentally fall through
+        # to a missing-class branch.
+        if mt == MessageType.TEXT_DISPLAY:
+            if frame.text_target_group != 0 \
+               and frame.text_target_group != self._settings.group:
+                return
+            self._lume_text_renderer.on_text_display(frame, now_ms)
+            return
+        if mt == MessageType.CLEAR_SCREEN:
+            if frame.clear_target_group != 0 \
+               and frame.clear_target_group != self._settings.group:
+                return
+            self._lume_text_renderer.on_clear_screen(frame, now_ms)
             return
 
         # Group filter per protocol manual section 4.2: target_group == 0
@@ -1520,30 +1763,30 @@ class NocturNationApp(app.App):
         cls = frame.target_class
 
         if mt == MessageType.LIGHT_PULSE:
-            if cls in _PERIMETER_CLASSES:
+            if cls in PERIMETER_CLASSES:
                 self._renderer.dispatch(frame, now_ms)
-            if cls in _LCD_CLASSES:
+            if cls in LCD_CLASSES:
                 self._lcd_renderer.dispatch(frame, now_ms)
         elif mt == MessageType.LIGHT_WASH:
             # Tildagon is wash-capable on both surfaces (can_pulse +
             # can_wash + can_overlay). Hand the wash to whichever
             # surface(s) match the target class.
-            if cls in _PERIMETER_CLASSES:
+            if cls in PERIMETER_CLASSES:
                 self._renderer.on_light_wash(frame, now_ms)
-            if cls in _LCD_CLASSES:
+            if cls in LCD_CLASSES:
                 self._lcd_renderer.on_light_wash(frame, now_ms)
         elif mt == MessageType.LIGHT_WASH_END:
-            if cls in _PERIMETER_CLASSES:
+            if cls in PERIMETER_CLASSES:
                 self._renderer.on_light_wash_end(frame, now_ms)
-            if cls in _LCD_CLASSES:
+            if cls in LCD_CLASSES:
                 self._lcd_renderer.on_light_wash_end(frame, now_ms)
         elif mt == MessageType.LIGHT_WASH_PULSE:
             # The renderer's on_light_wash_pulse handler internally
             # drops the frame if it has no active wash (per design),
             # so the receive-side dispatch routes unconditionally.
-            if cls in _PERIMETER_CLASSES:
+            if cls in PERIMETER_CLASSES:
                 self._renderer.on_light_wash_pulse(frame, now_ms)
-            if cls in _LCD_CLASSES:
+            if cls in LCD_CLASSES:
                 self._lcd_renderer.on_light_wash_pulse(frame, now_ms)
 
     def _lcd_background_rgb01(self):

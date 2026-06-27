@@ -294,3 +294,84 @@ class TestFormatLockLabel:
         # but the label surface stays informative if it does.
         assert format_lock_label(11, scanner_locked=True,
                                  tofu_locked_id=0xFF) == "ch 11 ?:FF"
+
+
+# =============================================================================
+# Display-family source-match admission (EMF multi-show phase 3, 2026-06-24)
+# =============================================================================
+#
+# Pre-phase-3: the orchestrator emitted display frames with source_id =
+# 0xFF (broadcast) because it didn't know which Director it was bridged
+# through. A carve-out admitted these when a TOFU lock was held.
+#
+# Post-phase-3: the Director Stick's bridge passthrough re-stamps the
+# source_id of bridged display frames to its own id BEFORE broadcasting,
+# so display frames arrive identified and go through the same source-
+# match gate as wash / pulse / heartbeat. The carve-out is gone.
+#
+# The multi-show property this gains: show A's Lume locked to Director A
+# now rejects show B's display frames (they arrive with B's source_id),
+# so show B's lyric overlay no longer leaks onto show A's audience.
+
+class TestDisplayFamilySourceMatch:
+
+    def test_any_broadcast_source_dropped_even_for_display_family(self):
+        """Pre-phase-3 admitted these when locked. Post-phase-3 the
+        Director re-stamps source_id, so a frame arriving with 0xFF
+        means an unstamped / misconfigured upstream - drop it."""
+        t = TofuLock()
+        t.admit(make_frame(source_id=0x42), channel=1, now_ms=100)
+        for mt in (
+            MessageType.TEXT_DISPLAY,
+            MessageType.CLEAR_SCREEN,
+            MessageType.BITMAP_HEADER,
+            MessageType.BITMAP_PLANE,
+        ):
+            f = make_frame(source_id=0xFF, message_type=mt)
+            assert t.admit(f, channel=1, now_ms=200) is False, mt
+
+    def test_display_frame_from_locked_director_admitted(self):
+        """Director-stamped display frame (source_id == locked
+        Director's id) admits through the normal post-lock filter."""
+        t = TofuLock()
+        t.admit(make_frame(source_id=0x42), channel=1, now_ms=100)
+        for mt in (
+            MessageType.TEXT_DISPLAY,
+            MessageType.BITMAP_HEADER,
+            MessageType.BITMAP_PLANE,
+            MessageType.CLEAR_SCREEN,
+        ):
+            f = make_frame(source_id=0x42, message_type=mt)
+            assert t.admit(f, channel=1, now_ms=200) is True, mt
+
+    def test_display_frame_from_different_director_dropped(self):
+        """Multi-show partitioning property: show A's Lume locked to
+        Director A must NOT render show B's lyric overlays."""
+        t = TofuLock()
+        t.admit(make_frame(source_id=0x42), channel=1, now_ms=100)
+        f = make_frame(source_id=0x43, message_type=MessageType.TEXT_DISPLAY)
+        assert t.admit(f, channel=1, now_ms=200) is False
+        f = make_frame(source_id=0x43, message_type=MessageType.BITMAP_PLANE)
+        assert t.admit(f, channel=1, now_ms=201) is False
+
+    def test_display_frame_from_locked_director_resets_liveness(self):
+        """Behaviour change at phase 3: display frames from the locked
+        Director DO count toward liveness. Arrival of a bridged display
+        frame is evidence the Director is up enough to forward."""
+        t = TofuLock(timeout_ms=1000)
+        t.admit(make_frame(source_id=0x42), channel=1, now_ms=0)
+        # Display frame from locked Director at t=500 -> extends timer.
+        t.admit(
+            make_frame(source_id=0x42, message_type=MessageType.TEXT_DISPLAY),
+            channel=1, now_ms=500,
+        )
+        # tick at t=1100: 1100 ms after original wash, but only 600 ms
+        # since the display frame -> still within timeout.
+        assert t.tick(now_ms=1100) is False
+        assert t.is_locked() is True
+
+    def test_non_display_broadcast_still_rejected_when_locked(self):
+        t = TofuLock()
+        t.admit(make_frame(source_id=0x42), channel=1, now_ms=100)
+        f = make_frame(source_id=0xFF, message_type=MessageType.LIGHT_PULSE)
+        assert t.admit(f, channel=1, now_ms=200) is False

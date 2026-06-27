@@ -85,22 +85,62 @@ class TestBroadcast:
         d.dispatch("02:00", _pulse(), now_ms=0)
         assert len(sent) == 1
 
-    def test_sequence_increments_and_wraps(self):
+    def test_sequence_increments_from_one(self):
+        # The counter starts at 1, not 0: sequence_number == 0 signals
+        # "no sequencing" per manual section 3.1 and bypasses dedup, so
+        # emitting it with 3x redundancy would triple-render that frame.
         sent = []
         d = RenderDispatcher(send_fn=sent.append)
         for _ in range(3):
             d.dispatch("00:00", _pulse(), now_ms=0)
         seqs = [parse_frame(b).sequence_number for b in sent]
-        assert seqs == [0, 1, 2]
+        assert seqs == [1, 2, 3]
 
-    def test_sequence_wraps_at_256(self):
+    def test_sequence_skips_zero_on_wrap(self):
+        # 255 -> 1 (skipping 0), matching the M5 next_seq() behaviour.
+        # If we wrapped to 0 the dedup ring would treat that frame as
+        # "no sequencing" and process all three retransmits.
         sent = []
         d = RenderDispatcher(send_fn=sent.append)
         d._sequence = 255
         d.dispatch("00:00", _pulse(), now_ms=0)
         d.dispatch("00:00", _pulse(), now_ms=0)
         seqs = [parse_frame(b).sequence_number for b in sent]
-        assert seqs == [255, 0]
+        assert seqs == [255, 1]
+
+    def test_counter_never_yields_zero_across_full_wrap(self):
+        # Run more than one full wrap (300 > 255) from a fresh counter and
+        # assert no emitted sequence is 0. This is the regression guard
+        # for the "every 256th frame triple-renders" bug.
+        sent = []
+        d = RenderDispatcher(send_fn=sent.append)
+        for _ in range(300):
+            d.dispatch("00:00", _pulse(), now_ms=0)
+        seqs = [parse_frame(b).sequence_number for b in sent]
+        assert all(s != 0 for s in seqs)
+        # And the wrap actually happened (we passed 255 at least once).
+        assert 255 in seqs
+
+    def test_wrapped_frame_still_dedups(self):
+        # The receiver's DedupRing treats sequence == 0 as "no
+        # sequencing" and bypasses the dedup check (dedup.py line 37).
+        # With the wrap-skip-zero fix the dispatcher never emits 0, so
+        # a wrapped frame (e.g. sequence == 1 after 255) is still a
+        # normal value and dedup still catches the 3x retransmit.
+        from nocturnation.protocol.dedup import DedupRing
+        sent = []
+        d = RenderDispatcher(send_fn=sent.append, source_id=0x42, redundancy=3)
+        d._sequence = 255
+        d.dispatch("00:00", _pulse(), now_ms=0)   # emits 255 x3
+        d.dispatch("00:00", _pulse(), now_ms=0)   # emits   1 x3 (the wrap)
+        # Receiver-side: 6 frames in, only 2 unique (source_id, seq) pairs.
+        ring = DedupRing()
+        admitted = 0
+        for payload in sent:
+            f = parse_frame(payload)
+            if not ring.seen(f.source_id, f.sequence_number):
+                admitted += 1
+        assert admitted == 2
 
     def test_send_failure_is_swallowed(self):
         def boom(_payload):
@@ -121,11 +161,11 @@ class TestBroadcast:
         d.dispatch("01:00", _pulse(), now_ms=0)
         assert len(sent) == 3
         seqs = [parse_frame(b).sequence_number for b in sent]
-        assert seqs == [0, 0, 0]
+        assert seqs == [1, 1, 1]
         # Next dispatch advances the sequence once, then repeats it.
         d.dispatch("01:00", _pulse(), now_ms=0)
         seqs2 = [parse_frame(b).sequence_number for b in sent]
-        assert seqs2 == [0, 0, 0, 1, 1, 1]
+        assert seqs2 == [1, 1, 1, 2, 2, 2]
 
     def test_no_send_fn_local_only(self):
         perimeter = _always_fire_perimeter()
@@ -254,10 +294,10 @@ class TestHeartbeat:
     def test_shares_sequence_counter_with_light(self):
         sent = []
         d = RenderDispatcher(send_fn=sent.append)
-        d.dispatch("01:00", _pulse(), now_ms=0)   # seq 0
-        d.heartbeat_tick(2000)                      # seq 1
+        d.dispatch("01:00", _pulse(), now_ms=0)   # seq 1
+        d.heartbeat_tick(2000)                     # seq 2
         seqs = [parse_frame(b).sequence_number for b in sent]
-        assert seqs == [0, 1]
+        assert seqs == [1, 2]
 
 
 class TestDispatchResult:
@@ -352,11 +392,11 @@ class TestDispatchWash:
         # matches the M5 side and lets the receiver dedup uniformly.
         sent = []
         d = RenderDispatcher(send_fn=sent.append)
-        d.dispatch("01:00", _pulse(), now_ms=0)         # seq 0
-        d.dispatch_wash("01:00", _wash(), now_ms=0)     # seq 1
-        d.dispatch("01:00", _pulse(), now_ms=0)         # seq 2
+        d.dispatch("01:00", _pulse(), now_ms=0)         # seq 1
+        d.dispatch_wash("01:00", _wash(), now_ms=0)     # seq 2
+        d.dispatch("01:00", _pulse(), now_ms=0)         # seq 3
         seqs = [parse_frame(b).sequence_number for b in sent]
-        assert seqs == [0, 1, 2]
+        assert seqs == [1, 2, 3]
 
     def test_redundancy_applies_to_wash(self):
         sent = []
@@ -365,7 +405,7 @@ class TestDispatchWash:
         assert len(sent) == 3
         # All three carry the same sequence (receiver dedups).
         seqs = [parse_frame(b).sequence_number for b in sent]
-        assert seqs == [0, 0, 0]
+        assert seqs == [1, 1, 1]
 
     def test_send_failure_is_swallowed_local_loopback_still_runs(self):
         def boom(_p):

@@ -56,6 +56,23 @@ class Capability:
     IMU_TAP                    = 17
     IMU_MOTION                 = 18
 
+    # DMX input (Epic 7 - reserved on Tildagon; an sACN-over-WiFi
+    # variant is a future possibility but not landed today).
+    DMX_INPUT                  = 19
+
+    # Addressable LED strip (Epic 12 - reserved on Tildagon; perimeter
+    # ring is driven by the MicroPython renderer, not as a generic
+    # LedStrip surface).
+    LED_STRIP                  = 20
+
+    # Display content sub-caps (Epic 13). Layered on top of DISPLAY:
+    # the host has a draw context and one or both of "can paint
+    # strings" / "can paint bitmaps". Tildagon declares both - the
+    # CtxDisplay surface in nocturnation.render.display handles
+    # arbitrary text + bitmap rendering on the round LCD.
+    DISPLAY_TEXT               = 21
+    DISPLAY_BITMAP             = 22
+
 
 class CapabilityMask:
     """Compact bitset of Capability values.

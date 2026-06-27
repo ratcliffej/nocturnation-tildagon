@@ -7,6 +7,8 @@ current clock value. The caller is responsible for the clock source
 (time.ticks_ms on the badge, monotonic test seam on the host).
 """
 
+from .clock import ticks_diff
+
 # Protocol manual section 6.2: three missed heartbeats at 1 Hz, or
 # three seconds with no other traffic, signal Director loss. Matches the
 # M5 StickC's kNoSignalGapMs constant.
@@ -42,12 +44,7 @@ class SignalTracker:
         """
         if self._last_frame_ms is None:
             return True
-        # Plain subtraction is fine on the host (CPython) and on the
-        # badge for the gap range we care about (< 12 days). For wrap
-        # safety on MicroPython we could call time.ticks_diff but the
-        # value we get from time.ticks_ms() is monotonic enough for
-        # the 3 s window we check against.
-        return (now_ms - self._last_frame_ms) > self._gap_ms
+        return ticks_diff(now_ms, self._last_frame_ms) > self._gap_ms
 
     def reset(self):
         """Clear the tracker (used on app re-entry to restart the boot

@@ -22,6 +22,7 @@ Reference manuals:
 
 import math
 
+from ..clock import ticks_diff
 from .envelope import TIME_MS, envelope_brightness  # noqa: F401 (re-exported)
 
 # Map the protocol's Chance enum (0..7) to a probability 0..1.
@@ -37,12 +38,29 @@ LED_MAX_INDEX = 12
 LED_COUNT = LED_MAX_INDEX - LED_MIN_INDEX + 1
 
 # Frequency caps: minimum milliseconds between accepted dispatch calls.
-CALM_MIN_INTERVAL_MS = 500   # 2 Hz
-FULL_MIN_INTERVAL_MS = 250   # 4 Hz
+# Calm mode keeps the 500 ms (2 Hz) Harding-safe floor for badges worn
+# by non-consenting audience. Full mode was 250 ms (4 Hz) but that
+# silently dropped every other sparkle at 140 BPM (sparkle_on_beat at
+# 7 Hz = 143 ms gap); raised to 60 ms (~16 Hz) so per-beat sparkles
+# land through 200+ BPM and sub-beat sparkles still fit. The operator
+# opts into Full mode knowing it's bright; the cap exists only to
+# protect against pathological back-to-back dispatches, not to throttle
+# legitimate music tempo.
+CALM_MIN_INTERVAL_MS = 500   # 2 Hz - Harding-safe for audience badges
+FULL_MIN_INTERVAL_MS = 60    # ~16 Hz - covers per-beat sparkles to 200+ BPM
 
 # Peak brightness multiplier applied per Calm Mode.
 CALM_BRIGHTNESS_CAP = 0.5
 FULL_BRIGHTNESS_CAP = 1.0
+
+# Lost-WASH_END failsafe (not a protocol change). A LIGHT_WASH with
+# ttl_seconds == 0 is "infinite" per the spec: it holds until an
+# explicit LIGHT_WASH_END frame arrives. If that frame is lost, a
+# wash with pulse_response = 0 also gates PULSE - so the Lume sits
+# unresponsive forever. After WASH_MAX_HOLD_MS the receiver
+# self-releases the wash so a missed WASH_END eventually recovers.
+# Mirrors the cap in the LCD renderer.
+WASH_MAX_HOLD_MS = 30 * 60 * 1000   # 30 minutes
 
 
 # WashPhase string constants (no IntEnum on MicroPython).
@@ -278,7 +296,7 @@ class PerimeterRenderer:
         # Frequency cap. Primers and zero-duration envelopes don't count
         # against the cap so they don't consume the budget that the
         # subsequent main fire needs.
-        if now_ms - self._last_dispatch_ms < self._min_interval_ms:
+        if ticks_diff(now_ms, self._last_dispatch_ms) < self._min_interval_ms:
             return 0
 
         if frame.r == 0 and frame.g == 0 and frame.b == 0:
@@ -418,21 +436,27 @@ class PerimeterRenderer:
                 w["phase_started_ms"] = now_ms
                 # No need to retain pre_wash_* once attack is over.
         elif phase == _WASH_HOLD:
-            if w["ttl_seconds"] != 0:
-                ttl_ms = w["ttl_seconds"] * 1000
-                if (now_ms - w["started_ms"]) >= ttl_ms:
-                    # TTL expiry: kick off a release using the wash's
-                    # own release as the fade duration.
-                    cur = self._wash_baseline_at(now_ms)
-                    w["pre_wash_r"]           = cur[0]
-                    w["pre_wash_g"]           = cur[1]
-                    w["pre_wash_b"]           = cur[2]
-                    w["release_units_active"] = w["release_units"]
-                    w["release_end_r"]        = 0
-                    w["release_end_g"]        = 0
-                    w["release_end_b"]        = 0
-                    w["phase"]                = _WASH_RELEASE
-                    w["phase_started_ms"]     = now_ms
+            # Effective hold cap: the operator's explicit ttl_seconds
+            # when set; the lost-WASH_END failsafe (WASH_MAX_HOLD_MS)
+            # when ttl_seconds == 0 ("infinite" per spec).
+            effective_ttl_ms = (
+                w["ttl_seconds"] * 1000
+                if w["ttl_seconds"] != 0
+                else WASH_MAX_HOLD_MS
+            )
+            if ticks_diff(now_ms, w["started_ms"]) >= effective_ttl_ms:
+                # TTL expiry: kick off a release using the wash's
+                # own release as the fade duration.
+                cur = self._wash_baseline_at(now_ms)
+                w["pre_wash_r"]           = cur[0]
+                w["pre_wash_g"]           = cur[1]
+                w["pre_wash_b"]           = cur[2]
+                w["release_units_active"] = w["release_units"]
+                w["release_end_r"]        = 0
+                w["release_end_g"]        = 0
+                w["release_end_b"]        = 0
+                w["phase"]                = _WASH_RELEASE
+                w["phase_started_ms"]     = now_ms
         elif phase == _WASH_RELEASE:
             rel_ms = w["release_units_active"] * 100
             if rel_ms == 0 or (now_ms - w["phase_started_ms"]) >= rel_ms:

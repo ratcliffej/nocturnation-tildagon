@@ -24,11 +24,21 @@ Pure logic: no I/O, no clock; the caller injects ``now_ms`` and the
 current channel. Unit-tested host-side; runs unchanged on the badge.
 """
 
-from .protocol import MessageType
+from .clock import ticks_diff
 from .protocol.source_id import SourceId, is_community_range, is_performance_range
 
 
 DEFAULT_TIMEOUT_MS = 10000   # mirrors the M5 firmware's kRescanMs
+
+# Display-family carve-out removed 2026-06-24 (EMF multi-show phase 3):
+# the Director Stick's bridge passthrough now re-stamps display frames
+# (TEXT_DISPLAY / BITMAP_HEADER / BITMAP_PLANE / CLEAR_SCREEN) with the
+# Director's own source_id before broadcasting, so they arrive
+# identified and pass through the same source-match gate as wash /
+# pulse / heartbeat. The old "admit BROADCAST display family when
+# locked" path would have admitted display frames from ALL Directors
+# at a multi-show venue instead of just the locked one - the
+# partitioning bug this phase fixes.
 
 
 class TofuLock:
@@ -72,9 +82,13 @@ class TofuLock:
           every admitted frame, deferring the timeout expiry.
         """
         # Broadcast / wildcard source_id is never a valid Director peer.
-        # (A Director never emits 0xFF as its own id; broadcast is for
+        # A Director never emits 0xFF as its own id; broadcast is for
         # senders that intentionally identify as anonymous, which a
-        # Lume MUST NOT lock to.)
+        # Lume MUST NOT lock to. The Director's bridge re-stamps
+        # display frames with its own source_id before broadcasting
+        # (EMF multi-show phase 3) so display traffic now arrives
+        # identified and goes through the same source-match gate as
+        # wash / pulse / heartbeat below.
         if frame.source_id == SourceId.BROADCAST:
             return False
 
@@ -112,10 +126,7 @@ class TofuLock:
         """
         if self._locked_id is None or self._last_frame_ms is None:
             return False
-        # ticks_ms wraps at 30 bits on MicroPython, but the wrap window
-        # (~12.4 days) is far beyond any reasonable lock duration so a
-        # plain subtraction is fine in practice.
-        if now_ms - self._last_frame_ms >= self._timeout_ms:
+        if ticks_diff(now_ms, self._last_frame_ms) >= self._timeout_ms:
             self._locked_id     = None
             self._last_frame_ms = None
             return True

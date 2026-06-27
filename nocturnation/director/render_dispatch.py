@@ -38,15 +38,7 @@ from ..protocol import (
     make_light_wash_end_frame,
     make_light_wash_pulse_frame,
 )
-from ..protocol.constants import DeviceClass
-
-
-# target_class values that drive each local surface. Mirrors the
-# receive-side routing the Lume already uses (see app.py _observe_frame):
-# perimeter accepts All/Light/MultiLedScreen, LCD accepts
-# All/Screen/MultiLedScreen.
-_PERIMETER_CLASSES = (DeviceClass.ALL, DeviceClass.LIGHT, DeviceClass.MULTI_LED_SCREEN)
-_LCD_CLASSES = (DeviceClass.ALL, DeviceClass.SCREEN, DeviceClass.MULTI_LED_SCREEN)
+from ..render.class_routing import PERIMETER_CLASSES, LCD_CLASSES
 
 
 def parse_target(target):
@@ -133,7 +125,12 @@ class RenderDispatcher:
         self._perimeter = perimeter
         self._lcd = lcd
         self._source_id = source_id & 0xFF
-        self._sequence = 0
+        # Start at 1, not 0: sequence_number == 0 signals "no sequencing"
+        # per protocol manual section 3.1 and bypasses receiver dedup. The
+        # wrap helper (_advance_sequence) also skips 0, so the counter
+        # never emits a frame that the receiver would refuse to dedup.
+        # Mirrors the M5 EspNowBroadcastDriver::next_seq().
+        self._sequence = 1
         # How many times to repeat each LIGHT_PULSE broadcast. ESP-NOW
         # is fire-and-forget with no retransmission, so a single send is
         # lossy; the M5 master sends 3x for reliability and the receiver
@@ -155,6 +152,17 @@ class RenderDispatcher:
         """Update the Director's source_id (e.g. after Epic-5.5
         allocation completes). Takes effect on the next dispatch."""
         self._source_id = source_id & 0xFF
+
+    def _advance_sequence(self):
+        """Advance the sequence counter, wrapping 255 -> 1 (skipping 0).
+
+        sequence_number == 0 signals "no sequencing" per protocol manual
+        section 3.1 and bypasses receiver dedup; emitting it with the
+        Director's 3x redundancy triple-renders that frame. Skip 0 to
+        keep dedup live across the full counter range. Mirrors the M5
+        EspNowBroadcastDriver::next_seq() in espnow_broadcast_driver.cpp.
+        """
+        self._sequence = 1 if self._sequence == 255 else self._sequence + 1
 
     def dispatch(self, target, ev, now_ms):
         """Encode + broadcast + locally loop back one render event.
@@ -181,7 +189,7 @@ class RenderDispatcher:
             ev.release,
             ev.chance,
         )
-        self._sequence = (self._sequence + 1) & 0xFF
+        self._advance_sequence()
 
         sent = False
         if self._send_fn is not None:
@@ -202,8 +210,8 @@ class RenderDispatcher:
         #    round-trip) and feed the renderers that match the class.
         perimeter_lit = 0
         lcd_armed = False
-        if (self._perimeter is not None and target_class in _PERIMETER_CLASSES) or (
-            self._lcd is not None and target_class in _LCD_CLASSES
+        if (self._perimeter is not None and target_class in PERIMETER_CLASSES) or (
+            self._lcd is not None and target_class in LCD_CLASSES
         ):
             frame = make_light_pulse_frame(
                 target_class,
@@ -217,9 +225,9 @@ class RenderDispatcher:
                 ev.chance,
                 source_id=self._source_id,
             )
-            if self._perimeter is not None and target_class in _PERIMETER_CLASSES:
+            if self._perimeter is not None and target_class in PERIMETER_CLASSES:
                 perimeter_lit = self._perimeter.dispatch(frame, now_ms)
-            if self._lcd is not None and target_class in _LCD_CLASSES:
+            if self._lcd is not None and target_class in LCD_CLASSES:
                 lcd_armed = self._lcd.dispatch(frame, now_ms)
 
         return DispatchResult(sent, perimeter_lit, lcd_armed)
@@ -254,7 +262,7 @@ class RenderDispatcher:
             ev.ttl_seconds,
             ev.pulse_response,
         )
-        self._sequence = (self._sequence + 1) & 0xFF
+        self._advance_sequence()
 
         sent = False
         if self._send_fn is not None:
@@ -269,8 +277,8 @@ class RenderDispatcher:
 
         perimeter_lit = 0
         lcd_armed = False
-        if (self._perimeter is not None and target_class in _PERIMETER_CLASSES) or (
-            self._lcd is not None and target_class in _LCD_CLASSES
+        if (self._perimeter is not None and target_class in PERIMETER_CLASSES) or (
+            self._lcd is not None and target_class in LCD_CLASSES
         ):
             frame = make_light_wash_frame(
                 target_class,
@@ -285,12 +293,12 @@ class RenderDispatcher:
                 ev.pulse_response,
                 source_id=self._source_id,
             )
-            if self._perimeter is not None and target_class in _PERIMETER_CLASSES:
+            if self._perimeter is not None and target_class in PERIMETER_CLASSES:
                 self._perimeter.on_light_wash(frame, now_ms)
                 # on_light_wash is a state setter, not a per-LED count.
                 # Report "loopback fired" as 1 for DispatchResult truthiness.
                 perimeter_lit = 1
-            if self._lcd is not None and target_class in _LCD_CLASSES:
+            if self._lcd is not None and target_class in LCD_CLASSES:
                 self._lcd.on_light_wash(frame, now_ms)
                 lcd_armed = True
 
@@ -311,7 +319,7 @@ class RenderDispatcher:
             target_group,
             release_time,
         )
-        self._sequence = (self._sequence + 1) & 0xFF
+        self._advance_sequence()
 
         sent = False
         if self._send_fn is not None:
@@ -326,8 +334,8 @@ class RenderDispatcher:
 
         perimeter_lit = 0
         lcd_armed = False
-        if (self._perimeter is not None and target_class in _PERIMETER_CLASSES) or (
-            self._lcd is not None and target_class in _LCD_CLASSES
+        if (self._perimeter is not None and target_class in PERIMETER_CLASSES) or (
+            self._lcd is not None and target_class in LCD_CLASSES
         ):
             frame = make_light_wash_end_frame(
                 target_class,
@@ -335,10 +343,10 @@ class RenderDispatcher:
                 release_time,
                 source_id=self._source_id,
             )
-            if self._perimeter is not None and target_class in _PERIMETER_CLASSES:
+            if self._perimeter is not None and target_class in PERIMETER_CLASSES:
                 self._perimeter.on_light_wash_end(frame, now_ms)
                 perimeter_lit = 1
-            if self._lcd is not None and target_class in _LCD_CLASSES:
+            if self._lcd is not None and target_class in LCD_CLASSES:
                 self._lcd.on_light_wash_end(frame, now_ms)
                 lcd_armed = True
 
@@ -367,7 +375,7 @@ class RenderDispatcher:
             ev.release,
             ev.chance,
         )
-        self._sequence = (self._sequence + 1) & 0xFF
+        self._advance_sequence()
 
         sent = False
         if self._send_fn is not None:
@@ -382,8 +390,8 @@ class RenderDispatcher:
 
         perimeter_lit = 0
         lcd_armed = False
-        if (self._perimeter is not None and target_class in _PERIMETER_CLASSES) or (
-            self._lcd is not None and target_class in _LCD_CLASSES
+        if (self._perimeter is not None and target_class in PERIMETER_CLASSES) or (
+            self._lcd is not None and target_class in LCD_CLASSES
         ):
             frame = make_light_wash_pulse_frame(
                 target_class,
@@ -397,9 +405,9 @@ class RenderDispatcher:
                 ev.chance,
                 source_id=self._source_id,
             )
-            if self._perimeter is not None and target_class in _PERIMETER_CLASSES:
+            if self._perimeter is not None and target_class in PERIMETER_CLASSES:
                 perimeter_lit = self._perimeter.on_light_wash_pulse(frame, now_ms)
-            if self._lcd is not None and target_class in _LCD_CLASSES:
+            if self._lcd is not None and target_class in LCD_CLASSES:
                 lcd_armed = bool(self._lcd.on_light_wash_pulse(frame, now_ms))
 
         return DispatchResult(sent, perimeter_lit, lcd_armed)
@@ -420,7 +428,7 @@ class RenderDispatcher:
         if self._last_tx_ms is not None and (now_ms - self._last_tx_ms) < interval_ms:
             return False
         payload = encode_heartbeat(self._source_id, self._sequence, tick=now_ms)
-        self._sequence = (self._sequence + 1) & 0xFF
+        self._advance_sequence()
         try:
             self._send_fn(payload)
         except Exception:

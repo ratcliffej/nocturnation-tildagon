@@ -148,12 +148,30 @@ class Settings:
         """Load from disk; return defaults if the file is missing or
         corrupt. Errors are silent because the boot path should never
         be blocked by a corrupted settings file - the operator's
-        recourse is to re-tune the settings in-app."""
+        recourse is to re-tune the settings in-app.
+
+        First-install behaviour (EMF stage-team feature 2026-06-23):
+        when the settings file doesn't exist (or is unreadable), roll
+        a random group in [1, 3] and persist it. With a swarm of
+        Tildagon Lumes coming out of the box this gives the LD ~3
+        evenly-distributed addressable zones without per-device
+        config. The operator can override via the in-app settings
+        menu after first boot; the override is sticky from then on.
+        """
         try:
             with open(path, "r") as f:
                 return cls.from_dict(json.load(f))
         except (OSError, ValueError):
-            return cls()
+            import random
+            s = cls(group=random.randint(1, 3))
+            try:
+                s.save(path)
+            except OSError:
+                # Filesystem write failed (read-only? out of space?).
+                # In-memory random group is still returned; next boot
+                # will re-roll, which is acceptable failure mode.
+                pass
+            return s
 
     def __eq__(self, other):
         if not isinstance(other, Settings):

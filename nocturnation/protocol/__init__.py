@@ -10,6 +10,8 @@ from .constants import (
     HEADER_SIZE,
     MessageType,
     DeviceClass,
+    TEXT_DISPLAY_MAX_HEADER_LEN,
+    TEXT_DISPLAY_MAX_BODY_LEN,
 )
 from .dedup import DedupRing
 from .frame import (
@@ -20,6 +22,8 @@ from .frame import (
     encode_light_wash,
     encode_light_wash_end,
     encode_light_wash_pulse,
+    encode_text_display,
+    encode_clear_screen,
     encode_heartbeat,
     make_light_pulse_frame,
     make_light_wash_frame,
@@ -34,6 +38,8 @@ __all__ = [
     "HEADER_SIZE",
     "MessageType",
     "DeviceClass",
+    "TEXT_DISPLAY_MAX_HEADER_LEN",
+    "TEXT_DISPLAY_MAX_BODY_LEN",
     "DedupRing",
     "Frame",
     "parse_frame",
@@ -42,6 +48,8 @@ __all__ = [
     "encode_light_wash",
     "encode_light_wash_end",
     "encode_light_wash_pulse",
+    "encode_text_display",
+    "encode_clear_screen",
     "encode_heartbeat",
     "make_light_pulse_frame",
     "make_light_wash_frame",
