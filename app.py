@@ -239,12 +239,16 @@ class NocturNationApp(app.App):
         # _frame_window is a ring of recent frame timestamps so the
         # overlay can show frames-per-10s (more useful than heartbeats-
         # only since real traffic = LIGHT_PULSE + LIGHT_WASH + heartbeats).
+        # _hop_counts tracks lifetime counts per hop level [hop=0..3]
+        # so the operator can spot relay-mode presence directly:
+        # any non-zero entry at hop>=1 proves the relay path is alive.
         # _last_heartbeat_ms kept for completeness but no longer shown.
         self._last_frame_ms     = 0
         self._last_heartbeat_ms = 0
         self._last_hop_count    = 0
         self._frame_window      = []   # list[int_ms], pruned to last 10 s
         self._heartbeat_window  = []   # list[int_ms], pruned to last 10 s
+        self._hop_counts        = [0, 0, 0, 0]   # frames seen at hop 0/1/2/3
         self._status = "starting"
         self._esp = None
         # WiFi STA handle, stored so the receive loop can read back the
@@ -972,7 +976,15 @@ class NocturNationApp(app.App):
           3. Frames per 10s - total traffic rate (LIGHT_PULSE + WASH
              + heartbeats). More useful than just heartbeats since
              real shows fire 4-8 LIGHT_PULSEs/sec at peak.
-          4. Hop count - 0 direct, 1+ via repeater.
+          4. Hop count + lifetime per-hop tally. "Hop: N (a b c)"
+             where N is the hop_count of the most recent admitted
+             frame, and (a b c) are the lifetime counts of frames
+             seen at hop=1, hop=2, hop=3. Any non-zero entry in
+             (a b c) is definitive evidence the relay path reached
+             us during this session. Lets the operator confirm
+             relay-mode presence (the relay TX is alive at all)
+             separately from "did the most recent packet come via
+             relay" - a brittle metric since direct-and-relay race.
           5. Total frames received this session.
           6. Footer: how to exit.
 
@@ -1050,12 +1062,24 @@ class NocturNationApp(app.App):
         fr_per_10s = len(self._frame_window)
         ctx.move_to(0, -10).text("Fr/10s: %d" % fr_per_10s)
 
-        # Hop count.
-        ctx.font_size = 22
+        # Hop count + lifetime per-hop tally. "Hop: N (a b c)" where
+        # a/b/c are total frames seen at hop=1/2/3. A non-zero entry
+        # at any of hop 1-3 is definitive proof of relay-path traffic
+        # reaching us, separately from whether the most recent frame
+        # was a relay or a direct. Smaller font because the line is
+        # longer; still much bigger than the old overlay.
+        ctx.font_size = 18
         if self._last_frame is None:
             ctx.move_to(0, 25).text("Hop: --")
         else:
-            ctx.move_to(0, 25).text("Hop: %d" % self._last_hop_count)
+            ctx.move_to(0, 25).text(
+                "Hop: %d (%d %d %d)" % (
+                    self._last_hop_count,
+                    self._hop_counts[1],
+                    self._hop_counts[2],
+                    self._hop_counts[3],
+                )
+            )
 
         # Total frames (dim - less critical at a glance).
         ctx.rgb(*dim)
@@ -1886,6 +1910,13 @@ class NocturNationApp(app.App):
         # heartbeats) so frames/10s reflects total traffic rather
         # than just the 1 Hz heartbeat baseline.
         self._last_hop_count = frame.hop_count
+        # Lifetime per-hop tally - any non-zero entry at hop>=1 is
+        # cast-iron proof a relay path is alive in the test
+        # environment. Clamp to the array's bounds defensively (hop>3
+        # is dropped by parse_admittable already, but better to be
+        # robust than crash on a hypothetical garbage frame).
+        if 0 <= frame.hop_count <= 3:
+            self._hop_counts[frame.hop_count] += 1
         if time is not None:
             now_frame = time.ticks_ms()
             self._last_frame_ms = now_frame
