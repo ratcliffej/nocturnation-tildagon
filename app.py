@@ -232,14 +232,18 @@ class NocturNationApp(app.App):
         self._frame_count = 0
         self._last_frame = None
         # Epic 15 bench follow-up: diagnostic capture for the debug-overlay
-        # LCD view. _last_heartbeat_ms is the timestamp of the most recent
-        # accepted HEARTBEAT frame; _last_hop_count is the hop_count field
-        # of the most recent accepted frame (any type). _heartbeat_window
-        # is a ring of recent heartbeat timestamps so the overlay can show
-        # heartbeats-per-10s. All fields are 0 / empty until the first
-        # frame lands; the renderer treats those as "no signal".
+        # LCD view. _last_frame_ms is the timestamp of the most recent
+        # accepted frame of any type (drives the "Last: N.Ns" gap readout
+        # + the background-colour signal-health band). _last_hop_count is
+        # the hop_count field of the most recent accepted frame.
+        # _frame_window is a ring of recent frame timestamps so the
+        # overlay can show frames-per-10s (more useful than heartbeats-
+        # only since real traffic = LIGHT_PULSE + LIGHT_WASH + heartbeats).
+        # _last_heartbeat_ms kept for completeness but no longer shown.
+        self._last_frame_ms     = 0
         self._last_heartbeat_ms = 0
         self._last_hop_count    = 0
+        self._frame_window      = []   # list[int_ms], pruned to last 10 s
         self._heartbeat_window  = []   # list[int_ms], pruned to last 10 s
         self._status = "starting"
         self._esp = None
@@ -959,42 +963,71 @@ class NocturNationApp(app.App):
         """Epic 15 bench follow-up: diagnostic readout for repeat-mode
         + range testing.
 
-        Lines (top to bottom):
-          1. Lock label - same `C:nn` / `P:nn` convention as the
-             normal HUD; shows what Director (or no Director) we're
-             locked to.
-          2. HB age - milliseconds since the last accepted HEARTBEAT.
-             Director heartbeats are 1 Hz with skip-if-recent, so this
-             SHOULD stay below ~1100 ms when traffic is healthy. Values
-             above ~2000 ms mean dropped heartbeats / weak signal.
-          3. HB/10s - count of heartbeats accepted in the rolling 10 s
-             window. Healthy: 8-10. Weak: 4-7. Dead: 0-3.
-          4. Hop count - hop_count field of the most recent accepted
-             frame. 0 = direct from Director. 1+ = via N repeaters.
-             Lets the operator confirm Lume-repeat mode is doing what
-             it should.
-          5. Frame count - total accepted frames across the session.
-             Bigger = healthier.
-          6. Channel - what scan/lock channel the badge is using.
-          7. Hint footer - how to leave debug mode.
+        Layout (top to bottom, large fonts for outdoor readability):
+          1. Lock label - format_lock_label returns "ch N P:nn" so
+             channel is encoded here (no separate channel line).
+          2. Last frame age - "Last: 0.4s" prominent; this is the
+             diagnostic the operator watches as they walk away from
+             the Director.
+          3. Frames per 10s - total traffic rate (LIGHT_PULSE + WASH
+             + heartbeats). More useful than just heartbeats since
+             real shows fire 4-8 LIGHT_PULSEs/sec at peak.
+          4. Hop count - 0 direct, 1+ via repeater.
+          5. Total frames received this session.
+          6. Footer: how to exit.
 
-        High-contrast black background, mono text, no anti-aliased
-        graphics. Optimised for being read at arm's length on a hardware
-        bench under uncontrolled lighting.
+        Background tints by signal health (Last-frame-age band):
+
+          age < 1.2 s  -> green tint (healthy)
+          1.2 - 2.0 s  -> amber tint (degraded)
+          age > 2.0 s  -> red tint (lost or about to be)
+
+        Text colour adjusts per band to keep contrast:
+          green/red bg -> white text
+          amber bg     -> black text (yellow + white is unreadable
+                          in bright daylight at arm's length)
         """
-        # Background: solid black for contrast.
-        ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
+        # Compute the health band from the last-frame age.
+        if time is None or self._last_frame_ms == 0:
+            band = "unknown"
+            age_ms = -1
+        else:
+            age_ms = ticks_diff(time.ticks_ms(), self._last_frame_ms)
+            if age_ms < 0:
+                age_ms = 0
+            if age_ms < 1200:
+                band = "green"
+            elif age_ms < 2000:
+                band = "amber"
+            else:
+                band = "red"
 
-        # Header.
-        ctx.rgb(1, 1, 1)
+        # Backgrounds tuned for outdoor visibility; text colour matches.
+        if band == "green":
+            bg_r, bg_g, bg_b = 0.0, 0.5, 0.0
+            fg = (1.0, 1.0, 1.0)
+            dim = (0.85, 1.0, 0.85)
+        elif band == "amber":
+            bg_r, bg_g, bg_b = 0.9, 0.6, 0.0
+            fg = (0.0, 0.0, 0.0)
+            dim = (0.2, 0.15, 0.0)
+        elif band == "red":
+            bg_r, bg_g, bg_b = 0.6, 0.0, 0.0
+            fg = (1.0, 1.0, 1.0)
+            dim = (1.0, 0.85, 0.85)
+        else:
+            bg_r, bg_g, bg_b = 0.0, 0.0, 0.0
+            fg = (0.7, 0.7, 0.7)
+            dim = (0.4, 0.4, 0.4)
+
+        ctx.rgb(bg_r, bg_g, bg_b).rectangle(-120, -120, 240, 240).fill()
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
-        ctx.font_size = 14
-        ctx.move_to(0, -95).text("DEBUG")
 
-        # Lock label.
-        ctx.font_size = 12
-        ctx.move_to(0, -65).text(
+        # Lock label (includes "ch N" prefix).
+        ctx.rgb(*fg)
+        ctx.font_size = 20
+        ctx.move_to(0, -85).text(
             format_lock_label(
                 channel=self._scanner.current_channel,
                 scanner_locked=self._scanner.is_locked,
@@ -1002,50 +1035,36 @@ class NocturNationApp(app.App):
             )
         )
 
-        # HB freshness.
-        if time is not None and self._last_heartbeat_ms != 0:
-            age_ms = ticks_diff(time.ticks_ms(), self._last_heartbeat_ms)
-            if age_ms < 0:
-                age_ms = 0
-            # Colour-band the freshness: green <1.5s, amber <3s, red beyond.
-            if age_ms < 1500:
-                ctx.rgb(0.2, 0.9, 0.2)
-            elif age_ms < 3000:
-                ctx.rgb(0.95, 0.75, 0.1)
-            else:
-                ctx.rgb(0.9, 0.2, 0.2)
-            ctx.move_to(0, -40).text("HB age: %d ms" % age_ms)
+        # Last frame age - the prominent diagnostic. "0.4s" format
+        # (1/10 s precision is what the operator can perceive while
+        # walking; ms is too noisy).
+        ctx.font_size = 26
+        if age_ms < 0:
+            ctx.move_to(0, -45).text("Last: --")
         else:
-            ctx.rgb(0.5, 0.5, 0.5)
-            ctx.move_to(0, -40).text("HB age: -")
+            ctx.move_to(0, -45).text("Last: %d.%ds" % (age_ms // 1000,
+                                                       (age_ms % 1000) // 100))
 
-        # HB rate.
-        hb_per_10s = len(self._heartbeat_window)
-        if hb_per_10s >= 8:
-            ctx.rgb(0.2, 0.9, 0.2)
-        elif hb_per_10s >= 4:
-            ctx.rgb(0.95, 0.75, 0.1)
-        else:
-            ctx.rgb(0.9, 0.2, 0.2)
-        ctx.move_to(0, -20).text("HB / 10s: %d" % hb_per_10s)
+        # Frames per 10 s.
+        ctx.font_size = 22
+        fr_per_10s = len(self._frame_window)
+        ctx.move_to(0, -10).text("Fr/10s: %d" % fr_per_10s)
 
         # Hop count.
-        ctx.rgb(1, 1, 1)
+        ctx.font_size = 22
         if self._last_frame is None:
-            ctx.move_to(0, 0).text("Hop: -")
+            ctx.move_to(0, 25).text("Hop: --")
         else:
-            ctx.move_to(0, 0).text("Hop: %d" % self._last_hop_count)
+            ctx.move_to(0, 25).text("Hop: %d" % self._last_hop_count)
 
-        # Frame count + channel.
-        ctx.move_to(0, 20).text("Frames: %d" % self._frame_count)
-        ctx.font_size = 11
-        ctx.move_to(0, 40).text("Chan: %s" % str(self._scanner.current_channel))
+        # Total frames (dim - less critical at a glance).
+        ctx.rgb(*dim)
+        ctx.font_size = 18
+        ctx.move_to(0, 60).text("Tot: %d" % self._frame_count)
 
-        # Hint footer.
-        ctx.rgb(0.6, 0.6, 0.6)
-        ctx.font_size = 10
-        ctx.move_to(0, 85).text("C: settings (toggle off)")
-        ctx.move_to(0, 100).text("F: exit Lume mode")
+        # Footer hint.
+        ctx.font_size = 14
+        ctx.move_to(0, 95).text("C: toggle off")
 
     def _draw_idle(self, ctx) -> None:
         """Idle screen: the start menu (Lume / Director / Settings /
@@ -1839,9 +1858,20 @@ class NocturNationApp(app.App):
         # Epic 15 bench follow-up: capture per-frame diagnostics for
         # the debug overlay. hop_count from every admitted frame
         # (0 = direct from Director, 1+ = via one or more repeaters).
-        # Heartbeat timestamps accumulate in a 10 s window so the
-        # overlay can compute hb-per-10s on demand.
+        # _last_frame_ms drives the prominent "Last: N.Ns" readout +
+        # the green/amber/red signal-health background band. The 10 s
+        # window tracks every frame (LIGHT_PULSE + LIGHT_WASH +
+        # heartbeats) so frames/10s reflects total traffic rather
+        # than just the 1 Hz heartbeat baseline.
         self._last_hop_count = frame.hop_count
+        if time is not None:
+            now_frame = time.ticks_ms()
+            self._last_frame_ms = now_frame
+            self._frame_window.append(now_frame)
+            cutoff = 10_000
+            while (self._frame_window
+                   and ticks_diff(now_frame, self._frame_window[0]) > cutoff):
+                self._frame_window.pop(0)
         if frame.message_type == MessageType.HEARTBEAT and time is not None:
             now_hb = time.ticks_ms()
             self._last_heartbeat_ms = now_hb
