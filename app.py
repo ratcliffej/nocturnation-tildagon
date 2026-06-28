@@ -130,7 +130,7 @@ from .nocturnation.protocol import DedupRing, MessageType
 from .nocturnation.protocol.frame import (
     make_light_wash_frame, make_light_wash_end_frame,
 )
-from .nocturnation.receive import process_frame
+from .nocturnation.receive import parse_admittable
 from .nocturnation.render import (
     LcdRenderer,
     LumeTextRenderer,
@@ -1690,7 +1690,7 @@ class NocturNationApp(app.App):
             while elapsed < listen_ms:
                 buf = self._try_recv()
                 if buf is not None:
-                    frame = process_frame(buf, self._dedup)
+                    frame = parse_admittable(buf)
                     # TOFU + cross-range gate (Epic 5.5 B6). A frame
                     # that fails the gate (e.g. community-range id
                     # on ch 11) is dropped silently; the channel
@@ -1701,7 +1701,13 @@ class NocturNationApp(app.App):
                                 and self._tofu.admit(frame, ch, now_ms))
                     self._dbg_frame("scan", buf, frame, admitted)
                     if admitted:
-                        self._observe_frame(frame)
+                        # Dedup check post-admit so the debug overlay
+                        # sees relayed dups (hop_count visible) while
+                        # rendering still skips them. See _observe_frame
+                        # for the is_duplicate contract.
+                        is_dup = self._dedup.seen(frame.source_id,
+                                                  frame.sequence_number)
+                        self._observe_frame(frame, is_duplicate=is_dup)
                         print("[nocturnation] locking channel %d "
                               "(src_id=0x%02X)" % (ch, frame.source_id))
                         self._scanner.lock()
@@ -1728,7 +1734,7 @@ class NocturNationApp(app.App):
         while self._mode == "lume":
             buf = self._try_recv()
             if buf is not None:
-                frame = process_frame(buf, self._dedup)
+                frame = parse_admittable(buf)
                 # TOFU + cross-range gate (Epic 5.5 B6). Drops frames
                 # from non-locked source_ids and community-range ids
                 # on channel 11.
@@ -1737,7 +1743,12 @@ class NocturNationApp(app.App):
                             and self._tofu.admit(frame, self._receive_channel, now_ms))
                 self._dbg_frame("rx", buf, frame, admitted)
                 if admitted:
-                    self._observe_frame(frame)
+                    # Dedup check post-admit so the debug overlay
+                    # sees relayed dups (hop_count visible) while
+                    # rendering still skips them. See _observe_frame.
+                    is_dup = self._dedup.seen(frame.source_id,
+                                              frame.sequence_number)
+                    self._observe_frame(frame, is_duplicate=is_dup)
                     if frame.message_type == MessageType.LIGHT_PULSE:
                         print(
                             "[nocturnation] LIGHT r=%d g=%d b=%d cls=%d grp=%d"
@@ -1852,7 +1863,18 @@ class NocturNationApp(app.App):
             self._fallback_faded = True
             self._emit_fallback_wash_fade(now_ms)
 
-    def _observe_frame(self, frame) -> None:
+    def _observe_frame(self, frame, is_duplicate=False) -> None:
+        # Epic 15 bench follow-up: diagnostic state updates on EVERY
+        # admitted frame, including duplicates. This is what lets the
+        # debug overlay show Hop:1 when a relayed frame arrives even
+        # if it's a dup of a direct hop:0 we already rendered. Without
+        # this, the operator couldn't tell whether the relay path was
+        # alive (dup-filtered relays + healthy direct path looked the
+        # same as no-relay).
+        #
+        # is_duplicate=True skips the render dispatch (LIGHT_PULSE /
+        # WASH / TEXT_DISPLAY) so duplicates don't double-fire on the
+        # output surfaces - that's still the dedup contract.
         self._frame_count += 1
         self._last_frame = frame
         # Epic 15 bench follow-up: capture per-frame diagnostics for
@@ -1898,6 +1920,15 @@ class NocturNationApp(app.App):
                 self._emit_fallback_wash_recovery(now_ms_record)
 
         if time is None:
+            return
+
+        # Dedup gate (Epic 15 bench follow-up). Diagnostics above ran
+        # for every admitted frame; rendering only runs for non-dup
+        # frames so duplicates don't double-pulse the output surfaces.
+        # This is the same contract the old in-process_frame dedup
+        # provided, just moved one layer up so the debug overlay can
+        # see relayed dups.
+        if is_duplicate:
             return
 
         now_ms = time.ticks_ms()

@@ -6,7 +6,7 @@ section 3.1; the function returns None for any of them.
 """
 
 from nocturnation.protocol import DedupRing, MessageType
-from nocturnation.receive import process_frame, MAX_HOP_COUNT
+from nocturnation.receive import process_frame, parse_admittable, MAX_HOP_COUNT
 
 
 # Manual annex C.1 reference vector. Modified per-test with helpers.
@@ -110,3 +110,44 @@ class TestSequenceZeroSemantics:
         for _ in range(5):
             f = process_frame(make_frame(seq=0), d)
             assert f is not None
+
+
+class TestParseAdmittable:
+    """Epic 15 bench follow-up. parse_admittable returns the parsed
+    frame WITHOUT dedup so the caller can update diagnostic state
+    (visible in the debug overlay) for duplicates - specifically,
+    a relayed frame with the same (source_id, seq) as a direct one.
+    Rendering dedup is then handled by the caller after observing.
+    """
+
+    def test_valid_frame_returns_parsed(self):
+        f = parse_admittable(make_frame())
+        assert f is not None
+        assert f.sequence_number == 42
+
+    def test_invalid_frame_returns_none(self):
+        # Magic byte mismatch.
+        bad = bytearray(make_frame())
+        bad[0] = 0x00
+        assert parse_admittable(bytes(bad)) is None
+
+    def test_hop_count_above_limit_dropped(self):
+        # Loop-prevention check still fires (independent of dedup).
+        assert parse_admittable(make_frame(hop=4)) is None
+        assert parse_admittable(make_frame(hop=255)) is None
+
+    def test_no_dedup_so_repeats_pass(self):
+        # Same (source, seq) returned each call - dedup is now the
+        # caller's responsibility. This is what lets a relayed
+        # frame's hop_count surface in the Tildagon debug overlay
+        # even when it's a dup of a direct hop=0.
+        for _ in range(5):
+            f = parse_admittable(make_frame(seq=99))
+            assert f is not None
+            assert f.sequence_number == 99
+
+    def test_hop_count_preserved(self):
+        # The diagnostic value the overlay reads.
+        f = parse_admittable(make_frame(hop=1))
+        assert f is not None
+        assert f.hop_count == 1
