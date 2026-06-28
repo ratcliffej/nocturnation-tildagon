@@ -130,7 +130,7 @@ from .nocturnation.protocol import DedupRing, MessageType
 from .nocturnation.protocol.frame import (
     make_light_wash_frame, make_light_wash_end_frame,
 )
-from .nocturnation.receive import process_frame
+from .nocturnation.receive import parse_admittable
 from .nocturnation.render import (
     LcdRenderer,
     LumeTextRenderer,
@@ -231,6 +231,26 @@ class NocturNationApp(app.App):
         self._dedup = DedupRing()
         self._frame_count = 0
         self._last_frame = None
+        # Epic 15 bench follow-up: diagnostic capture for the debug-overlay
+        # LCD view. _last_frame_ms is the timestamp of the most recent
+        # accepted frame of any type (drives the "Last: N.Ns" gap readout
+        # + the background-colour signal-health band). _last_hop_count is
+        # the hop_count field of the most recent accepted frame.
+        # _frame_window is a ring of recent frame timestamps so the
+        # overlay can show frames-per-10s (more useful than heartbeats-
+        # only since real traffic = LIGHT_PULSE + LIGHT_WASH + heartbeats).
+        # _hops_seen[h] flips True the first time a frame at hop=h
+        # arrives. Indexed by hop_count (0..3). Drives the overlay's
+        # "(1 2 3)" live meter - presence/absence per hop level,
+        # no counts. Any non-zero entry at hop>=1 is cast-iron
+        # evidence the relay path reached us during this session.
+        # _last_heartbeat_ms kept for completeness but no longer shown.
+        self._last_frame_ms     = 0
+        self._last_heartbeat_ms = 0
+        self._last_hop_count    = 0
+        self._frame_window      = []   # list[int_ms], pruned to last 10 s
+        self._heartbeat_window  = []   # list[int_ms], pruned to last 10 s
+        self._hops_seen         = [False, False, False, False]   # by hop 0..3
         self._status = "starting"
         self._esp = None
         # WiFi STA handle, stored so the receive loop can read back the
@@ -706,6 +726,7 @@ class NocturNationApp(app.App):
             "Calm Mode: %s" % ("ON" if self._settings.calm_mode else "OFF"),
             "Group: %d" % self._settings.group,
             "Channel: %s" % self._settings.channel,
+            "Debug: %s" % ("ON" if self._settings.debug_mode else "OFF"),
             "Rescan",
             "Back",
         ]
@@ -745,6 +766,13 @@ class NocturNationApp(app.App):
                 pos = -1
             self._settings.channel = _CHANNEL_CYCLE[(pos + 1) % len(_CHANNEL_CYCLE)]
         elif idx == 3:
+            # Debug overlay toggle (Epic 15 bench follow-up). When ON,
+            # the Lume LCD shows last-heartbeat freshness, hop count
+            # of the most recent frame, heartbeats-per-10s window, and
+            # the TOFU lock label - used to objectively measure
+            # repeat-mode behaviour at range.
+            self._settings.debug_mode = not self._settings.debug_mode
+        elif idx == 4:
             # Rescan (Epic 5.5 B7). Clears the TOFU lock so the next
             # valid frame on the current channel establishes a fresh
             # lock. Note: the Tildagon's radio doesn't reliably support
@@ -754,7 +782,7 @@ class NocturNationApp(app.App):
             print("[nocturnation] TOFU lock cleared by operator")
             self._close_settings()
             return
-        elif idx == 4:
+        elif idx == 5:
             self._close_settings()
             return
         # Persist after every change. If the save fails we keep the
@@ -825,6 +853,17 @@ class NocturNationApp(app.App):
         # Director mode: the active Show owns the screen (or an overlay).
         if self._mode == "director":
             self._draw_director(ctx)
+            return
+
+        # Epic 15 bench follow-up. When the operator has toggled debug
+        # ON in Settings, the Lume LCD is taken over by a diagnostic
+        # readout: last-heartbeat freshness, current hop count, hb/10s,
+        # lock label. Bypasses the normal background-image + wash +
+        # text layers because diagnostic clarity beats aesthetics
+        # during a range test. Re-toggle OFF to restore the regular
+        # Lume LCD behaviour.
+        if self._mode == "lume" and self._settings.debug_mode:
+            self._draw_debug_overlay(ctx)
             return
 
         # Background: layered, with DirID-keyed image (Epic 13 Phase 2A)
@@ -925,6 +964,137 @@ class NocturNationApp(app.App):
         # what.
         ctx.font_size = 10
         ctx.move_to(0, 85).text("C: settings   F: exit")
+
+    def _draw_debug_overlay(self, ctx) -> None:
+        """Epic 15 bench follow-up: diagnostic readout for repeat-mode
+        + range testing.
+
+        Layout (top to bottom, large fonts for outdoor readability):
+          1. Lock label - format_lock_label returns "ch N P:nn" so
+             channel is encoded here (no separate channel line).
+          2. Last frame age - "Last: 0.4s" prominent; this is the
+             diagnostic the operator watches as they walk away from
+             the Director.
+          3. Frames per 10s - total traffic rate (LIGHT_PULSE + WASH
+             + heartbeats). More useful than just heartbeats since
+             real shows fire 4-8 LIGHT_PULSEs/sec at peak.
+          4. Hop count + live meter of further hops also reaching
+             us. "Hop: N (a b ...)" where N is the most recent
+             admitted frame's hop, and (a b ...) lists each hop
+             level GREATER than N that has been seen in this
+             session. Examples:
+                Hop: 0 ()      direct only - no relay observed
+                Hop: 0 (1 2)   direct latest, but relay-and-relay
+                               -of-relay frames have also arrived
+                Hop: 1 (2)     latest was via one repeater, double-
+                               relay frames are also reaching us
+             Empty parens after a known-relaying repeater has been
+             firing = relay TX isn't reaching us.
+          5. Total frames received this session.
+          6. Footer: how to exit.
+
+        Background tints by signal health (Last-frame-age band):
+
+          age < 1.2 s  -> green tint (healthy)
+          1.2 - 2.0 s  -> amber tint (degraded)
+          age > 2.0 s  -> red tint (lost or about to be)
+
+        Text colour adjusts per band to keep contrast:
+          green/red bg -> white text
+          amber bg     -> black text (yellow + white is unreadable
+                          in bright daylight at arm's length)
+        """
+        # Compute the health band from the last-frame age.
+        if time is None or self._last_frame_ms == 0:
+            band = "unknown"
+            age_ms = -1
+        else:
+            age_ms = ticks_diff(time.ticks_ms(), self._last_frame_ms)
+            if age_ms < 0:
+                age_ms = 0
+            if age_ms < 1200:
+                band = "green"
+            elif age_ms < 2000:
+                band = "amber"
+            else:
+                band = "red"
+
+        # Backgrounds tuned for outdoor visibility; text colour matches.
+        if band == "green":
+            bg_r, bg_g, bg_b = 0.0, 0.5, 0.0
+            fg = (1.0, 1.0, 1.0)
+            dim = (0.85, 1.0, 0.85)
+        elif band == "amber":
+            bg_r, bg_g, bg_b = 0.9, 0.6, 0.0
+            fg = (0.0, 0.0, 0.0)
+            dim = (0.2, 0.15, 0.0)
+        elif band == "red":
+            bg_r, bg_g, bg_b = 0.6, 0.0, 0.0
+            fg = (1.0, 1.0, 1.0)
+            dim = (1.0, 0.85, 0.85)
+        else:
+            bg_r, bg_g, bg_b = 0.0, 0.0, 0.0
+            fg = (0.7, 0.7, 0.7)
+            dim = (0.4, 0.4, 0.4)
+
+        ctx.rgb(bg_r, bg_g, bg_b).rectangle(-120, -120, 240, 240).fill()
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+
+        # Lock label (includes "ch N" prefix).
+        ctx.rgb(*fg)
+        ctx.font_size = 20
+        ctx.move_to(0, -85).text(
+            format_lock_label(
+                channel=self._scanner.current_channel,
+                scanner_locked=self._scanner.is_locked,
+                tofu_locked_id=self._tofu.locked_id,
+            )
+        )
+
+        # Last frame age - the prominent diagnostic. "0.4s" format
+        # (1/10 s precision is what the operator can perceive while
+        # walking; ms is too noisy).
+        ctx.font_size = 26
+        if age_ms < 0:
+            ctx.move_to(0, -45).text("Last: --")
+        else:
+            ctx.move_to(0, -45).text("Last: %d.%ds" % (age_ms // 1000,
+                                                       (age_ms % 1000) // 100))
+
+        # Frames per 10 s.
+        ctx.font_size = 22
+        fr_per_10s = len(self._frame_window)
+        ctx.move_to(0, -10).text("Fr/10s: %d" % fr_per_10s)
+
+        # Hop count + live meter of further relay hops also reaching
+        # us. "Hop: N (a b ...)" where (a b ...) are the hop levels
+        # GREATER than N that have been observed in this session.
+        # Direct + multi-hop relay simultaneously visible reads as
+        # "Hop: 0 (1 2)"; a corner-side Lume hearing only relays
+        # reads as "Hop: 1 (2)" or similar. Empty parens after a
+        # known-relaying repeater has been firing = relay TX isn't
+        # reaching us.
+        ctx.font_size = 18
+        if self._last_frame is None:
+            ctx.move_to(0, 25).text("Hop: --")
+        else:
+            higher_seen = " ".join(
+                str(h) for h in (1, 2, 3)
+                if h > self._last_hop_count and self._hops_seen[h]
+            )
+            ctx.move_to(0, 25).text(
+                "Hop: %d (%s)" % (self._last_hop_count, higher_seen)
+            )
+
+        # Total frames (dim - less critical at a glance).
+        ctx.rgb(*dim)
+        ctx.font_size = 18
+        ctx.move_to(0, 60).text("Tot: %d" % self._frame_count)
+
+        # Footer hint.
+        ctx.font_size = 14
+        ctx.move_to(0, 95).text("C: toggle off")
 
     def _draw_idle(self, ctx) -> None:
         """Idle screen: the start menu (Lume / Director / Settings /
@@ -1081,15 +1251,33 @@ class NocturNationApp(app.App):
         try:
             self._wlan = network.WLAN(network.STA_IF)
             self._wlan.active(True)
+            # Epic 15: switch the PHY to ESP-NOW Long Range mode.
+            # Halves the bitrate (500 kbps vs 1 Mbps) in exchange for
+            # 2.5-7x open-air range. Fleet-wide commitment - LR-only
+            # peers cannot decode standard 802.11b/g/n peers, so every
+            # Director and Lume must enable this together.
+            # Integer 8 = WIFI_PROTOCOL_LR in ESP-IDF v5.x. We pass it
+            # as a raw int rather than network.WLAN.PROTOCOL_LR because
+            # the badge's MicroPython (5114f2c-dirty, March 2024 base)
+            # has the protocol setter but not the named LR constant;
+            # the setter accepts any int and forwards to esp_wifi_set_
+            # protocol() which knows the value. Bench-confirmed
+            # 2026-06-27: wlan.config(protocol=8) succeeds and
+            # wlan.config("protocol") reads back 8.
+            try:
+                self._wlan.config(protocol=8)
+            except Exception as exc:
+                print("[nocturnation] wlan.config(protocol=8/LR) failed: %s" % exc)
             # Disable Wi-Fi modem power-save. Per the MicroPython espnow
             # docs ("ESPNow and Wifi Operation"), the STA defaults to a
             # duty-cycled PM mode that sleeps through short ESP-NOW
-            # bursts (the Director sends 3x retransmits within ~2 ms),
-            # so receivers must set PM_NONE for reliable receive. This
-            # raises idle current; any future light-sleep work must keep
-            # the radio awake for heartbeat windows or this bug returns.
-            # Older firmware may not expose `pm`; swallow the error so
-            # acquisition still proceeds.
+            # bursts (the Director sends 2x retransmits within ~2 ms;
+            # was 3x pre-Epic-15), so receivers must set PM_NONE for
+            # reliable receive. This raises idle current; any future
+            # light-sleep work must keep the radio awake for heartbeat
+            # windows or this bug returns. Older firmware may not
+            # expose `pm`; swallow the error so acquisition still
+            # proceeds.
             try:
                 self._wlan.config(pm=network.WLAN.PM_NONE)
             except Exception as exc:
@@ -1532,7 +1720,7 @@ class NocturNationApp(app.App):
             while elapsed < listen_ms:
                 buf = self._try_recv()
                 if buf is not None:
-                    frame = process_frame(buf, self._dedup)
+                    frame = parse_admittable(buf)
                     # TOFU + cross-range gate (Epic 5.5 B6). A frame
                     # that fails the gate (e.g. community-range id
                     # on ch 11) is dropped silently; the channel
@@ -1543,7 +1731,13 @@ class NocturNationApp(app.App):
                                 and self._tofu.admit(frame, ch, now_ms))
                     self._dbg_frame("scan", buf, frame, admitted)
                     if admitted:
-                        self._observe_frame(frame)
+                        # Dedup check post-admit so the debug overlay
+                        # sees relayed dups (hop_count visible) while
+                        # rendering still skips them. See _observe_frame
+                        # for the is_duplicate contract.
+                        is_dup = self._dedup.seen(frame.source_id,
+                                                  frame.sequence_number)
+                        self._observe_frame(frame, is_duplicate=is_dup)
                         print("[nocturnation] locking channel %d "
                               "(src_id=0x%02X)" % (ch, frame.source_id))
                         self._scanner.lock()
@@ -1570,7 +1764,7 @@ class NocturNationApp(app.App):
         while self._mode == "lume":
             buf = self._try_recv()
             if buf is not None:
-                frame = process_frame(buf, self._dedup)
+                frame = parse_admittable(buf)
                 # TOFU + cross-range gate (Epic 5.5 B6). Drops frames
                 # from non-locked source_ids and community-range ids
                 # on channel 11.
@@ -1579,7 +1773,12 @@ class NocturNationApp(app.App):
                             and self._tofu.admit(frame, self._receive_channel, now_ms))
                 self._dbg_frame("rx", buf, frame, admitted)
                 if admitted:
-                    self._observe_frame(frame)
+                    # Dedup check post-admit so the debug overlay
+                    # sees relayed dups (hop_count visible) while
+                    # rendering still skips them. See _observe_frame.
+                    is_dup = self._dedup.seen(frame.source_id,
+                                              frame.sequence_number)
+                    self._observe_frame(frame, is_duplicate=is_dup)
                     if frame.message_type == MessageType.LIGHT_PULSE:
                         print(
                             "[nocturnation] LIGHT r=%d g=%d b=%d cls=%d grp=%d"
@@ -1694,9 +1893,54 @@ class NocturNationApp(app.App):
             self._fallback_faded = True
             self._emit_fallback_wash_fade(now_ms)
 
-    def _observe_frame(self, frame) -> None:
+    def _observe_frame(self, frame, is_duplicate=False) -> None:
+        # Epic 15 bench follow-up: diagnostic state updates on EVERY
+        # admitted frame, including duplicates. This is what lets the
+        # debug overlay show Hop:1 when a relayed frame arrives even
+        # if it's a dup of a direct hop:0 we already rendered. Without
+        # this, the operator couldn't tell whether the relay path was
+        # alive (dup-filtered relays + healthy direct path looked the
+        # same as no-relay).
+        #
+        # is_duplicate=True skips the render dispatch (LIGHT_PULSE /
+        # WASH / TEXT_DISPLAY) so duplicates don't double-fire on the
+        # output surfaces - that's still the dedup contract.
         self._frame_count += 1
         self._last_frame = frame
+        # Epic 15 bench follow-up: capture per-frame diagnostics for
+        # the debug overlay. hop_count from every admitted frame
+        # (0 = direct from Director, 1+ = via one or more repeaters).
+        # _last_frame_ms drives the prominent "Last: N.Ns" readout +
+        # the green/amber/red signal-health background band. The 10 s
+        # window tracks every frame (LIGHT_PULSE + LIGHT_WASH +
+        # heartbeats) so frames/10s reflects total traffic rather
+        # than just the 1 Hz heartbeat baseline.
+        self._last_hop_count = frame.hop_count
+        # Live-meter per-hop tally - any True at hop>=1 is cast-iron
+        # proof a relay path reached us during this session. Clamp
+        # defensively (hop>3 is dropped by parse_admittable already,
+        # but better robust than crash on a garbage frame).
+        if 0 <= frame.hop_count <= 3:
+            self._hops_seen[frame.hop_count] = True
+        if time is not None:
+            now_frame = time.ticks_ms()
+            self._last_frame_ms = now_frame
+            self._frame_window.append(now_frame)
+            cutoff = 10_000
+            while (self._frame_window
+                   and ticks_diff(now_frame, self._frame_window[0]) > cutoff):
+                self._frame_window.pop(0)
+        if frame.message_type == MessageType.HEARTBEAT and time is not None:
+            now_hb = time.ticks_ms()
+            self._last_heartbeat_ms = now_hb
+            self._heartbeat_window.append(now_hb)
+            # Prune to the last 10 s. ticks_diff handles wrap-around;
+            # cheap linear walk because the window is at most ~12
+            # entries (heartbeat is 1 Hz, capped at 1 Hz nominal).
+            cutoff = 10_000
+            while (self._heartbeat_window
+                   and ticks_diff(now_hb, self._heartbeat_window[0]) > cutoff):
+                self._heartbeat_window.pop(0)
         # Every accepted frame counts as Director-alive proof for the
         # NO SIGNAL detector, regardless of message type. Heartbeats
         # are just as good as LIGHT_PULSEs here.
@@ -1712,6 +1956,15 @@ class NocturNationApp(app.App):
                 self._emit_fallback_wash_recovery(now_ms_record)
 
         if time is None:
+            return
+
+        # Dedup gate (Epic 15 bench follow-up). Diagnostics above ran
+        # for every admitted frame; rendering only runs for non-dup
+        # frames so duplicates don't double-pulse the output surfaces.
+        # This is the same contract the old in-process_frame dedup
+        # provided, just moved one layer up so the debug overlay can
+        # see relayed dups.
+        if is_duplicate:
             return
 
         now_ms = time.ticks_ms()

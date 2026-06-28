@@ -67,7 +67,7 @@ class TestDictRoundTrip:
     def test_to_dict_has_all_fields(self):
         s = Settings(calm_mode=False, group=3, channel="11",
                      active_show="simple_tap", mode="director",
-                     help_url="http://example.com")
+                     help_url="http://example.com", debug_mode=True)
         d = s.to_dict()
         assert d == {
             "calm_mode": False,
@@ -76,7 +76,19 @@ class TestDictRoundTrip:
             "active_show": "simple_tap",
             "mode": "director",
             "help_url": "http://example.com",
+            "debug_mode": True,
         }
+
+    def test_debug_mode_defaults_off(self):
+        # Epic 15 follow-up: a fresh badge has debug_mode OFF so a
+        # typical Lume keeps a clean LCD.
+        assert Settings().debug_mode is False
+        # Persisted-as-False round-trips cleanly.
+        assert Settings.from_dict({"debug_mode": False}).debug_mode is False
+        assert Settings.from_dict({"debug_mode": True}).debug_mode is True
+        # Garbage coerces to False (defensive).
+        assert Settings.from_dict({"debug_mode": "yes"}).debug_mode is True   # bool("yes") = True
+        assert Settings.from_dict({}).debug_mode is False                      # missing key
 
     def test_from_dict_populates(self):
         s = Settings.from_dict({

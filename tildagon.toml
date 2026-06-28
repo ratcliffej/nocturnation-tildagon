@@ -33,4 +33,4 @@ description = "Turn your badge into a Lume that pulses with the crowd in time to
 # Monotonic version string; bump on every app-store release. The store
 # schema requires a string here (a bare TOML integer is rejected by the
 # crawler as "expected string, received bigint").
-version = "3"
+version = "4"
