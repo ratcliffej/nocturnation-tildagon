@@ -978,14 +978,18 @@ class NocturNationApp(app.App):
           3. Frames per 10s - total traffic rate (LIGHT_PULSE + WASH
              + heartbeats). More useful than just heartbeats since
              real shows fire 4-8 LIGHT_PULSEs/sec at peak.
-          4. Hop count + live meter of relay levels seen. "Hop: N
-             (a b c)" where N is the hop of the most recent admitted
-             frame, and (a b c) lists each hop level >= 1 that has
-             received a frame at any point in this session. Just
-             presence, not counts - in the field the only question
-             is whether the relay path EVER reached us. Empty "()"
-             after a known-relaying repeater has been firing means
-             the relay isn't getting through.
+          4. Hop count + live meter of further hops also reaching
+             us. "Hop: N (a b ...)" where N is the most recent
+             admitted frame's hop, and (a b ...) lists each hop
+             level GREATER than N that has been seen in this
+             session. Examples:
+                Hop: 0 ()      direct only - no relay observed
+                Hop: 0 (1 2)   direct latest, but relay-and-relay
+                               -of-relay frames have also arrived
+                Hop: 1 (2)     latest was via one repeater, double-
+                               relay frames are also reaching us
+             Empty parens after a known-relaying repeater has been
+             firing = relay TX isn't reaching us.
           5. Total frames received this session.
           6. Footer: how to exit.
 
@@ -1063,22 +1067,24 @@ class NocturNationApp(app.App):
         fr_per_10s = len(self._frame_window)
         ctx.move_to(0, -10).text("Fr/10s: %d" % fr_per_10s)
 
-        # Hop count + live meter of seen relay hops. "Hop: N (a b c)"
-        # where (a b c) are the hop levels at which a frame has
-        # arrived at any point this session (just presence, not
-        # counts - "did the relay path ever reach us" is the only
-        # question that matters in the field). An empty "()" after a
-        # known-relaying repeater has been firing means the relay's
-        # rebroadcast isn't getting to us.
+        # Hop count + live meter of further relay hops also reaching
+        # us. "Hop: N (a b ...)" where (a b ...) are the hop levels
+        # GREATER than N that have been observed in this session.
+        # Direct + multi-hop relay simultaneously visible reads as
+        # "Hop: 0 (1 2)"; a corner-side Lume hearing only relays
+        # reads as "Hop: 1 (2)" or similar. Empty parens after a
+        # known-relaying repeater has been firing = relay TX isn't
+        # reaching us.
         ctx.font_size = 18
         if self._last_frame is None:
             ctx.move_to(0, 25).text("Hop: --")
         else:
-            relay_hops_str = " ".join(
-                str(h) for h in (1, 2, 3) if self._hops_seen[h]
+            higher_seen = " ".join(
+                str(h) for h in (1, 2, 3)
+                if h > self._last_hop_count and self._hops_seen[h]
             )
             ctx.move_to(0, 25).text(
-                "Hop: %d (%s)" % (self._last_hop_count, relay_hops_str)
+                "Hop: %d (%s)" % (self._last_hop_count, higher_seen)
             )
 
         # Total frames (dim - less critical at a glance).
