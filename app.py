@@ -231,6 +231,16 @@ class NocturNationApp(app.App):
         self._dedup = DedupRing()
         self._frame_count = 0
         self._last_frame = None
+        # Epic 15 bench follow-up: diagnostic capture for the debug-overlay
+        # LCD view. _last_heartbeat_ms is the timestamp of the most recent
+        # accepted HEARTBEAT frame; _last_hop_count is the hop_count field
+        # of the most recent accepted frame (any type). _heartbeat_window
+        # is a ring of recent heartbeat timestamps so the overlay can show
+        # heartbeats-per-10s. All fields are 0 / empty until the first
+        # frame lands; the renderer treats those as "no signal".
+        self._last_heartbeat_ms = 0
+        self._last_hop_count    = 0
+        self._heartbeat_window  = []   # list[int_ms], pruned to last 10 s
         self._status = "starting"
         self._esp = None
         # WiFi STA handle, stored so the receive loop can read back the
@@ -706,6 +716,7 @@ class NocturNationApp(app.App):
             "Calm Mode: %s" % ("ON" if self._settings.calm_mode else "OFF"),
             "Group: %d" % self._settings.group,
             "Channel: %s" % self._settings.channel,
+            "Debug: %s" % ("ON" if self._settings.debug_mode else "OFF"),
             "Rescan",
             "Back",
         ]
@@ -745,6 +756,13 @@ class NocturNationApp(app.App):
                 pos = -1
             self._settings.channel = _CHANNEL_CYCLE[(pos + 1) % len(_CHANNEL_CYCLE)]
         elif idx == 3:
+            # Debug overlay toggle (Epic 15 bench follow-up). When ON,
+            # the Lume LCD shows last-heartbeat freshness, hop count
+            # of the most recent frame, heartbeats-per-10s window, and
+            # the TOFU lock label - used to objectively measure
+            # repeat-mode behaviour at range.
+            self._settings.debug_mode = not self._settings.debug_mode
+        elif idx == 4:
             # Rescan (Epic 5.5 B7). Clears the TOFU lock so the next
             # valid frame on the current channel establishes a fresh
             # lock. Note: the Tildagon's radio doesn't reliably support
@@ -754,7 +772,7 @@ class NocturNationApp(app.App):
             print("[nocturnation] TOFU lock cleared by operator")
             self._close_settings()
             return
-        elif idx == 4:
+        elif idx == 5:
             self._close_settings()
             return
         # Persist after every change. If the save fails we keep the
@@ -825,6 +843,17 @@ class NocturNationApp(app.App):
         # Director mode: the active Show owns the screen (or an overlay).
         if self._mode == "director":
             self._draw_director(ctx)
+            return
+
+        # Epic 15 bench follow-up. When the operator has toggled debug
+        # ON in Settings, the Lume LCD is taken over by a diagnostic
+        # readout: last-heartbeat freshness, current hop count, hb/10s,
+        # lock label. Bypasses the normal background-image + wash +
+        # text layers because diagnostic clarity beats aesthetics
+        # during a range test. Re-toggle OFF to restore the regular
+        # Lume LCD behaviour.
+        if self._mode == "lume" and self._settings.debug_mode:
+            self._draw_debug_overlay(ctx)
             return
 
         # Background: layered, with DirID-keyed image (Epic 13 Phase 2A)
@@ -925,6 +954,98 @@ class NocturNationApp(app.App):
         # what.
         ctx.font_size = 10
         ctx.move_to(0, 85).text("C: settings   F: exit")
+
+    def _draw_debug_overlay(self, ctx) -> None:
+        """Epic 15 bench follow-up: diagnostic readout for repeat-mode
+        + range testing.
+
+        Lines (top to bottom):
+          1. Lock label - same `C:nn` / `P:nn` convention as the
+             normal HUD; shows what Director (or no Director) we're
+             locked to.
+          2. HB age - milliseconds since the last accepted HEARTBEAT.
+             Director heartbeats are 1 Hz with skip-if-recent, so this
+             SHOULD stay below ~1100 ms when traffic is healthy. Values
+             above ~2000 ms mean dropped heartbeats / weak signal.
+          3. HB/10s - count of heartbeats accepted in the rolling 10 s
+             window. Healthy: 8-10. Weak: 4-7. Dead: 0-3.
+          4. Hop count - hop_count field of the most recent accepted
+             frame. 0 = direct from Director. 1+ = via N repeaters.
+             Lets the operator confirm Lume-repeat mode is doing what
+             it should.
+          5. Frame count - total accepted frames across the session.
+             Bigger = healthier.
+          6. Channel - what scan/lock channel the badge is using.
+          7. Hint footer - how to leave debug mode.
+
+        High-contrast black background, mono text, no anti-aliased
+        graphics. Optimised for being read at arm's length on a hardware
+        bench under uncontrolled lighting.
+        """
+        # Background: solid black for contrast.
+        ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
+
+        # Header.
+        ctx.rgb(1, 1, 1)
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+        ctx.font_size = 14
+        ctx.move_to(0, -95).text("DEBUG")
+
+        # Lock label.
+        ctx.font_size = 12
+        ctx.move_to(0, -65).text(
+            format_lock_label(
+                channel=self._scanner.current_channel,
+                scanner_locked=self._scanner.is_locked,
+                tofu_locked_id=self._tofu.locked_id,
+            )
+        )
+
+        # HB freshness.
+        if time is not None and self._last_heartbeat_ms != 0:
+            age_ms = ticks_diff(time.ticks_ms(), self._last_heartbeat_ms)
+            if age_ms < 0:
+                age_ms = 0
+            # Colour-band the freshness: green <1.5s, amber <3s, red beyond.
+            if age_ms < 1500:
+                ctx.rgb(0.2, 0.9, 0.2)
+            elif age_ms < 3000:
+                ctx.rgb(0.95, 0.75, 0.1)
+            else:
+                ctx.rgb(0.9, 0.2, 0.2)
+            ctx.move_to(0, -40).text("HB age: %d ms" % age_ms)
+        else:
+            ctx.rgb(0.5, 0.5, 0.5)
+            ctx.move_to(0, -40).text("HB age: -")
+
+        # HB rate.
+        hb_per_10s = len(self._heartbeat_window)
+        if hb_per_10s >= 8:
+            ctx.rgb(0.2, 0.9, 0.2)
+        elif hb_per_10s >= 4:
+            ctx.rgb(0.95, 0.75, 0.1)
+        else:
+            ctx.rgb(0.9, 0.2, 0.2)
+        ctx.move_to(0, -20).text("HB / 10s: %d" % hb_per_10s)
+
+        # Hop count.
+        ctx.rgb(1, 1, 1)
+        if self._last_frame is None:
+            ctx.move_to(0, 0).text("Hop: -")
+        else:
+            ctx.move_to(0, 0).text("Hop: %d" % self._last_hop_count)
+
+        # Frame count + channel.
+        ctx.move_to(0, 20).text("Frames: %d" % self._frame_count)
+        ctx.font_size = 11
+        ctx.move_to(0, 40).text("Chan: %s" % str(self._scanner.current_channel))
+
+        # Hint footer.
+        ctx.rgb(0.6, 0.6, 0.6)
+        ctx.font_size = 10
+        ctx.move_to(0, 85).text("C: settings (toggle off)")
+        ctx.move_to(0, 100).text("F: exit Lume mode")
 
     def _draw_idle(self, ctx) -> None:
         """Idle screen: the start menu (Lume / Director / Settings /
@@ -1715,6 +1836,23 @@ class NocturNationApp(app.App):
     def _observe_frame(self, frame) -> None:
         self._frame_count += 1
         self._last_frame = frame
+        # Epic 15 bench follow-up: capture per-frame diagnostics for
+        # the debug overlay. hop_count from every admitted frame
+        # (0 = direct from Director, 1+ = via one or more repeaters).
+        # Heartbeat timestamps accumulate in a 10 s window so the
+        # overlay can compute hb-per-10s on demand.
+        self._last_hop_count = frame.hop_count
+        if frame.message_type == MessageType.HEARTBEAT and time is not None:
+            now_hb = time.ticks_ms()
+            self._last_heartbeat_ms = now_hb
+            self._heartbeat_window.append(now_hb)
+            # Prune to the last 10 s. ticks_diff handles wrap-around;
+            # cheap linear walk because the window is at most ~12
+            # entries (heartbeat is 1 Hz, capped at 1 Hz nominal).
+            cutoff = 10_000
+            while (self._heartbeat_window
+                   and ticks_diff(now_hb, self._heartbeat_window[0]) > cutoff):
+                self._heartbeat_window.pop(0)
         # Every accepted frame counts as Director-alive proof for the
         # NO SIGNAL detector, regardless of message type. Heartbeats
         # are just as good as LIGHT_PULSEs here.

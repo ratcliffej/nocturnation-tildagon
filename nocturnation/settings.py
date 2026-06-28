@@ -60,16 +60,22 @@ _VALID_MODES = ("lume", "director")
 
 class Settings:
     __slots__ = ("calm_mode", "group", "channel", "active_show", "mode",
-                 "help_url")
+                 "help_url", "debug_mode")
 
     def __init__(self, calm_mode=True, group=0, channel="auto", active_show="",
-                 mode="lume", help_url=DEFAULT_HELP_URL):
+                 mode="lume", help_url=DEFAULT_HELP_URL, debug_mode=False):
         self.calm_mode = bool(calm_mode)
         self.group = self._coerce_group(group)
         self.channel = self._coerce_channel(channel)
         self.active_show = self._coerce_active_show(active_show)
         self.mode = self._coerce_mode(mode)
         self.help_url = self._coerce_help_url(help_url)
+        # Epic 15 bench feedback: operator-toggle diagnostic overlay
+        # on the Lume LCD. Shows last-heartbeat freshness, hop count,
+        # heartbeats per 10s, and the TOFU lock label. Used to
+        # objectively measure repeat-mode behaviour at range. Default
+        # OFF so a typical Lume keeps a clean LCD.
+        self.debug_mode = bool(debug_mode)
 
     @staticmethod
     def _coerce_group(g):
@@ -124,6 +130,7 @@ class Settings:
             "active_show": self.active_show,
             "mode": self.mode,
             "help_url": self.help_url,
+            "debug_mode": self.debug_mode,
         }
 
     @classmethod
@@ -137,6 +144,7 @@ class Settings:
             active_show=d.get("active_show", ""),
             mode=d.get("mode", "lume"),
             help_url=d.get("help_url", DEFAULT_HELP_URL),
+            debug_mode=d.get("debug_mode", False),
         )
 
     def save(self, path=DEFAULT_PATH):
