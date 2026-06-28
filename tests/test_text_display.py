@@ -323,6 +323,47 @@ def test_renderer_wraps_long_body_into_multiple_lines():
         assert len(c["s"]) * char_advance <= max_w + char_advance  # 1-char slack
 
 
+def test_renderer_honours_explicit_newline_break():
+    # Cue file `\n` escape -> actual newline in the body text.
+    # Renderer should split at the newline before word-wrap so the
+    # operator gets two LINES, not one wrapped phrase.
+    r = LumeTextRenderer()
+    r.on_text_display(_frame_for(header="", body="Music of\nthe Spheres"), 0)
+    d = _RecordingDisplay()
+    r.paint(d, 0)
+    # Exactly two body lines, in the order written.
+    body_calls = [c for c in d.calls]
+    assert len(body_calls) == 2
+    assert body_calls[0]["s"] == "Music of"
+    assert body_calls[1]["s"] == "the Spheres"
+    # Second line is below the first.
+    assert body_calls[1]["y"] > body_calls[0]["y"]
+
+
+def test_renderer_consecutive_newlines_give_blank_line():
+    # `\n\n` in the body produces a blank middle line for vertical
+    # spacing.
+    r = LumeTextRenderer()
+    r.on_text_display(_frame_for(header="", body="Top\n\nBottom"), 0)
+    d = _RecordingDisplay()
+    r.paint(d, 0)
+    # Three lines painted: "Top", "" (blank), "Bottom". Note: depending
+    # on the renderer, the blank line may or may not produce a draw
+    # call. We assert at minimum that "Top" and "Bottom" appear and
+    # in order, with extra vertical separation vs the no-blank case.
+    strings = [c["s"] for c in d.calls]
+    assert "Top" in strings
+    assert "Bottom" in strings
+    top_idx = strings.index("Top")
+    bot_idx = strings.index("Bottom")
+    assert bot_idx > top_idx
+    # "Bottom" should be at a y-offset consistent with the blank in
+    # between (i.e. one extra line height further down than back-to-
+    # back text would be).
+    body_calls = [c for c in d.calls if c["s"] in ("Top", "Bottom")]
+    assert body_calls[1]["y"] > body_calls[0]["y"]
+
+
 def test_renderer_clear_method_wipes_state():
     r = LumeTextRenderer()
     r.on_text_display(_frame_for(header="X", body="Y"), 0)

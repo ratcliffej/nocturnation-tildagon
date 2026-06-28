@@ -261,7 +261,12 @@ class LumeTextRenderer:
     def _wrap_body_lines(self, body):
         """Word-wrap body text into lines that fit the inscribed-
         square width. Words longer than a single line get chopped at
-        the line boundary."""
+        the line boundary.
+
+        Newline characters in the body (introduced via `\\n` escape
+        in the cue file) are treated as forced line breaks: each
+        newline-separated segment is word-wrapped independently.
+        Empty segments (consecutive newlines) become blank lines."""
         if not body:
             return []
         max_w = 2 * INSCRIBED_HALF
@@ -269,7 +274,27 @@ class LumeTextRenderer:
         char_w = max(1, int(BODY_FONT_SIZE * _CHAR_ADVANCE_RATIO))
         max_chars = max(1, max_w // char_w)
         lines = []
-        words = body.split()
+        # Split on forced-newline boundaries first, then word-wrap
+        # each segment. Empty segments produce blank lines so the
+        # author can use `\n\n` to create vertical space.
+        for segment in body.split("\n"):
+            if not segment.strip():
+                lines.append("")
+                if len(lines) >= MAX_BODY_LINES:
+                    return lines[:MAX_BODY_LINES]
+                continue
+            wrapped = self._wrap_segment(segment, max_chars)
+            for line in wrapped:
+                lines.append(line)
+                if len(lines) >= MAX_BODY_LINES:
+                    return lines[:MAX_BODY_LINES]
+        return lines
+
+    def _wrap_segment(self, segment, max_chars):
+        """Word-wrap a single segment of body text (no newlines).
+        Returns a list of lines, each within max_chars."""
+        lines = []
+        words = segment.split()
         if not words:
             return []
         current = ""
