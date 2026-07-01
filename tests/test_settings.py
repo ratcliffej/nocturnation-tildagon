@@ -67,7 +67,8 @@ class TestDictRoundTrip:
     def test_to_dict_has_all_fields(self):
         s = Settings(calm_mode=False, group=3, channel="11",
                      active_show="simple_tap", mode="director",
-                     help_url="http://example.com", debug_mode=True)
+                     help_url="http://example.com", debug_mode=True,
+                     repeat="OFF")
         d = s.to_dict()
         assert d == {
             "calm_mode": False,
@@ -77,6 +78,7 @@ class TestDictRoundTrip:
             "mode": "director",
             "help_url": "http://example.com",
             "debug_mode": True,
+            "repeat": "OFF",
         }
 
     def test_debug_mode_defaults_off(self):
@@ -263,6 +265,42 @@ class TestHelpUrl:
             assert Settings.load(path).help_url == "http://example.com/y"
         finally:
             os.unlink(path)
+
+
+class TestRepeat:
+    """Epic 17: dynamic repeater AUTO/OFF toggle."""
+
+    def test_default_auto(self):
+        # AUTO by default. Engineered repeaters naturally suppress
+        # audience election so AUTO is safe as a default.
+        assert Settings().repeat == "AUTO"
+
+    def test_valid_values_kept(self):
+        assert Settings(repeat="AUTO").repeat == "AUTO"
+        assert Settings(repeat="OFF").repeat == "OFF"
+
+    def test_unknown_falls_back_to_auto(self):
+        assert Settings(repeat="on").repeat == "AUTO"
+        assert Settings(repeat="").repeat == "AUTO"
+        assert Settings(repeat=None).repeat == "AUTO"
+        assert Settings(repeat=42).repeat == "AUTO"
+
+    def test_from_dict_missing_defaults_to_auto(self):
+        # An old settings file without the repeat key upgrades cleanly
+        # into AUTO - no operator action needed.
+        assert Settings.from_dict({}).repeat == "AUTO"
+
+    def test_round_trips(self):
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
+            path = f.name
+        try:
+            Settings(repeat="OFF").save(path)
+            assert Settings.load(path).repeat == "OFF"
+        finally:
+            os.unlink(path)
+
+    def test_different_repeat_not_equal(self):
+        assert Settings(repeat="AUTO") != Settings(repeat="OFF")
 
 
 class TestEquality:

@@ -41,7 +41,36 @@ The NocturNation manuals live in the [**nocturnation-docs**](https://github.com/
 - **Calm Mode** default-on (frequency and brightness caps, LCD flashing disabled) for photosensitivity safety; opt in to full effects in Settings.
 - An idle start menu (**Lume / Director / Settings / Help / Quit**). WiFi stays up while idle and the radio is taken only once a mode starts, so ESP-NOW and the badge's WiFi coexist cleanly. **Help** shows a scannable QR code to the project site.
 - Trust-On-First-Use source locking and Performance-band filtering, so the badge follows a single trusted Director (see the protocol manual's access-control section).
-- **399 host-side tests**, all passing, including byte-level parity against the protocol manual's reference vectors.
+- **559 host-side tests**, all passing, including byte-level parity against the protocol manual's reference vectors.
+
+## Repeat Mode
+
+**Dynamic repeat** turns audience Tildagons into an opportunistic ESP-NOW mesh. On open-air stages, human bodies attenuate the radio signal enough that devices at the back of a dense crowd can drop frames from a Director on stage. When a Tildagon in Lume mode notices that no peer is covering signal in its vicinity, it silently steps up as a repeater; when a peer takes over (another audience badge, or an engineered StickC repeater on stage), it steps back down. The mesh self-organises without operator input.
+
+Each relay increments the frame's hop count by one; the network caps at hop 3, so the mesh can extend up to three "shells" deep through the audience. Recovery from a repeater walking out of range takes 3-9 seconds.
+
+**Configuration:** Config → **Repeat: AUTO** (default) enables the FSM; **Repeat: OFF** disables it entirely. There is no per-badge setup — the default just works.
+
+**LCD status on the standard HUD:**
+
+- **LISTEN** — passively observing, no vacancy detected.
+- **LISTEN?** — vacancy noticed, election pending.
+- **REPEAT** — actively relaying signal.
+- **CDOWN** — peer contention detected; still relaying while assessing whether to step down.
+
+Enable **Debug: ON** in Config to see the state prominently on the debug overlay alongside `tx:` (frames relayed by this badge) and `px:` (peer frames observed).
+
+### Examples
+
+**Solo Tildagon with a Director nearby.** The badge sees direct hop=0 traffic with no peer at hop=1 → within ~1-9 seconds it elects **REPEAT** and relays every incoming frame at hop=1. Coverage now extends beyond the Director's direct range.
+
+**Tildagon plus an engineered StickC repeater on stage.** The StickC's continuous hop=1 output covers the first shell, so the Tildagon stays in **LISTEN** for that role. If nobody is covering the next shell out (no hop=2 traffic in reply to the StickC's hop=1), the Tildagon elects **REPEAT** at hop=2. The two devices stack cleanly without contention.
+
+**A punter walks their repeating Tildagon deeper into the crowd.** The badge loses direct Director range and stops relaying. ~3 seconds later its idle timer fires, dropping it to **LISTEN**. If a nearby StickC or another Tildagon is producing hop=1 in the new position, the badge re-elects **REPEAT** at hop=2 within a few more seconds — total recovery ~4-10 seconds.
+
+**Two Tildagons close together, both trying to relay the same shell.** Both TX at the same hop simultaneously → each sees the other's frame as a peer collision → both enter **CDOWN**. Whichever's random cooldown counter expires first while the other is still active drops back to **LISTEN**; the other continues as **REPEAT**. No operator action needed.
+
+Nothing needs monitoring at showtime — the feature is on by default and adapts continuously to how the crowd moves.
 
 ## Getting it running
 

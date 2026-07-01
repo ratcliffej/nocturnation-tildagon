@@ -115,6 +115,9 @@ try:
     import wifi as _badge_wifi
 except ImportError:
     _badge_wifi = None
+# Standard library on both CPython and MicroPython; used by the dynamic
+# repeater FSM to seed CANDIDATE/COOLDOWN X-frame counters.
+import random
 
 # Relative imports against the internal nocturnation/ package: the
 # Tildagon launcher loads this module as apps.<dir>.app and does not add
@@ -156,7 +159,8 @@ from .nocturnation.director import (
     RESULT_OPEN_PICKER,
     RESULT_OPEN_SETTINGS,
 )
-from .nocturnation.director.espnow_sender import make_sender
+from .nocturnation.director.espnow_sender import make_sender, BROADCAST_MAC
+from .nocturnation.repeater import DynamicRepeater
 
 
 # Cycle order for the settings menu.
@@ -251,6 +255,17 @@ class NocturNationApp(app.App):
         self._frame_window      = []   # list[int_ms], pruned to last 10 s
         self._heartbeat_window  = []   # list[int_ms], pruned to last 10 s
         self._hops_seen         = [False, False, False, False]   # by hop 0..3
+        # Epic 17 B1: optional observer notified for every admitted frame
+        # (both first-seen and dedup-duplicate). B2 wires an FSM instance
+        # here when Repeat=AUTO. Signature: on_admitted_frame(frame,
+        # is_duplicate, now_ms, raw_buf). raw_buf is the untouched ESP-NOW
+        # payload so the FSM can relay by mutating hop_count (byte 5) and
+        # calling esp.send() without re-encoding. now_ms/raw_buf may be
+        # None on the host (no time module or in tests).
+        self._repeater_observer = None
+        # Epic 17 B2: DynamicRepeater FSM instance, created on Lume-mode
+        # entry when settings.repeat == "AUTO" and torn down on exit.
+        self._fsm = None
         self._status = "starting"
         self._esp = None
         # WiFi STA handle, stored so the receive loop can read back the
@@ -727,6 +742,7 @@ class NocturNationApp(app.App):
             "Group: %d" % self._settings.group,
             "Channel: %s" % self._settings.channel,
             "Debug: %s" % ("ON" if self._settings.debug_mode else "OFF"),
+            "Repeat: %s" % self._settings.repeat,
             "Rescan",
             "Back",
         ]
@@ -773,6 +789,14 @@ class NocturNationApp(app.App):
             # repeat-mode behaviour at range.
             self._settings.debug_mode = not self._settings.debug_mode
         elif idx == 4:
+            # Repeat toggle (Epic 17). Cycles AUTO ↔ OFF. In AUTO the
+            # badge silently becomes an audience repeater when no peer
+            # covers its vicinity; OFF disables the FSM entirely. Takes
+            # effect on the next Lume-mode session entry - a mid-session
+            # toggle does not tear down an active FSM here (bench-test
+            # for whether that matters).
+            self._settings.repeat = "OFF" if self._settings.repeat == "AUTO" else "AUTO"
+        elif idx == 5:
             # Rescan (Epic 5.5 B7). Clears the TOFU lock so the next
             # valid frame on the current channel establishes a fresh
             # lock. Note: the Tildagon's radio doesn't reliably support
@@ -782,7 +806,7 @@ class NocturNationApp(app.App):
             print("[nocturnation] TOFU lock cleared by operator")
             self._close_settings()
             return
-        elif idx == 5:
+        elif idx == 6:
             self._close_settings()
             return
         # Persist after every change. If the save fails we keep the
@@ -808,6 +832,52 @@ class NocturNationApp(app.App):
             # starts from black at the next dispatch rather than
             # holding any stale envelope.
             self._lcd_renderer.clear()
+
+    def _start_repeater(self) -> None:
+        """Epic 17 B2: instantiate the dynamic-repeater FSM if Repeat=AUTO.
+
+        Registers the ESP-NOW broadcast peer for TX. Wires the FSM to
+        _repeater_observer so every admitted frame reaches its FSM.
+        No-op when Repeat=OFF or the radio isn't up.
+        """
+        if self._settings.repeat != "AUTO":
+            self._fsm = None
+            self._repeater_observer = None
+            return
+        if self._esp is None or espnow is None:
+            return
+        try:
+            self._esp.add_peer(BROADCAST_MAC)
+        except OSError:
+            # Peer already registered from a prior session; add_peer is
+            # not otherwise idempotent on this MicroPython build.
+            pass
+        esp_ref = self._esp
+
+        def _relay_send(payload):
+            # esp_ref captured at start; if _esp is later cleared we
+            # still send here - but the FSM is torn down at _stop_repeater
+            # before the radio is released, so this closure only fires
+            # while _esp is live.
+            esp_ref.send(BROADCAST_MAC, payload)
+
+        def _relay_random(lo, hi):
+            return random.randint(lo, hi)
+
+        now = time.ticks_ms() if time is not None else 0
+        self._fsm = DynamicRepeater(_relay_send, _relay_random, now_ms=now)
+        self._repeater_observer = self._fsm.on_admitted_frame
+        print("[nocturnation] dynamic repeater armed (Repeat=AUTO)")
+
+    def _stop_repeater(self) -> None:
+        """Epic 17 B2: tear down the FSM. Idempotent - safe to call in
+        any state, including when the FSM was never instantiated."""
+        if self._fsm is not None:
+            print("[nocturnation] dynamic repeater disarmed "
+                  "(relayed=%d peer-seen=%d)" %
+                  (self._fsm.relayed_count, self._fsm.peer_seen_count))
+        self._fsm = None
+        self._repeater_observer = None
 
     def _render_perimeter(self) -> None:
         """Advance perimeter LED envelopes and push to hardware.
@@ -938,7 +1008,16 @@ class NocturNationApp(app.App):
                 tofu_locked_id=self._tofu.locked_id,
             )
         )
-        ctx.move_to(0, 20).text("frames: %d" % self._frame_count)
+        # Epic 17 B2e: FSM state label appended to the frames line when
+        # the dynamic repeater is armed. LISTEN / LISTEN? / REPEAT /
+        # CDOWN. Absent when Repeat=OFF.
+        if self._fsm is not None:
+            ctx.move_to(0, 20).text(
+                "frames: %d  %s" % (self._frame_count,
+                                     self._fsm.state_label())
+            )
+        else:
+            ctx.move_to(0, 20).text("frames: %d" % self._frame_count)
 
         # NO SIGNAL overlay (Block 6) takes precedence over the RGB
         # triplet line: it answers the more important "is the Director
@@ -1087,12 +1166,31 @@ class NocturNationApp(app.App):
                 "Hop: %d (%s)" % (self._last_hop_count, higher_seen)
             )
 
-        # Total frames (dim - less critical at a glance).
-        ctx.rgb(*dim)
-        ctx.font_size = 18
-        ctx.move_to(0, 60).text("Tot: %d" % self._frame_count)
+        # Epic 17 B3: dynamic-repeater state, prominent state label
+        # + relayed / peer-seen counters underneath. Absent when
+        # Repeat=OFF (FSM not instantiated). Replaces the pre-Epic-17
+        # "Tot: N" row - total-frames count wasn't materially useful
+        # in the field vs the FSM state which is the primary
+        # diagnostic during a bench walk-out.
+        if self._fsm is not None:
+            ctx.rgb(*fg)
+            ctx.font_size = 20
+            ctx.move_to(0, 55).text(self._fsm.state_label())
+            ctx.rgb(*dim)
+            ctx.font_size = 14
+            ctx.move_to(0, 80).text(
+                "tx:%d px:%d" % (self._fsm.relayed_count,
+                                  self._fsm.peer_seen_count)
+            )
+        else:
+            # Repeat=OFF: fall back to the pre-Epic-17 Tot: readout so
+            # the space isn't blank on non-repeater devices.
+            ctx.rgb(*dim)
+            ctx.font_size = 18
+            ctx.move_to(0, 60).text("Tot: %d" % self._frame_count)
 
         # Footer hint.
+        ctx.rgb(*fg)
         ctx.font_size = 14
         ctx.move_to(0, 95).text("C: toggle off")
 
@@ -1358,7 +1456,19 @@ class NocturNationApp(app.App):
                 self._status = "no-scan"
                 print("[nocturnation] auto-scan unavailable; listening on default channel")
 
+        # Epic 17 B2: instantiate the dynamic-repeater FSM if Repeat=AUTO.
+        # Register the ESP-NOW broadcast peer once so the FSM's send_fn
+        # can TX relay frames. add_peer is idempotent-with-OSError; we
+        # swallow the error the same way the Director-side make_sender
+        # does.
+        self._start_repeater()
+
         await self._receive_loop()
+
+        # Tear down the FSM on Lume-session exit so a subsequent Director
+        # session doesn't inherit stale state and the observer hook goes
+        # back to None (no-op path).
+        self._stop_repeater()
 
     async def _director_session(self, wlan) -> None:
         """Director transmit session: build the runtime, claim the
@@ -1737,7 +1847,8 @@ class NocturNationApp(app.App):
                         # for the is_duplicate contract.
                         is_dup = self._dedup.seen(frame.source_id,
                                                   frame.sequence_number)
-                        self._observe_frame(frame, is_duplicate=is_dup)
+                        self._observe_frame(frame, is_duplicate=is_dup,
+                                            raw_buf=buf)
                         print("[nocturnation] locking channel %d "
                               "(src_id=0x%02X)" % (ch, frame.source_id))
                         self._scanner.lock()
@@ -1778,7 +1889,8 @@ class NocturNationApp(app.App):
                     # rendering still skips them. See _observe_frame.
                     is_dup = self._dedup.seen(frame.source_id,
                                               frame.sequence_number)
-                    self._observe_frame(frame, is_duplicate=is_dup)
+                    self._observe_frame(frame, is_duplicate=is_dup,
+                                        raw_buf=buf)
                     if frame.message_type == MessageType.LIGHT_PULSE:
                         print(
                             "[nocturnation] LIGHT r=%d g=%d b=%d cls=%d grp=%d"
@@ -1809,6 +1921,11 @@ class NocturNationApp(app.App):
             # they fire BECAUSE no frames are coming).
             if time is not None:
                 self._evaluate_fallback(time.ticks_ms())
+            # Epic 17: dynamic-repeater FSM peer-watch expiry. Runs at
+            # every poll tick so the LISTENING → CANDIDATE trigger fires
+            # on the 100 ms deadline even when no new frame arrives.
+            if self._fsm is not None and time is not None:
+                self._fsm.tick(time.ticks_ms())
             # Tick the perimeter at ~20 Hz independent of foreground
             # state. The settings menu, if open, skips this tick (the
             # menu owns the screen visually and our LEDs stay dark).
@@ -1893,7 +2010,7 @@ class NocturNationApp(app.App):
             self._fallback_faded = True
             self._emit_fallback_wash_fade(now_ms)
 
-    def _observe_frame(self, frame, is_duplicate=False) -> None:
+    def _observe_frame(self, frame, is_duplicate=False, raw_buf=None) -> None:
         # Epic 15 bench follow-up: diagnostic state updates on EVERY
         # admitted frame, including duplicates. This is what lets the
         # debug overlay show Hop:1 when a relayed frame arrives even
@@ -1907,6 +2024,13 @@ class NocturNationApp(app.App):
         # output surfaces - that's still the dedup contract.
         self._frame_count += 1
         self._last_frame = frame
+        # Epic 17 B1: notify the repeater FSM (if wired). Fires for
+        # BOTH first-seen and duplicate admitted frames - the FSM needs
+        # duplicates because a peer's relay of (src, seq) arriving after
+        # ours is a dedup-duplicate but the load-bearing peer signal.
+        if self._repeater_observer is not None:
+            obs_now = time.ticks_ms() if time is not None else None
+            self._repeater_observer(frame, is_duplicate, obs_now, raw_buf)
         # Epic 15 bench follow-up: capture per-frame diagnostics for
         # the debug overlay. hop_count from every admitted frame
         # (0 = direct from Director, 1+ = via one or more repeaters).
