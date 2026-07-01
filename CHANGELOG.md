@@ -4,6 +4,34 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-07-01 — Epic 17 fix: no outer-shell election from the coverage core
+
+Bench-found: a Tildagon sitting beside a StickC shell-1 repeater, both
+in direct earshot of the Director, parked in `ACTIVE(shell-2)` — `tx:`
+crawling, `px:` stuck at 0 — and never stepped down to LISTEN. The
+StickC's continuous hop=1 covers the badge's hop=0 watches (suppressing
+shell-1 election as intended) but nothing covers the hop=1 watches, so
+the badge elected itself shell-2 to relay hop=1→hop=2. In a co-located
+cluster there's no shell-2 audience to serve (nothing to relay) and no
+shell-2 peer to hand off to (never stands down).
+
+The FSM now arms a peer-watch only at the LOWEST hop it hears a given
+`(src, seq)` at. A device that also receives a frame closer to the
+source is in the coverage core, not at an edge, so it no longer seeds
+an outer-shell election. Legitimate cascade is preserved: a badge that
+hears a frame ONLY at hop=1 (walked out of the Director's direct range)
+still elects shell-2. Even in the out-of-order case (relayed copy beats
+the direct copy) the worst outcome is a shell-1 election, which is
+self-correcting via peer detection — never the unresolvable shell-2.
+
+- `nocturnation/repeater.py` — `_note_hop_should_watch` records the
+  lowest hop per recent `(src, seq)` and gates `_add_watch`;
+  `_cancel_watches_above` retires higher-hop watches when a lower-hop
+  copy arrives out of order. New `RECENT_HOP_MEMORY_SIZE` ring bound.
+- `tests/test_repeater.py` — core-cascade tests reframed to the
+  corrected behaviour; added core-stays-LISTEN, edge-still-elects, and
+  out-of-order regression cases.
+
 ## 2026-07-01 — Epic 17: dynamic repeater (B0-B3)
 
 Audience-Tildagon dynamic-repeater FSM. A Tildagon in Lume mode with

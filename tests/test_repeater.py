@@ -134,23 +134,64 @@ class TestListeningToCandidate:
         h = RepeaterHarness()
         h.admit(FakeFrame(seq=1, hop=0), now_ms=1000)
         # Peer relay at hop=1 arrives inside the 100 ms window and
-        # covers the shell-1 watch. State stays LISTENING at this
-        # point. (The peer hop=1 also creates its own shell-2 watch;
-        # a later tick past THAT deadline would elect shell-2 -
-        # correct cascade behaviour, tested separately.)
+        # covers the shell-1 watch. State stays LISTENING. The peer's
+        # hop=1 frame does NOT spawn a shell-2 watch here: we already
+        # heard this (src, seq) direct at hop=0, so a further relay
+        # shell from us would serve no one - see
+        # test_core_device_does_not_cascade_to_shell_2.
         h.admit(FakeFrame(seq=1, hop=1), now_ms=1010)
         assert h.fsm.state == STATE_LISTENING
 
-    def test_shell_2_cascade_elects_when_no_hop_2_peer(self):
-        # After a peer covers hop=0 → hop=1, the received hop=1 spawns
-        # a shell-2 watch. If nobody relays at hop=2 within 100 ms we
-        # correctly cascade into shell-2 candidacy.
+    def test_core_device_does_not_cascade_to_shell_2(self):
+        # A device that hears a frame BOTH direct (hop=0) and relayed
+        # (hop=1) is in the coverage core, not the edge. It must not
+        # elect itself shell-2: nothing downstream needs the frame pushed
+        # a further hop, and no shell-2 peer exists to hand off to, so it
+        # would park in REPEAT forever with almost nothing to relay.
+        # (Bench-found 2026-07-01: Tildagon beside a StickC shell-1
+        # repeater, both in earshot of the Director, stuck ACTIVE(shell-2)
+        # with tx crawling and px=0.)
         h = RepeaterHarness(randoms=[3])
         h.admit(FakeFrame(seq=1, hop=0), now_ms=1000)
         h.admit(FakeFrame(seq=1, hop=1), now_ms=1010)
-        # shell-2 watch deadline = 1010 + 100 = 1110.
+        h.tick(now_ms=1200)
+        assert h.fsm.state == STATE_LISTENING
+        # Sustained: several more direct+relayed pairs never elect.
+        h.admit(FakeFrame(seq=2, hop=0), now_ms=2000)
+        h.admit(FakeFrame(seq=2, hop=1), now_ms=2010)
+        h.admit(FakeFrame(seq=3, hop=0), now_ms=3000)
+        h.admit(FakeFrame(seq=3, hop=1), now_ms=3010)
+        h.tick(now_ms=3200)
+        assert h.fsm.state == STATE_LISTENING
+        assert h.txs == []
+
+    def test_edge_device_elects_shell_2_from_hop_1_only(self):
+        # The legitimate cascade: a device that hears a frame ONLY at
+        # hop=1 (it has walked out of the Director's direct range) is at
+        # the edge and SHOULD extend coverage as shell-2 when no hop=2
+        # relay covers it.
+        h = RepeaterHarness(randoms=[3])
+        h.admit(FakeFrame(seq=1, hop=1), now_ms=1010)
         h.tick(now_ms=1200)
         assert h.fsm.state == STATE_CANDIDATE
+        assert h.fsm._output_hop == 2
+
+    def test_out_of_order_direct_copy_cancels_shell_2_watch(self):
+        # Relayed hop=1 can arrive before the direct hop=0 (the StickC
+        # beats the through-wall direct path). The hop=1 arms a shell-2
+        # watch, but when the direct hop=0 copy lands inside the window
+        # it supersedes it. Any election that follows is at most shell-1
+        # (output_hop=1) - the resolvable role that stands down once a
+        # peer relay is detected - never the phantom, unresolvable
+        # shell-2.
+        h = RepeaterHarness(randoms=[3])
+        h.admit(FakeFrame(seq=1, hop=1), now_ms=1000)   # relayed copy first
+        h.admit(FakeFrame(seq=1, hop=0), now_ms=1050)   # direct copy, in-window
+        h.tick(now_ms=1200)
+        assert h.fsm._output_hop != 2
+        # Here the hop=0 watch goes uncovered, so it elects shell-1.
+        assert h.fsm.state == STATE_CANDIDATE
+        assert h.fsm._output_hop == 1
 
     def test_hop_at_max_creates_no_watch(self):
         # A frame at hop=MAX_HOP_COUNT cannot be relayed (cap), so
@@ -212,10 +253,10 @@ class TestBenchScenario20260701:
     """
 
     def test_shell_2_candidate_not_cancelled_by_shell_1_peer(self):
-        # Setup: enter CANDIDATE(output_hop=2) by seeing a hop=1 frame
-        # go uncovered (nobody relaying at hop=2).
+        # Setup: enter CANDIDATE(output_hop=2) legitimately - an edge
+        # device that hears seq=1 ONLY at hop=1 (never direct), with no
+        # hop=2 relay covering it.
         h = RepeaterHarness(randoms=[3])
-        h.admit(FakeFrame(seq=1, hop=0), now_ms=1000)
         h.admit(FakeFrame(seq=1, hop=1), now_ms=1010)
         h.tick(now_ms=1200)
         assert h.fsm.state == STATE_CANDIDATE
@@ -237,10 +278,9 @@ class TestBenchScenario20260701:
         assert h.fsm.state == STATE_ACTIVE
 
     def test_shell_2_candidate_cancelled_by_shell_2_peer(self):
-        # Same setup, but this time a peer starts relaying at hop=2
+        # Same edge setup, but this time a peer starts relaying at hop=2
         # (matching our target output hop). CANDIDATE should cancel.
         h = RepeaterHarness(randoms=[9])
-        h.admit(FakeFrame(seq=1, hop=0), now_ms=1000)
         h.admit(FakeFrame(seq=1, hop=1), now_ms=1010)
         h.tick(now_ms=1200)
         assert h.fsm.state == STATE_CANDIDATE
