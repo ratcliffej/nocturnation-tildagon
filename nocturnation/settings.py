@@ -56,14 +56,16 @@ DEFAULT_HELP_URL = "http://www.nocturnation.net"
 
 _VALID_CHANNELS = ("auto", "1", "11")
 _VALID_MODES = ("lume", "director")
+_VALID_REPEAT = ("AUTO", "OFF")
 
 
 class Settings:
     __slots__ = ("calm_mode", "group", "channel", "active_show", "mode",
-                 "help_url", "debug_mode")
+                 "help_url", "debug_mode", "repeat")
 
     def __init__(self, calm_mode=True, group=0, channel="auto", active_show="",
-                 mode="lume", help_url=DEFAULT_HELP_URL, debug_mode=False):
+                 mode="lume", help_url=DEFAULT_HELP_URL, debug_mode=False,
+                 repeat="AUTO"):
         self.calm_mode = bool(calm_mode)
         self.group = self._coerce_group(group)
         self.channel = self._coerce_channel(channel)
@@ -76,6 +78,14 @@ class Settings:
         # objectively measure repeat-mode behaviour at range. Default
         # OFF so a typical Lume keeps a clean LCD.
         self.debug_mode = bool(debug_mode)
+        # Epic 17: dynamic repeater mode. "AUTO" enables the FSM in
+        # Lume mode; the badge silently becomes an audience repeater
+        # when no upstream peer is covering its vicinity, and steps
+        # down when a peer takes over. Default AUTO because engineered
+        # (StickC) repeaters naturally suppress audience election, so
+        # AUTO is safe as a default even in fully-covered deployments.
+        # "OFF" disables the FSM entirely (no election, no relay).
+        self.repeat = self._coerce_repeat(repeat)
 
     @staticmethod
     def _coerce_group(g):
@@ -122,6 +132,14 @@ class Settings:
             return u
         return DEFAULT_HELP_URL
 
+    @staticmethod
+    def _coerce_repeat(r):
+        """Constrain to AUTO / OFF; anything else falls back to AUTO
+        (the audience-mesh default)."""
+        if r in _VALID_REPEAT:
+            return r
+        return "AUTO"
+
     def to_dict(self):
         return {
             "calm_mode": self.calm_mode,
@@ -131,6 +149,7 @@ class Settings:
             "mode": self.mode,
             "help_url": self.help_url,
             "debug_mode": self.debug_mode,
+            "repeat": self.repeat,
         }
 
     @classmethod
@@ -145,6 +164,7 @@ class Settings:
             mode=d.get("mode", "lume"),
             help_url=d.get("help_url", DEFAULT_HELP_URL),
             debug_mode=d.get("debug_mode", False),
+            repeat=d.get("repeat", "AUTO"),
         )
 
     def save(self, path=DEFAULT_PATH):
@@ -191,12 +211,14 @@ class Settings:
             and self.active_show == other.active_show
             and self.mode == other.mode
             and self.help_url == other.help_url
+            and self.debug_mode == other.debug_mode
+            and self.repeat == other.repeat
         )
 
     def __repr__(self):
         return (
             "Settings(calm_mode=%r, group=%r, channel=%r, active_show=%r, "
-            "mode=%r, help_url=%r)"
+            "mode=%r, help_url=%r, debug_mode=%r, repeat=%r)"
             % (
                 self.calm_mode,
                 self.group,
@@ -204,5 +226,7 @@ class Settings:
                 self.active_show,
                 self.mode,
                 self.help_url,
+                self.debug_mode,
+                self.repeat,
             )
         )

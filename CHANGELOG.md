@@ -4,6 +4,87 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-07-01 — Epic 17: dynamic repeater (B0-B3)
+
+Audience-Tildagon dynamic-repeater FSM. A Tildagon in Lume mode with
+Repeat=AUTO silently becomes an ESP-NOW relay when it observes no
+peer covering its vicinity, and steps down when a peer takes over.
+Enables self-organising cascade coverage up to 3 shells deep through
+the audience, mitigating the EMF Stage D body-absorption problem where
+crowd density can shadow the far half of the audience from the
+Director. Default AUTO — engineered StickC repeaters (Epic 15) send
+continuous hop=1, which naturally suppresses audience election, so
+AUTO is safe as a default even in fully-covered deployments.
+
+- `nocturnation/repeater.py` — `DynamicRepeater` FSM: LISTENING /
+  CANDIDATE / ACTIVE / COOLDOWN. Per-output-hop peer detection via
+  `(src, seq, hop_txed)` ring buffer. Aggressive LISTENING → CANDIDATE
+  trigger (any single uncovered frame) balanced by 2-9 frame CANDIDATE
+  settling period that absorbs ~2 % transient peer-relay loss.
+- `app.py` — `_repeater_observer` hook in `_observe_frame` fires for
+  every admitted frame (first-seen + duplicate). `_start_repeater` /
+  `_stop_repeater` instantiate + tear down around `_receive_loop`;
+  FSM tick runs in the poll loop alongside `_evaluate_fallback`.
+- `nocturnation/settings.py` — `repeat: AUTO / OFF` field, persisted
+  in `/nocturnation_settings.json`. Config menu entry between Debug
+  and Rescan.
+- LCD indicators: state char (`-` `?` `*` `~`) appended to the
+  standard HUD's frames line; dedicated `R:<state> tx:<n> px:<n>`
+  row on the debug overlay for bench observation.
+- `tools/espnow_loopback_probe.py` — bench-only script that verifies
+  ESP-NOW broadcast does NOT echo back to sender. LOOPBACK: NO
+  confirmed 2026-07-01 across 10 iterations; the FSM's peer detection
+  relies on this assumption.
+- 27 new host tests (`tests/test_repeater.py` + `tests/test_settings.py`
+  additions) cover FSM state transitions, peer detection, watch
+  expiry, ring bounds, LCD indicator, and Repeat setting.
+- Docs: Epic 17 spec at `Docs/epics/epic-17-dynamic-repeater.md`
+  (working copy; Notion sync at Epic close).
+
+Bench fixes 2026-07-01:
+
+  1. CANDIDATE cancel logic tracked only "any covered watch",
+     causing LISTENING ↔ CANDIDATE oscillation when a shell-1 peer
+     (e.g. an engineered StickC repeater) covered shell-1 watches
+     while the FSM was actually electing for shell-2. Fix tracks
+     `_output_hop` on CANDIDATE entry and cancels only on peer
+     traffic at that specific hop.
+  2. ACTIVE relayed ANY input frame with hop<3 regardless of the
+     shell it was elected for. A shell-2 elected device would still
+     TX hop=1 for hop=0 inputs, competing with an engineered shell-1
+     repeater and causing ACTIVE→COOLDOWN→LISTENING→CANDIDATE
+     re-election churn. Fix: ACTIVE/COOLDOWN relay ONLY where
+     `hop + 1 == _output_hop`. A shell-2 role produces hop=2 only,
+     ignoring hop=0 inputs entirely. `_output_hop` is preserved
+     through the CANDIDATE → ACTIVE → COOLDOWN chain; reset only
+     on transition back to LISTENING.
+
+Five regression tests added across TestBenchScenario20260701 and
+TestActiveRelay for role-specific relay + shell-1/shell-2 ignore
+of out-of-role inputs.
+
+UI clarity 2026-07-01: replaced single-char state indicators with
+explicit labels (LISTEN / LISTEN? / REPEAT / CDOWN) on both the
+standard HUD and the debug overlay. Debug overlay's `Tot: N` line
+dropped in favour of a prominent state label at font 20 with
+`tx: N px: N` counters below - the state is the primary field
+diagnostic during a bench walk-out and deserves the space.
+
+  3. ACTIVE/COOLDOWN devices got stuck when their upstream disappeared.
+     A Tildagon in ACTIVE(shell-2) receiving hop=1 from a StickC-shell-1
+     repeater would keep its ACTIVE state even after the StickC was
+     turned off - the FSM's transition-out-of-ACTIVE path only fired
+     on peer collision, not on "no more input at my role's hop". Fix:
+     ACTIVE_IDLE_TIMEOUT_MS = 3000 ms. If no relay has fired in that
+     window, step down to LISTENING and let re-election pick a new
+     role (typically shell-1 in this scenario). Applied in tick(), so
+     the transition fires without needing a new frame arrival. Three
+     regression tests added in TestIdleTimeout.
+
+Not yet done: B4 field bench test with bodies (needs 3 Tildagons +
+volunteers in a park), B5 tuning pass. Target ship: 2026-07-12
+for EMF 2026-07-16 (4-day slack).
+
 ## 2026-05-24 — Repo restructure for app-store packaging
 
 Moved the app payload (`app.py`, `metadata.json`, `uQR.py`, and the
