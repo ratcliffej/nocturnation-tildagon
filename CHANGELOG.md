@@ -4,6 +4,20 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-07-02 — Terminology: drop "shell N" for "hop N" in current code
+
+The Epic 17 design used "shell N" and "hop N" for what turned out to
+be the same concept — a device that repeats at hop N is a "hop N
+repeater"; there was no separate meaning "shell" was carrying that
+"hop" didn't already. Live code (`nocturnation/repeater.py`,
+`tests/test_repeater.py`) and operator-facing docs (README, user
+manual) are now consistent on "hop N". Historical CHANGELOG entries
+below are left as-is — they're a record of what shipped when, and
+the shell/hop split was part of the design vocabulary of that day.
+Test names renamed (e.g. `test_shell_2_candidate_not_cancelled_by_shell_1_peer`
+→ `test_hop_2_candidate_not_cancelled_by_hop_1_peer`). No behavioural
+change; 561 host tests pass.
+
 ## 2026-07-01 — Epic 17 fix: no outer-shell election from the coverage core
 
 Bench-found: a Tildagon sitting beside a StickC shell-1 repeater, both

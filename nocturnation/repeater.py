@@ -3,7 +3,7 @@
 Runs on each Tildagon in Lume mode when Repeat=AUTO. Observes admitted
 frames from the app receive path, elects itself as a relay when a
 per-output-hop vacancy is detected, and steps down when a peer takes
-over. Cap at hop=3 enables up to three cascade shells through the
+over. Cap at hop=3 enables up to three relay hops through the
 audience.
 
 The FSM is pure logic: it depends only on a small callback set (send,
@@ -18,7 +18,7 @@ The five states:
               (hop < 3) that arrives at the LOWEST hop we hear it at.
               A frame we can also hear closer to the source arms no
               watch - we're in its coverage core, not at an edge that a
-              further relay shell would serve. Any single "uncovered"
+              next-hop relay would serve. Any single "uncovered"
               watch (deadline passes with no matching peer relay at
               hop+1) → CANDIDATE.
 
@@ -82,7 +82,7 @@ WATCH_RING_SIZE = 32
 
 # Lowest-hop memory capacity. Tracks the lowest hop each recent
 # (src, seq) has been received at, so a device that also hears a frame
-# closer to the source never arms an outer-shell watch for it. Sized
+# closer to the source never arms an outer-hop watch for it. Sized
 # like the other rings - comfortably beyond the in-flight frame count.
 RECENT_HOP_MEMORY_SIZE = 64
 
@@ -90,8 +90,8 @@ RECENT_HOP_MEMORY_SIZE = 64
 # a frame for this long, the elected role is obsolete (upstream at
 # our input hop has stopped producing traffic) - step down to
 # LISTENING and let re-election pick a role fitting the current
-# topology. Bench-found 2026-07-01: without this, an ACTIVE(shell-2)
-# device stayed stuck when its shell-1 upstream (StickC) was turned
+# topology. Bench-found 2026-07-01: without this, an ACTIVE(hop 2)
+# device stayed stuck when its hop 1 upstream (StickC) was turned
 # off, receiving hop=0 from Director but unable to relay it (out of
 # role). 3 s ≈ 3 heartbeat cycles; long enough to bridge a normal
 # quiet gap, short enough for responsive recovery.
@@ -163,10 +163,10 @@ class DynamicRepeater:
         # watch creation: we only arm a peer-watch (the seed of self-
         # election) at the LOWEST hop we personally hear a frame at. A
         # frame we can also hear closer to the source needs no outer
-        # relay shell from us - electing for one strands us in a shell
+        # relay hop from us - electing for one strands us at a hop
         # with no peer to hand off to and almost no fresh input to relay
-        # (bench-found 2026-07-01: a badge beside a StickC shell-1
-        # repeater parked in ACTIVE(shell-2), tx crawling, px stuck at 0,
+        # (bench-found 2026-07-01: a badge beside a StickC hop 1
+        # repeater parked in ACTIVE(hop 2), tx crawling, px stuck at 0,
         # never standing down).
         self._recent_lo = {}          # (src, seq) -> lowest hop seen
         self._recent_lo_order = []    # FIFO of keys for bounded eviction
@@ -185,11 +185,11 @@ class DynamicRepeater:
         # ACTIVE → COOLDOWN chain; reset in _to_listening. Load-bearing
         # bench-found 2026-07-01:
         #   1. CANDIDATE cancel triggers only on peer traffic at this
-        #      hop (a shell-2 candidate ignores shell-1 traffic).
+        #      hop (a hop 2 candidate ignores hop 1 traffic).
         #   2. ACTIVE / COOLDOWN relay ONLY frames where hop+1 matches
-        #      this hop - a shell-2 elected device produces hop=2 only,
+        #      this hop - a hop 2 elected device produces hop=2 only,
         #      ignoring hop=0 inputs so it doesn't compete with an
-        #      engineered shell-1 repeater at hop=1.
+        #      engineered hop 1 repeater at hop=1.
         self._output_hop = 0
 
         # Timestamp of the last successful relay TX. Drives the
@@ -288,7 +288,7 @@ class DynamicRepeater:
         # New peer-watch for THIS frame if it's a potential input to a
         # future relay (hop < MAX) AND this is the lowest hop we hear it
         # at. Gating on lowest-hop stops a device that also receives the
-        # frame closer to the source from seeding an outer-shell election
+        # frame closer to the source from seeding an outer-hop election
         # it can neither hand off nor usefully serve (see
         # _note_hop_should_watch). All states track watches - the data is
         # used by LISTENING/CANDIDATE and cheap to maintain in
@@ -330,12 +330,12 @@ class DynamicRepeater:
     def _on_frame_candidate(self, frame, now_ms, covered_watch, peer_hit):
         # Cancel ONLY on peer traffic at MY target output hop -
         # proving another device is filling the specific vacancy that
-        # triggered my candidacy. A shell-2 CANDIDATE (output_hop=2)
-        # must ignore shell-1 peer relays (hop=1 frames covering hop=0
-        # watches) because those are shell-1's business, not shell-2's.
+        # triggered my candidacy. A hop 2 CANDIDATE (output_hop=2)
+        # must ignore hop 1 peer relays (hop=1 frames covering hop=0
+        # watches) because those are hop 1's business, not hop 2's.
         # Bench-found 2026-07-01: covering ANY watch previously fired
         # the cancel, causing LISTENING ↔ CANDIDATE oscillation when
-        # an engineered shell-1 repeater was active but shell-2 was
+        # an engineered hop 1 repeater was active but hop 2 was
         # still vacant.
         if frame.hop_count == self._output_hop:
             self._to_listening(now_ms)
@@ -347,9 +347,9 @@ class DynamicRepeater:
     def _on_frame_active(self, frame, is_duplicate, now_ms, raw_buf,
                          peer_hit):
         # ACTIVE relays ONLY frames where hop+1 matches our elected
-        # output hop. A shell-2 elected device (output_hop=2) relays
+        # output hop. A hop 2 elected device (output_hop=2) relays
         # hop=1 → hop=2 and ignores hop=0 inputs so it doesn't compete
-        # with the engineered shell-1 repeater. Duplicates do NOT
+        # with the engineered hop 1 repeater. Duplicates do NOT
         # trigger a fresh relay (we already TXed on first-seen);
         # peer_hit is meaningful on either.
         if not is_duplicate \
@@ -439,11 +439,11 @@ class DynamicRepeater:
         """Record the lowest hop (src, seq) has been received at and report
         whether this frame warrants a peer-watch.
 
-        A watch at hop H is the seed of shell-(H+1) self-election. We only
+        A watch at hop H is the seed of hop (H+1) self-election. We only
         want to arm one at the LOWEST hop we personally receive a frame at:
         if we can also hear the same frame closer to the source, an outer
-        relay shell from us serves nobody we don't already reach. Electing
-        anyway strands us in an outer shell with no peer to hand off to and
+        relay hop from us serves nobody we don't already reach. Electing
+        anyway strands us at an outer hop with no peer to hand off to and
         almost no fresh input to relay.
 
         Returns True on the first sighting of a (src, seq), or when a
@@ -478,7 +478,7 @@ class DynamicRepeater:
     def _cancel_watches_above(self, src, seq, hop):
         """Drop pending watches for (src, seq) at a hop strictly greater
         than ``hop``. A lower-hop sighting of the frame has obsoleted them
-        - we are closer to the source than any outer shell they'd elect."""
+        - we are closer to the source than any outer hop they'd elect."""
         self._watches = [w for w in self._watches
                          if not (w[0] == src and w[1] == seq and w[2] > hop)]
 
@@ -515,8 +515,8 @@ class DynamicRepeater:
         target-elapsed transition and cover-resolution drives cancels.
 
         Multiple watches may expire in one sweep; if so we elect for
-        the LOWEST-hop vacancy first (shell-1 upstream of shell-2 -
-        filling shell-1 might obviate the shell-2 need). The chosen
+        the LOWEST-hop vacancy first (hop 1 upstream of hop 2 -
+        filling hop 1 might obviate the hop 2 need). The chosen
         vacancy hop becomes the CANDIDATE's target output hop.
         """
         lowest_expired_hop = None
@@ -532,7 +532,7 @@ class DynamicRepeater:
         if lowest_expired_hop is not None and self._state == STATE_LISTENING:
             # output_hop = triggering_watch_hop + 1: if I watched a
             # hop=0 frame that went uncovered, my role is hop=1
-            # (shell-1). A hop=1 frame's expiry → hop=2 (shell-2).
+            # (hop 1). A hop=1 frame's expiry → hop=2 (hop 2).
             self._to_candidate(now_ms, lowest_expired_hop + 1)
 
     # ------------------------------------------------------------------
