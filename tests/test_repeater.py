@@ -134,22 +134,22 @@ class TestListeningToCandidate:
         h = RepeaterHarness()
         h.admit(FakeFrame(seq=1, hop=0), now_ms=1000)
         # Peer relay at hop=1 arrives inside the 100 ms window and
-        # covers the shell-1 watch. State stays LISTENING. The peer's
-        # hop=1 frame does NOT spawn a shell-2 watch here: we already
-        # heard this (src, seq) direct at hop=0, so a further relay
-        # shell from us would serve no one - see
-        # test_core_device_does_not_cascade_to_shell_2.
+        # covers the hop 1 watch. State stays LISTENING. The peer's
+        # hop=1 frame does NOT spawn a hop 2 watch here: we already
+        # heard this (src, seq) direct at hop=0, so a next-hop relay
+        # from us would serve no one - see
+        # test_core_device_does_not_cascade_to_hop_2.
         h.admit(FakeFrame(seq=1, hop=1), now_ms=1010)
         assert h.fsm.state == STATE_LISTENING
 
-    def test_core_device_does_not_cascade_to_shell_2(self):
+    def test_core_device_does_not_cascade_to_hop_2(self):
         # A device that hears a frame BOTH direct (hop=0) and relayed
         # (hop=1) is in the coverage core, not the edge. It must not
-        # elect itself shell-2: nothing downstream needs the frame pushed
-        # a further hop, and no shell-2 peer exists to hand off to, so it
+        # elect itself hop 2: nothing downstream needs the frame pushed
+        # a further hop, and no hop 2 peer exists to hand off to, so it
         # would park in REPEAT forever with almost nothing to relay.
-        # (Bench-found 2026-07-01: Tildagon beside a StickC shell-1
-        # repeater, both in earshot of the Director, stuck ACTIVE(shell-2)
+        # (Bench-found 2026-07-01: Tildagon beside a StickC hop 1
+        # repeater, both in earshot of the Director, stuck ACTIVE(hop 2)
         # with tx crawling and px=0.)
         h = RepeaterHarness(randoms=[3])
         h.admit(FakeFrame(seq=1, hop=0), now_ms=1000)
@@ -165,10 +165,10 @@ class TestListeningToCandidate:
         assert h.fsm.state == STATE_LISTENING
         assert h.txs == []
 
-    def test_edge_device_elects_shell_2_from_hop_1_only(self):
+    def test_edge_device_elects_hop_2_from_hop_1_only(self):
         # The legitimate cascade: a device that hears a frame ONLY at
         # hop=1 (it has walked out of the Director's direct range) is at
-        # the edge and SHOULD extend coverage as shell-2 when no hop=2
+        # the edge and SHOULD extend coverage as hop 2 when no hop=2
         # relay covers it.
         h = RepeaterHarness(randoms=[3])
         h.admit(FakeFrame(seq=1, hop=1), now_ms=1010)
@@ -176,20 +176,20 @@ class TestListeningToCandidate:
         assert h.fsm.state == STATE_CANDIDATE
         assert h.fsm._output_hop == 2
 
-    def test_out_of_order_direct_copy_cancels_shell_2_watch(self):
+    def test_out_of_order_direct_copy_cancels_hop_2_watch(self):
         # Relayed hop=1 can arrive before the direct hop=0 (the StickC
-        # beats the through-wall direct path). The hop=1 arms a shell-2
+        # beats the through-wall direct path). The hop=1 arms a hop 2
         # watch, but when the direct hop=0 copy lands inside the window
-        # it supersedes it. Any election that follows is at most shell-1
+        # it supersedes it. Any election that follows is at most hop 1
         # (output_hop=1) - the resolvable role that stands down once a
         # peer relay is detected - never the phantom, unresolvable
-        # shell-2.
+        # hop 2.
         h = RepeaterHarness(randoms=[3])
         h.admit(FakeFrame(seq=1, hop=1), now_ms=1000)   # relayed copy first
         h.admit(FakeFrame(seq=1, hop=0), now_ms=1050)   # direct copy, in-window
         h.tick(now_ms=1200)
         assert h.fsm._output_hop != 2
-        # Here the hop=0 watch goes uncovered, so it elects shell-1.
+        # Here the hop=0 watch goes uncovered, so it elects hop 1.
         assert h.fsm.state == STATE_CANDIDATE
         assert h.fsm._output_hop == 1
 
@@ -242,17 +242,17 @@ class TestCandidateRange:
 
 
 class TestBenchScenario20260701:
-    """Regression: Tildagon + Director + engineered StickC shell-1 repeater.
+    """Regression: Tildagon + Director + engineered StickC hop 1 repeater.
 
     Bench observation 2026-07-01: FSM oscillated LISTENING ↔ CANDIDATE
     without ever reaching ACTIVE. Root cause was CANDIDATE cancelling
     on ANY covered watch, including StickC's hop=1 covering hop=0
-    watches while the FSM was actually electing for shell-2 (output_hop=2).
+    watches while the FSM was actually electing for hop 2 (output_hop=2).
     Fix tracks candidate_output_hop on entry and only cancels on peer
     traffic at that specific hop.
     """
 
-    def test_shell_2_candidate_not_cancelled_by_shell_1_peer(self):
+    def test_hop_2_candidate_not_cancelled_by_hop_1_peer(self):
         # Setup: enter CANDIDATE(output_hop=2) legitimately - an edge
         # device that hears seq=1 ONLY at hop=1 (never direct), with no
         # hop=2 relay covering it.
@@ -272,12 +272,12 @@ class TestBenchScenario20260701:
         assert h.fsm.state == STATE_CANDIDATE
 
         # Third sequence progresses the counter; target=3 reached
-        # → ACTIVE for shell-2 role.
+        # → ACTIVE for hop 2 role.
         h.admit(FakeFrame(seq=3, hop=0), now_ms=3000)
         h.admit(FakeFrame(seq=3, hop=1), now_ms=3010)
         assert h.fsm.state == STATE_ACTIVE
 
-    def test_shell_2_candidate_cancelled_by_shell_2_peer(self):
+    def test_hop_2_candidate_cancelled_by_hop_2_peer(self):
         # Same edge setup, but this time a peer starts relaying at hop=2
         # (matching our target output hop). CANDIDATE should cancel.
         h = RepeaterHarness(randoms=[9])
@@ -287,21 +287,21 @@ class TestBenchScenario20260701:
         assert h.fsm._output_hop == 2
 
         # A peer's hop=2 relay proves someone else is filling the
-        # shell-2 role. Cancel back to LISTENING.
+        # hop 2 role. Cancel back to LISTENING.
         h.admit(FakeFrame(seq=2, hop=2), now_ms=2000)
         assert h.fsm.state == STATE_LISTENING
 
-    def test_shell_1_candidate_cancelled_by_shell_1_peer(self):
+    def test_hop_1_candidate_cancelled_by_hop_1_peer(self):
         # Shell-1 candidacy (output_hop=1) is still correctly cancelled
         # by hop=1 peer traffic. Regression against over-correcting
-        # the fix and breaking the shell-1 case too.
+        # the fix and breaking the hop 1 case too.
         h = RepeaterHarness(randoms=[9])
         h.admit(FakeFrame(seq=1, hop=0), now_ms=1000)
         h.tick(now_ms=1200)
         assert h.fsm.state == STATE_CANDIDATE
         assert h.fsm._output_hop == 1
 
-        # Peer relays hop=1 (shell-1 coverage) → cancel back to
+        # Peer relays hop=1 (hop 1 coverage) → cancel back to
         # LISTENING because our target output IS hop=1.
         h.admit(FakeFrame(seq=2, hop=0), now_ms=2000)
         h.admit(FakeFrame(seq=2, hop=1), now_ms=2010)
@@ -313,27 +313,26 @@ class TestBenchScenario20260701:
 # ---------------------------------------------------------------------
 
 class TestActiveRelay:
-    def _make_active(self, shell=1, randoms=None):
-        """Set up FSM in ACTIVE for the given elected shell (1/2/3).
+    def _make_active(self, output_hop=1, randoms=None):
+        """Set up FSM in ACTIVE for the given elected output hop (1/2/3).
         ACTIVE relays are role-specific (post-2026-07-01 bench fix): a
-        shell-N elected device only relays input frames at hop=(N-1)
-        so it doesn't compete with peers at other shells. Each shell
-        needs its own election, driven by a watch at hop=(N-1) expiring
-        uncovered.
+        hop-N-elected device only relays input frames at hop=(N-1) so it
+        doesn't compete with peers at other hops. Each role needs its
+        own election, driven by a watch at hop=(N-1) expiring uncovered.
         """
         h = RepeaterHarness(randoms=(randoms or [2]))
-        input_hop = shell - 1
+        input_hop = output_hop - 1
         h.admit(FakeFrame(seq=1, hop=input_hop), now_ms=0)
-        h.tick(now_ms=PEER_WATCH_MS + 1)   # → CANDIDATE(output_hop=shell)
+        h.tick(now_ms=PEER_WATCH_MS + 1)   # → CANDIDATE at output_hop
         h.admit(FakeFrame(seq=2, hop=input_hop), now_ms=1000)
         h.admit(FakeFrame(seq=3, hop=input_hop), now_ms=2000)
         assert h.fsm.state == STATE_ACTIVE
-        assert h.fsm._output_hop == shell
+        assert h.fsm._output_hop == output_hop
         return h
 
     def test_relays_hop_zero_as_hop_one(self):
         # Shell-1 elected: hop=0 → hop=1.
-        h = self._make_active(shell=1)
+        h = self._make_active(output_hop=1)
         pre = len(h.txs)
         h.admit(FakeFrame(src=1, seq=100, hop=0), now_ms=3000,
                 raw_buf=make_buf(src=1, seq=100, hop=0))
@@ -345,7 +344,7 @@ class TestActiveRelay:
 
     def test_relays_hop_one_as_hop_two(self):
         # Shell-2 elected: hop=1 → hop=2.
-        h = self._make_active(shell=2)
+        h = self._make_active(output_hop=2)
         pre = len(h.txs)
         h.admit(FakeFrame(seq=101, hop=1), now_ms=3000,
                 raw_buf=make_buf(seq=101, hop=1))
@@ -354,31 +353,31 @@ class TestActiveRelay:
 
     def test_relays_hop_two_as_hop_three(self):
         # Shell-3 elected: hop=2 → hop=3.
-        h = self._make_active(shell=3)
+        h = self._make_active(output_hop=3)
         pre = len(h.txs)
         h.admit(FakeFrame(seq=102, hop=2), now_ms=3000,
                 raw_buf=make_buf(seq=102, hop=2))
         assert len(h.txs) == pre + 1
         assert h.txs[-1][HOP_COUNT_BYTE_OFFSET] == 3
 
-    def test_shell_1_ignores_hop_1_input(self):
-        # Regression for bench-found 2026-07-01: a shell-1 elected
+    def test_hop_1_role_ignores_hop_1_input(self):
+        # Regression for bench-found 2026-07-01: a hop 1 elected
         # device MUST ignore hop=1 inputs (would produce hop=2, but
-        # a peer at hop=2 is shell-2's business, not ours). Before
+        # a peer at hop=2 is hop 2's business, not ours). Before
         # the fix, ACTIVE relayed hop=1 → hop=2 too, which caused
-        # shell-1 contention loops.
-        h = self._make_active(shell=1)
+        # hop 1 contention loops.
+        h = self._make_active(output_hop=1)
         pre = len(h.txs)
         h.admit(FakeFrame(seq=104, hop=1), now_ms=3000,
                 raw_buf=make_buf(seq=104, hop=1))
         assert len(h.txs) == pre   # no relay - out of role
 
-    def test_shell_2_ignores_hop_0_input(self):
-        # Regression for bench-found 2026-07-01: a shell-2 elected
+    def test_hop_2_role_ignores_hop_0_input(self):
+        # Regression for bench-found 2026-07-01: a hop 2 elected
         # device MUST ignore hop=0 inputs (would produce hop=1, but
-        # that's shell-1's business - and competing with an engineered
-        # shell-1 repeater is exactly the loop we're trying to avoid).
-        h = self._make_active(shell=2)
+        # that's hop 1's business - and competing with an engineered
+        # hop 1 repeater is exactly the loop we're trying to avoid).
+        h = self._make_active(output_hop=2)
         pre = len(h.txs)
         h.admit(FakeFrame(seq=105, hop=0), now_ms=3000,
                 raw_buf=make_buf(seq=105, hop=0))
@@ -386,10 +385,10 @@ class TestActiveRelay:
 
     def test_does_not_relay_hop_three(self):
         # hop=3 → hop=4 exceeds MAX_HOP_COUNT regardless of elected
-        # shell. In shell-3 role (output_hop=3), the condition
+        # role. In hop 3 role (output_hop=3), the condition
         # frame.hop_count + 1 == output_hop is 4 == 3 → False, so no
         # relay.
-        h = self._make_active(shell=3)
+        h = self._make_active(output_hop=3)
         pre = len(h.txs)
         h.admit(FakeFrame(seq=103, hop=MAX_HOP_COUNT), now_ms=3000,
                 raw_buf=make_buf(seq=103, hop=MAX_HOP_COUNT))
@@ -397,7 +396,7 @@ class TestActiveRelay:
 
     def test_duplicates_do_not_relay(self):
         # First-seen relays; a following duplicate must not.
-        h = self._make_active(shell=1)
+        h = self._make_active(output_hop=1)
         h.admit(FakeFrame(seq=200, hop=0), now_ms=3000,
                 raw_buf=make_buf(seq=200, hop=0))
         pre = len(h.txs)
@@ -434,7 +433,7 @@ class TestActiveToCooldown:
         assert h.fsm.state == STATE_COOLDOWN
 
     def test_downstream_relay_does_not_flip(self):
-        # A shell-2 device's hop=2 relay is downstream, NOT a peer.
+        # A hop 2 device's hop=2 relay is downstream, NOT a peer.
         # Shell-1 (us) TXes hop=1; hop=2 is not a peer collision.
         h = self._make_active()
         h.admit(FakeFrame(seq=100, hop=0), now_ms=3000,
@@ -488,7 +487,7 @@ class TestCooldown:
         # with a matching peer relay - _frames_since_peer stays at 0,
         # cooldown counter accumulates - and we time out into LISTENING
         # (not into ACTIVE via the peer-stopped path).
-        # Post-2026-07-01 bench fix: shell-2 cascade watches can then
+        # Post-2026-07-01 bench fix: hop 2 cascade watches can then
         # drive LISTENING → CANDIDATE(output_hop=2) as correct-by-design
         # cascade behaviour. So we track ALL states seen during the
         # loop and just verify LISTENING appears (COOLDOWN → LISTENING
@@ -548,12 +547,12 @@ class TestIdleTimeout:
     """Regression: ACTIVE / COOLDOWN devices whose upstream disappears
     should step down to LISTENING so re-election can pick a role
     fitting the new topology. Bench-found 2026-07-01: a Tildagon in
-    ACTIVE(shell-2) got stuck when its shell-1 upstream (StickC) was
+    ACTIVE(hop 2) got stuck when its hop 1 upstream (StickC) was
     turned off - no more hop=1 inputs → no more relays → but state
     never transitioned back to LISTENING.
     """
 
-    def _make_active_shell_1(self):
+    def _make_active_hop_1(self):
         # Election via hop=0 watch expiry, then progression to ACTIVE.
         h = RepeaterHarness(randoms=[2])
         h.admit(FakeFrame(seq=1, hop=0), now_ms=0)
@@ -564,7 +563,7 @@ class TestIdleTimeout:
         return h
 
     def test_active_steps_down_after_idle(self):
-        h = self._make_active_shell_1()
+        h = self._make_active_hop_1()
         # Relay once to prime _last_relay_ms.
         h.admit(FakeFrame(seq=10, hop=0), now_ms=3000,
                 raw_buf=make_buf(seq=10, hop=0))
@@ -576,7 +575,7 @@ class TestIdleTimeout:
         assert h.fsm._output_hop == 0
 
     def test_active_relay_defers_idle_timeout(self):
-        h = self._make_active_shell_1()
+        h = self._make_active_hop_1()
         # First relay at t=3000.
         h.admit(FakeFrame(seq=10, hop=0), now_ms=3000,
                 raw_buf=make_buf(seq=10, hop=0))
@@ -592,7 +591,7 @@ class TestIdleTimeout:
     def test_freshly_elected_active_does_not_immediately_step_down(self):
         # _to_active primes _last_relay_ms so a brand-new ACTIVE
         # doesn't step down on its first tick.
-        h = self._make_active_shell_1()
+        h = self._make_active_hop_1()
         # Same-ms tick shouldn't trigger.
         h.tick(now_ms=2001)
         assert h.fsm.state == STATE_ACTIVE
@@ -600,18 +599,18 @@ class TestIdleTimeout:
 
 class TestPunterWalksScenario:
     """Bench-driven scenario 2026-07-01: a punter carrying a Tildagon
-    acting as shell-1 repeater walks deeper into the audience. They
+    acting as hop 1 repeater walks deeper into the audience. They
     lose Director's hop=0 signal but still hear hop=1 from other
     repeaters. The FSM should:
 
-      1. Idle-timeout out of ACTIVE(shell-1) after 3 s of no relays.
+      1. Idle-timeout out of ACTIVE(hop 1) after 3 s of no relays.
       2. Transition to LISTENING (fresh _output_hop=0).
       3. Notice the hop=1 traffic without hop=2 coverage → elect
-         shell-2 in the new position.
+         hop 2 in the new position.
     """
 
-    def test_walk_re_elects_from_shell_1_to_shell_2(self):
-        # Setup ACTIVE(shell-1): hop=0 watch expires, CANDIDATE, then
+    def test_walk_re_elects_from_hop_1_to_hop_2(self):
+        # Setup ACTIVE(hop 1): hop=0 watch expires, CANDIDATE, then
         # ACTIVE via 2 more admits.
         h = RepeaterHarness(randoms=[2, 3])  # CANDIDATE=2, later CANDIDATE=3
         h.admit(FakeFrame(seq=1, hop=0), now_ms=0)
@@ -627,11 +626,11 @@ class TestPunterWalksScenario:
         assert len(h.txs) == 1   # relay TXed
 
         # Punter walks. No more hop=0 arrives. Only hop=1 (from other
-        # shell-1 repeaters covering the new position).
+        # hop 1 repeaters covering the new position).
         pre_tx = len(h.txs)
         h.admit(FakeFrame(seq=20, hop=1), now_ms=4000,
                 raw_buf=make_buf(seq=20, hop=1))
-        # No relay - hop=1 input doesn't match shell-1 role.
+        # No relay - hop=1 input doesn't match hop 1 role.
         assert len(h.txs) == pre_tx
 
         # Idle timeout fires 3 s after last relay.
@@ -642,7 +641,7 @@ class TestPunterWalksScenario:
         # Next hop=1 frame in the new position creates a hop=1 watch.
         h.admit(FakeFrame(seq=30, hop=1), now_ms=6200,
                 raw_buf=make_buf(seq=30, hop=1))
-        # No peer at hop=2 covers → watch expires → CANDIDATE(shell-2).
+        # No peer at hop=2 covers → watch expires → CANDIDATE(hop 2).
         h.tick(now_ms=6200 + PEER_WATCH_MS + 1)
         assert h.fsm.state == STATE_CANDIDATE
         assert h.fsm._output_hop == 2
