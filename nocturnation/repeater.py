@@ -14,9 +14,13 @@ Spec: Docs/epics/epic-17-dynamic-repeater.md
 
 The five states:
 
-  LISTENING   default; sets 100 ms peer-watch on each admitted frame
-              (hop < 3). Any single "uncovered" watch (deadline passes
-              with no matching peer relay at hop+1) → CANDIDATE.
+  LISTENING   default; sets a 100 ms peer-watch on each admitted frame
+              (hop < 3) that arrives at the LOWEST hop we hear it at.
+              A frame we can also hear closer to the source arms no
+              watch - we're in its coverage core, not at an edge that a
+              further relay shell would serve. Any single "uncovered"
+              watch (deadline passes with no matching peer relay at
+              hop+1) → CANDIDATE.
 
   CANDIDATE   election pending; counts down X frames (random 2-9).
               Any peer relay observed during the count → LISTENING.
@@ -75,6 +79,12 @@ TX_RING_SIZE = 32
 # Peer-watch ring capacity. Same rationale as TX ring; sized so we
 # never lose a pending watch to eviction under normal traffic.
 WATCH_RING_SIZE = 32
+
+# Lowest-hop memory capacity. Tracks the lowest hop each recent
+# (src, seq) has been received at, so a device that also hears a frame
+# closer to the source never arms an outer-shell watch for it. Sized
+# like the other rings - comfortably beyond the in-flight frame count.
+RECENT_HOP_MEMORY_SIZE = 64
 
 # ACTIVE / COOLDOWN idle timeout: if we haven't successfully relayed
 # a frame for this long, the elected role is obsolete (upstream at
@@ -148,6 +158,18 @@ class DynamicRepeater:
         # A list rather than a dict keyed by (src, seq, hop) so we can
         # evict oldest when full without a separate ordering structure.
         self._watches = []
+
+        # Lowest hop each recent (src, seq) has been received at. Gates
+        # watch creation: we only arm a peer-watch (the seed of self-
+        # election) at the LOWEST hop we personally hear a frame at. A
+        # frame we can also hear closer to the source needs no outer
+        # relay shell from us - electing for one strands us in a shell
+        # with no peer to hand off to and almost no fresh input to relay
+        # (bench-found 2026-07-01: a badge beside a StickC shell-1
+        # repeater parked in ACTIVE(shell-2), tx crawling, px stuck at 0,
+        # never standing down).
+        self._recent_lo = {}          # (src, seq) -> lowest hop seen
+        self._recent_lo_order = []    # FIFO of keys for bounded eviction
 
         # TX ring: entries are dicts {src, seq, hop_txed, ts_ms}.
         # Used only in ACTIVE / COOLDOWN for peer detection.
@@ -264,10 +286,15 @@ class DynamicRepeater:
                                     peer_hit=peer_hit)
 
         # New peer-watch for THIS frame if it's a potential input to a
-        # future relay (hop < MAX). All states track watches - the
-        # data is used by LISTENING/CANDIDATE and cheap to maintain in
+        # future relay (hop < MAX) AND this is the lowest hop we hear it
+        # at. Gating on lowest-hop stops a device that also receives the
+        # frame closer to the source from seeding an outer-shell election
+        # it can neither hand off nor usefully serve (see
+        # _note_hop_should_watch). All states track watches - the data is
+        # used by LISTENING/CANDIDATE and cheap to maintain in
         # ACTIVE/COOLDOWN too.
-        if frame.hop_count < MAX_HOP_COUNT:
+        watch_worthy = self._note_hop_should_watch(frame)
+        if watch_worthy and frame.hop_count < MAX_HOP_COUNT:
             self._add_watch(frame, now_ms)
 
     def tick(self, now_ms):
@@ -407,6 +434,53 @@ class DynamicRepeater:
     # ------------------------------------------------------------------
     # Peer-watch mechanics.
     # ------------------------------------------------------------------
+
+    def _note_hop_should_watch(self, frame):
+        """Record the lowest hop (src, seq) has been received at and report
+        whether this frame warrants a peer-watch.
+
+        A watch at hop H is the seed of shell-(H+1) self-election. We only
+        want to arm one at the LOWEST hop we personally receive a frame at:
+        if we can also hear the same frame closer to the source, an outer
+        relay shell from us serves nobody we don't already reach. Electing
+        anyway strands us in an outer shell with no peer to hand off to and
+        almost no fresh input to relay.
+
+        Returns True on the first sighting of a (src, seq), or when a
+        strictly-lower hop arrives out of order (which also cancels any
+        higher-hop watch already armed for it). Returns False for an
+        equal-or-higher-hop copy of a frame already seen. seq == 0 ("no
+        sequencing") can't be tracked per-frame, so it keeps the prior
+        always-watch behaviour.
+        """
+        seq = frame.sequence_number
+        if seq == 0:
+            return True
+        key = (frame.source_id, seq)
+        prev = self._recent_lo.get(key)
+        if prev is None:
+            self._recent_lo[key] = frame.hop_count
+            self._recent_lo_order.append(key)
+            if len(self._recent_lo_order) > RECENT_HOP_MEMORY_SIZE:
+                evicted = self._recent_lo_order.pop(0)
+                self._recent_lo.pop(evicted, None)
+            return True
+        if frame.hop_count < prev:
+            # A lower-hop copy arrived out of order: it supersedes any
+            # higher-hop watch we already armed for this frame.
+            self._recent_lo[key] = frame.hop_count
+            self._cancel_watches_above(frame.source_id, seq, frame.hop_count)
+            return True
+        # Already heard this frame at an equal or lower hop; a higher-or-
+        # equal copy is not our vacancy to fill.
+        return False
+
+    def _cancel_watches_above(self, src, seq, hop):
+        """Drop pending watches for (src, seq) at a hop strictly greater
+        than ``hop``. A lower-hop sighting of the frame has obsoleted them
+        - we are closer to the source than any outer shell they'd elect."""
+        self._watches = [w for w in self._watches
+                         if not (w[0] == src and w[1] == seq and w[2] > hop)]
 
     def _add_watch(self, frame, now_ms):
         deadline = now_ms + PEER_WATCH_MS
