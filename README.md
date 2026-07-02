@@ -47,7 +47,7 @@ The NocturNation manuals live in the [**nocturnation-docs**](https://github.com/
 
 **Dynamic repeat** turns audience Tildagons into an opportunistic ESP-NOW mesh. On open-air stages, human bodies attenuate the radio signal enough that devices at the back of a dense crowd can drop frames from a Director on stage. When a Tildagon in Lume mode finds itself at an **unserviced edge of the mesh** — receiving signal at one hop level with no relay pushing it further out — it silently steps up as a repeater. When a peer takes over, or when the badge finds itself back in the coverage core, it steps back down. The mesh self-organises without operator input.
 
-**How hop numbering works.** The Director broadcasts at hop 0. Each relay increments the number by one: a shell-1 repeater retransmits its hop 0 input as hop 1, a shell-2 repeater retransmits hop 1 traffic as hop 2, and so on. The wire spec caps at hop 3, so the mesh can extend at most three cascade shells deep through the audience.
+**How hop numbering works.** The Director broadcasts at hop 0. Each relay increments the number by one: a hop 1 repeater retransmits its hop 0 input as hop 1, a hop 2 repeater retransmits hop 1 traffic as hop 2, and so on. The wire spec caps at hop 3, so the mesh can extend at most three relay hops deep through the audience.
 
 **The edge rule.** A badge only elects if it can't hear the same frame at a lower hop. If it hears both the Director directly (hop 0) *and* a relay of that frame (hop 1), it's in the coverage core — adding another relay from there serves no one who isn't already reached — so the badge stays LISTEN. Only edge badges cascade the mesh further out. Recovery from a repeater walking out of range takes 3-9 seconds.
 
@@ -68,11 +68,11 @@ Enable **Debug: ON** in Config to see the state prominently on the debug overlay
 
 **2. Tildagon at the back of the audience, with a StickC repeater between it and the Director.** The badge is out of the Director's direct range but hears the StickC's hop 1 relay. Since it hears the frame at only one hop level, it's at an edge → it elects **REPEAT** at hop 2, extending coverage further into the back of the audience.
 
-**3. Tildagon in the coverage core (Director *plus* a StickC repeater both within earshot).** The badge hears the Director's hop 0 direct AND the StickC's hop 1 relay of the same frame → it's in the core, not at an edge → stays **LISTEN**. Neither shell needs another repeater here. Airtime and battery preserved for the badges further out that actually need to cascade.
+**3. Tildagon in the coverage core (Director *plus* a StickC repeater both within earshot).** The badge hears the Director's hop 0 direct AND the StickC's hop 1 relay of the same frame → it's in the core, not at an edge → stays **LISTEN**. Neither hop level needs another repeater here. Airtime and battery preserved for the badges further out that actually need to cascade.
 
-**4. A punter walks their repeating Tildagon deeper into the crowd.** The badge loses direct Director range and stops relaying (it was serving shell 1 but has no more hop 0 inputs). ~3 seconds later its idle timer fires, dropping it to **LISTEN**. Now it only hears the StickC's hop 1 in its new position — an edge — so within a few more seconds it re-elects **REPEAT** at hop 2. Total role-transition time ~4-10 seconds.
+**4. A punter walks their repeating Tildagon deeper into the crowd.** The badge loses direct Director range and stops relaying (it was serving as a hop 1 repeater but has no more hop 0 inputs). ~3 seconds later its idle timer fires, dropping it to **LISTEN**. Now it only hears the StickC's hop 1 in its new position — an edge — so within a few more seconds it re-elects **REPEAT** at hop 2. Total role-transition time ~4-10 seconds.
 
-**5. Two Tildagons at the same edge, both trying to relay the same shell.** Both TX at the same hop simultaneously → each sees the other's frame as a peer collision → both enter **CDOWN**. Whichever's random cooldown counter expires first while the other is still active drops back to **LISTEN**; the other continues as **REPEAT**. No operator action needed.
+**5. Two Tildagons at the same edge, both trying to relay at the same hop.** Both TX at the same hop simultaneously → each sees the other's frame as a peer collision → both enter **CDOWN**. Whichever's random cooldown counter expires first while the other is still active drops back to **LISTEN**; the other continues as **REPEAT**. No operator action needed.
 
 Nothing needs monitoring at showtime — the feature is on by default and adapts continuously to how the crowd moves.
 
