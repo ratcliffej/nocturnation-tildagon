@@ -258,13 +258,17 @@ def parse_frame(buf):
         # UTF-8 decode with replacement; a malformed string from a
         # buggy sender shouldn't take the receiver down. The orchestrator
         # validates UTF-8 before sending, so this is belt-and-braces.
+        # NB: catch ValueError only - MicroPython has no
+        # UnicodeDecodeError builtin (a bad decode raises UnicodeError,
+        # whose base is ValueError), and naming it here would itself
+        # raise NameError on the badge, defeating the guard.
         try:
             f.header = bytes(header_bytes).decode("utf-8")
-        except (UnicodeDecodeError, ValueError):
+        except ValueError:
             f.header = ""
         try:
             f.body = bytes(body_bytes).decode("utf-8")
-        except (UnicodeDecodeError, ValueError):
+        except ValueError:
             f.body = ""
     elif f.message_type == MessageType.CLEAR_SCREEN:
         # Epic 13 3-byte layout.
