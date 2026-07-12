@@ -1472,6 +1472,48 @@ class NocturNationApp(app.App):
         self._radio_held = True
         self._dbg_radio("acquire")
 
+    def _bounce_radio(self) -> bool:
+        """Cycle STA_IF active state so the next wlan.config(channel=N)
+        call becomes a fresh first-config-after-active (Q6 workaround).
+
+        Cheaper than _release_radio + _acquire_radio because it skips the
+        badge_wifi restore/stop cycle and does NOT reset the scanner /
+        TOFU / signal-tracker state - those must survive across an
+        auto-scan's channel rotations. Long-range PHY + PM_NONE need
+        to be re-applied because active(False) throws them away; the
+        ESP-NOW peer table survives the wlan cycle in practice (bench-
+        verified 2026-07-12) but we bounce esp.active around it for
+        safety in case a future MicroPython build tightens the coupling.
+
+        Returns True on success. False on hard exception - the caller
+        should bail out of the scan rather than spin forever on a broken
+        radio.
+        """
+        if self._wlan is None:
+            return False
+        try:
+            if self._esp is not None:
+                try:
+                    self._esp.active(False)
+                except Exception:
+                    pass
+            self._wlan.active(False)
+            self._wlan.active(True)
+            try:
+                self._wlan.config(protocol=8)   # ESP-NOW long range
+            except Exception:
+                pass
+            try:
+                self._wlan.config(pm=network.WLAN.PM_NONE)
+            except Exception:
+                pass
+            if self._esp is not None:
+                self._esp.active(True)
+            return True
+        except Exception as exc:
+            print("[nocturnation] radio bounce failed: %s" % exc)
+            return False
+
     def _release_radio(self) -> None:
         """Release ESP-NOW and hand WiFi back to the OS. Idempotent."""
         if not self._radio_held:
@@ -1937,17 +1979,33 @@ class NocturNationApp(app.App):
         # Director in earshot see this until a frame arrives.
         self._status = "Open-source crowd lighting"
 
+        # Q6 workaround: the badge's STA_IF only honours the FIRST
+        # wlan.config(channel=N) call after each wlan.active(True), so
+        # subsequent scan targets in a single session used to fail with
+        # RuntimeError 0xffffffff and the scanner froze on the first
+        # channel (usually 11). Bouncing STA_IF active(False)/active(True)
+        # around every non-first channel-set resets that counter, letting
+        # the SCAN_ORDER (11 -> 1 -> 6) actually rotate. Skip the bounce
+        # on the first iteration because _acquire_radio just brought the
+        # STA up - the first config call is already a fresh
+        # first-config-after-active.
+        first_iter = True
         while not self._scanner.is_locked and self._mode == "lume":
             ch = self._scanner.current_channel
+            if not first_iter:
+                if not self._bounce_radio():
+                    self._status = "radio bounce err ch %d" % ch
+                    print("[nocturnation] scan radio bounce failed at ch %d" % ch)
+                    return False
+            first_iter = False
             try:
                 wlan.config(channel=ch)
             except Exception as exc:
-                # Tildagon's networking layer can reject channel changes
-                # on STA_IF with a non-OSError exception (observed:
-                # RuntimeError: Wifi Unknown Error 0xffffffff). Treat any
-                # failure as "this badge does not let us steer the radio"
-                # and fall back to receive on whichever channel was last
-                # successfully set (often the first scan target).
+                # STA_IF still rejects the config even after a bounce -
+                # something deeper is wrong. Fall back to receive on
+                # whichever channel was last successfully set (often
+                # the first scan target). This preserves the pre-Q6-
+                # workaround behaviour as the ultimate fallback.
                 self._status = "ch %d err" % ch
                 print("[nocturnation] wlan.config(channel=%d) failed: %s" % (ch, exc))
                 return False

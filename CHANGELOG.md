@@ -49,6 +49,15 @@ Polish release ahead of EMF. Operator-visible changes:
   channel actually landed on 1 — aborting to idle with a visible
   status message if it didn't. Fixes the "Atom can't see Tildagon
   Director after Lume mode" bug reported 2026-07-12.
+- **Lume-mode auto-scan Q6 workaround.** Same badge-firmware bug hit
+  the Lume auto-scan: only the first scan channel (ch 11) ever got
+  set — the SCAN_ORDER's ch 1 and ch 6 stops silently failed and the
+  badge froze on ch 11 for the rest of the session. Auto-scan now
+  bounces STA_IF `active(False)/(True)` before each non-first
+  channel-set (lighter than a full release/reacquire — preserves the
+  scanner cursor, TOFU state, and signal-tracker across the bounce).
+  The `(11 → 1 → 6)` rotation now actually rotates. `_bounce_radio()`
+  helper method added for reuse.
 - **Director TX heartbeat pip.** Small 8×8 pip drawn top-right of the
   LCD in Director mode. Bright green for 200 ms after each successful
   `esp.send()`, dim green for up to 2 s (~healthy 1 Hz heartbeat
