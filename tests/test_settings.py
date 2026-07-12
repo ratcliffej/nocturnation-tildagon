@@ -17,7 +17,9 @@ from nocturnation.settings import Settings, DEFAULT_PATH, DEFAULT_HELP_URL
 class TestDefaults:
     def test_default_values(self):
         s = Settings()
-        assert s.calm_mode is True
+        # calm_mode default flipped True -> False on 2026-07-12 (v1.0.0)
+        # so fresh installs render the authored show at full brightness.
+        assert s.calm_mode is False
         assert s.group == 0
         assert s.channel == "auto"
         assert s.active_show == ""
@@ -148,7 +150,7 @@ class TestPersistence:
             # Group is randomised into [1, 3] inclusive.
             assert 1 <= loaded.group <= 3
             # Other fields are still default.
-            assert loaded.calm_mode is True
+            assert loaded.calm_mode is False
             assert loaded.channel == "auto"
             assert loaded.mode == "lume"
         finally:

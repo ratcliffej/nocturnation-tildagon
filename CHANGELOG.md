@@ -4,6 +4,72 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-07-12 — v1.0.0: Calm Mode default OFF, tagline + version footer on searching screen, Conductor section-cycle gesture
+
+Polish release ahead of EMF. Operator-visible changes:
+
+- **Searching-for-signal screen** now displays the tagline
+  `Open-source crowd lighting` in place of the internal `scanning`
+  status text, and no longer shows the running frame count / FSM state
+  label. Punters glancing at an unlocked badge see brand + channel /
+  lock status, nothing else. Operator diagnostics (frames, FSM state)
+  remain available on the Debug Overlay (`Settings > Debug`). A small
+  version footer (`vN.N.N`) is drawn below the button hints, read
+  dynamically from `metadata.json` at module import so the number
+  tracks the manifest without a duplicate constant to keep in sync.
+- **Conductor Show: long-press LEFT / RIGHT cycles Section** without
+  opening the Settings overlay. Short-press keeps its palette-cycle
+  role; the 500 ms hold threshold arbitrates. `SECTION_NEXT` /
+  `SECTION_PREV` added to `InputAction`; `DirectorButtonMapper` gained
+  release-fire + hold-duration detection on LEFT / RIGHT (UP / DOWN
+  stay rising-edge). The Conductor's on-screen button hint updated to
+  `< >: palette  hold: section`.
+- **Calm Mode default flipped OFF** (`Settings.calm_mode` default
+  `True` → `False`). A fresh install renders the authored show at
+  full authored brightness on both the perimeter LEDs and the LCD
+  wash; the operator opts INTO Calm Mode via the in-app menu for
+  photosensitivity-sensitive contexts. Existing settings files with
+  `calm_mode: true` explicitly saved still load `True` — only fresh
+  installs and files missing the key see the new default.
+- **Version 0.9.0 → 1.0.0** (`metadata.json`); app-store manifest
+  `tildagon.toml` monotonic version `9` → `10` so the EMF App Store
+  picks it up as a new release.
+
+- **Director-mode Q6 workaround.** The badge's STA_IF layer only
+  honours the first `wlan.config(channel=N)` call after `active(True)`;
+  subsequent channel-sets raise `RuntimeError 0xffffffff`. If a user
+  ran Lume first (whose auto-scan sets ch 11 as its first channel)
+  then switched to Director, the `wlan.config(channel=1)` call
+  silently failed and the badge broadcast on ch 11 — invisible to any
+  Lume because StickC's `tofu_lock.cpp` filters community-range source
+  IDs on ch 11 (that's the "misconfigured Director on wrong channel"
+  guard). Director mode now bounces STA_IF `active(False)/(True)` at
+  session start (same `_bounce_radio()` helper as the Lume scan) so
+  `channel=1` is the fresh first-config call, and verifies via
+  `wlan.config("channel")` read-back that the physical channel actually
+  landed on 1 — aborting to idle with a visible status message if it
+  didn't. The ESP-NOW broadcast peer table is wiped by
+  `esp.active(False)` on this MicroPython build, so the peer is
+  re-registered explicitly after the bounce (idempotent-with-OSError,
+  matching `make_sender`'s pattern). Fixes the "Atom can't see
+  Tildagon Director after Lume mode" bug reported 2026-07-12.
+- **Lume-mode auto-scan Q6 workaround.** Same badge-firmware bug hit
+  the Lume auto-scan: only the first scan channel (ch 11) ever got
+  set — the SCAN_ORDER's ch 1 and ch 6 stops silently failed and the
+  badge froze on ch 11 for the rest of the session. Auto-scan now
+  bounces STA_IF `active(False)/(True)` before each non-first
+  channel-set (lighter than a full release/reacquire — preserves the
+  scanner cursor, TOFU state, and signal-tracker across the bounce).
+  The `(11 → 1 → 6)` rotation now actually rotates. `_bounce_radio()`
+  helper method added for reuse.
+- **Director TX heartbeat pip.** Small 8×8 pip drawn top-right of the
+  LCD in Director mode. Bright green for 200 ms after each successful
+  `esp.send()`, dim green for up to 2 s (~healthy 1 Hz heartbeat
+  cadence), red thereafter. Gives the operator a "the radio is
+  actually broadcasting" cue without hooking up USB serial.
+
+All 561 host tests pass (0 skipped).
+
 ## 2026-07-02 — Terminology: drop "shell N" for "hop N" in current code
 
 The Epic 17 design used "shell N" and "hop N" for what turned out to

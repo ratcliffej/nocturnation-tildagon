@@ -163,6 +163,40 @@ from .nocturnation.director.espnow_sender import make_sender, BROADCAST_MAC
 from .nocturnation.repeater import DynamicRepeater
 
 
+# App version, loaded once at import from metadata.json (the on-badge
+# runtime artefact copied alongside app.py by deploy.sh). Displayed on
+# the Lume searching-for-signal screen. Read dynamically rather than
+# baked in as a literal so the value tracks metadata.json without a
+# separate constant to keep in sync.
+#
+# Fallback path list because __file__ semantics differ:
+#   - Host pytest: __file__ absolute, rsplit gives project dir - reads
+#     Nocturnation-Tildagon/metadata.json.
+#   - Badge: deploy.sh copies metadata.json to /apps/nocturnation/,
+#     alongside app.py. Depending on how the launcher spawns the app,
+#     __file__ may or may not include the full path - try both.
+#
+# Falls back to "?" if every path fails; the caller renders "v?" so the
+# failure surfaces on the screen rather than reading as a healthy value.
+_APP_VERSION = "?"
+try:
+    import json as _json
+    _version_paths = ["/apps/nocturnation/metadata.json", "metadata.json"]
+    try:
+        _version_paths.insert(0, __file__.rsplit("/", 1)[0] + "/metadata.json")
+    except (NameError, AttributeError):
+        pass
+    for _p in _version_paths:
+        try:
+            with open(_p) as _vf:
+                _APP_VERSION = _json.load(_vf).get("version", "?")
+                break
+        except OSError:
+            continue
+except (ValueError, ImportError):
+    pass
+
+
 # Cycle order for the settings menu.
 _GROUP_CYCLE = (0, 1, 2, 3)
 _CHANNEL_CYCLE = ("auto", "1", "11")
@@ -329,6 +363,14 @@ class NocturNationApp(app.App):
         self._button_tap = None
         self._dir_buttons = DirectorButtonMapper()
         self._display = CtxDisplay()
+        # Director-mode TX heartbeat pip: the send-wrapper set up in
+        # _ensure_director bumps this to time.ticks_ms() on every
+        # successful esp.send(); _draw_director paints a small pip in
+        # the top-right whose colour is derived from the age of this
+        # timestamp. Gives the operator a visual "the radio is actually
+        # broadcasting" cue without hooking up USB serial. None = no
+        # TX has landed yet this session.
+        self._director_last_tx_ms = None
         # Director overlay (Show picker / per-Show settings). None when
         # the active Show owns the screen.
         self._director_overlay = None
@@ -520,14 +562,16 @@ class NocturNationApp(app.App):
             self._stop_to_idle()
             return
 
-        # Nav buttons -> InputActions (mapper does its own edge
+        # Nav buttons -> InputActions (mapper does its own edge + hold
         # detection, so no button_states.clear() that would disturb the
-        # held CONFIRM tap state).
+        # held CONFIRM tap state). now_ms feeds the long-press timer
+        # for LEFT / RIGHT (short = palette, long = section).
         actions = self._dir_buttons.poll(
             up=bool(self.button_states.get(BUTTON_TYPES["UP"])),
             down=bool(self.button_states.get(BUTTON_TYPES["DOWN"])),
             left=bool(self.button_states.get(BUTTON_TYPES["LEFT"])),
             right=bool(self.button_states.get(BUTTON_TYPES["RIGHT"])),
+            now_ms=time.ticks_ms() if time is not None else 0,
         )
         for action in actions:
             result = self._controller.on_input_action(action)
@@ -1008,16 +1052,11 @@ class NocturNationApp(app.App):
                 tofu_locked_id=self._tofu.locked_id,
             )
         )
-        # Epic 17 B2e: FSM state label appended to the frames line when
-        # the dynamic repeater is armed. LISTEN / LISTEN? / REPEAT /
-        # CDOWN. Absent when Repeat=OFF.
-        if self._fsm is not None:
-            ctx.move_to(0, 20).text(
-                "frames: %d  %s" % (self._frame_count,
-                                     self._fsm.state_label())
-            )
-        else:
-            ctx.move_to(0, 20).text("frames: %d" % self._frame_count)
+        # Frame count + FSM state deliberately not drawn on the
+        # searching / unlocked Lume screen (2026-07-12): punters see
+        # a clean tagline + channel/lock status. Both stay available
+        # on the operator Debug Overlay (_draw_debug_overlay) where
+        # LISTEN / REPEAT / CDOWN belong.
 
         # NO SIGNAL overlay (Block 6) takes precedence over the RGB
         # triplet line: it answers the more important "is the Director
@@ -1035,6 +1074,15 @@ class NocturNationApp(app.App):
         ):
             f = self._last_frame
             ctx.move_to(0, 45).text("rgb %02x%02x%02x" % (f.r, f.g, f.b))
+
+        # Version line, tucked just below the brand title so it reads
+        # as "NocturNation vN.N.N" in a two-line stack. Value read once
+        # at module import from metadata.json (see _APP_VERSION); tracks
+        # whatever the on-badge manifest declares. Placed above the
+        # tagline / channel stack so the round display can't clip it -
+        # earlier position at y=105 sat on the edge of the visible arc.
+        ctx.font_size = 12
+        ctx.move_to(0, -33).text("v%s" % _APP_VERSION)
 
         # Button-hint footer. Tildagon convention: C = select (CONFIRM),
         # F = back (CANCEL). The mapping is fixed by the frontboard and
@@ -1292,6 +1340,35 @@ class NocturNationApp(app.App):
             ctx.move_to(0, 0).text("show error")
             print("[nocturnation] show on_render failed: %s" % exc)
 
+        # Director TX heartbeat pip. Drawn last so a Show that clears
+        # its own background can't wipe it. Positioned inside the round
+        # 240-diameter display: (60, -85) with 10x10 size keeps all four
+        # corners under radius 105, well inside the 120 visible arc.
+        # Previous position (95, -110) landed at radius 145 - completely
+        # off-screen. Colour by age of the last successful esp.send():
+        #   < 200 ms  bright green   (a frame just went out)
+        #   < 2000 ms dim green      (recent TX; healthy heartbeat cadence)
+        #   >= 2000 ms or never      red (TX stalled - Q6, radio fault,
+        #                                 or Show emits nothing)
+        # 2 s outer threshold matches the 1 Hz heartbeat cadence
+        # (dispatcher.heartbeat_tick) with margin.
+        if time is not None:
+            now_pip_ms = time.ticks_ms()
+            if self._director_last_tx_ms is None:
+                pip_r, pip_g, pip_b = 0.6, 0.0, 0.0
+            else:
+                age = ticks_diff(now_pip_ms, self._director_last_tx_ms)
+                if age < 0:
+                    age = 0
+                if age < 200:
+                    pip_r, pip_g, pip_b = 0.0, 1.0, 0.0
+                elif age < 2000:
+                    pip_r, pip_g, pip_b = 0.0, 0.4, 0.0
+                else:
+                    pip_r, pip_g, pip_b = 0.6, 0.0, 0.0
+            ctx.rgb(pip_r, pip_g, pip_b)
+            ctx.rectangle(60, -85, 10, 10).fill()
+
     async def background_task(self) -> None:
         """ESP-NOW receive loop: auto-scan, lock, then receive forever.
 
@@ -1396,6 +1473,48 @@ class NocturNationApp(app.App):
         self._signal_tracker.reset()
         self._radio_held = True
         self._dbg_radio("acquire")
+
+    def _bounce_radio(self) -> bool:
+        """Cycle STA_IF active state so the next wlan.config(channel=N)
+        call becomes a fresh first-config-after-active (Q6 workaround).
+
+        Cheaper than _release_radio + _acquire_radio because it skips the
+        badge_wifi restore/stop cycle and does NOT reset the scanner /
+        TOFU / signal-tracker state - those must survive across an
+        auto-scan's channel rotations. Long-range PHY + PM_NONE need
+        to be re-applied because active(False) throws them away; the
+        ESP-NOW peer table survives the wlan cycle in practice (bench-
+        verified 2026-07-12) but we bounce esp.active around it for
+        safety in case a future MicroPython build tightens the coupling.
+
+        Returns True on success. False on hard exception - the caller
+        should bail out of the scan rather than spin forever on a broken
+        radio.
+        """
+        if self._wlan is None:
+            return False
+        try:
+            if self._esp is not None:
+                try:
+                    self._esp.active(False)
+                except Exception:
+                    pass
+            self._wlan.active(False)
+            self._wlan.active(True)
+            try:
+                self._wlan.config(protocol=8)   # ESP-NOW long range
+            except Exception:
+                pass
+            try:
+                self._wlan.config(pm=network.WLAN.PM_NONE)
+            except Exception:
+                pass
+            if self._esp is not None:
+                self._esp.active(True)
+            return True
+        except Exception as exc:
+            print("[nocturnation] radio bounce failed: %s" % exc)
+            return False
 
     def _release_radio(self) -> None:
         """Release ESP-NOW and hand WiFi back to the OS. Idempotent."""
@@ -1504,6 +1623,42 @@ class NocturNationApp(app.App):
             self._stop_to_idle()
             return
 
+        # Q6 workaround: the badge's STA_IF layer only honours the FIRST
+        # wlan.config(channel=N) call after each active(True) - subsequent
+        # channel-sets raise RuntimeError 0xffffffff. If we arrived here
+        # via a prior Lume session, that first-config slot was already
+        # spent on the auto-scan's channel 11, so the config(channel=1)
+        # below would silently fail: the try/except catches the exception,
+        # the log line prints, and the Director then broadcasts on ch 11
+        # (invisible to Lumes: StickC's tofu_lock filters community-range
+        # source_ids on ch 11, Tildagon's DIRECTOR_FORBIDDEN check already
+        # rules out ch 11 as a design channel). Bounce STA_IF active state
+        # so ch 1 becomes the fresh first-config after active(True).
+        # Matches the Lume-scan bounce mechanism - lighter than
+        # _release_radio + _acquire_radio and preserves _esp identity so
+        # the dispatcher's send_fn closure stays valid.
+        if not self._bounce_radio():
+            print("[nocturnation] director: radio bounce failed; back to idle")
+            self._status = "no radio"
+            self._stop_to_idle()
+            return
+
+        # ESP-NOW peer table is wiped by esp.active(False) inside the
+        # bounce. make_sender only registers the broadcast peer ONCE
+        # (during _ensure_director at first Director entry), so heartbeat
+        # sends after the bounce would raise "peer not found" and the
+        # exception would silently drop the frame. Re-add the peer here.
+        # Idempotent-with-OSError, matching make_sender's pattern.
+        if self._esp is not None:
+            try:
+                self._esp.add_peer(BROADCAST_MAC)
+            except OSError:
+                # Peer already registered (some MicroPython builds
+                # preserve peers across active-cycle). No-op path.
+                pass
+            except Exception as exc:
+                print("[nocturnation] director: peer re-add failed: %s" % exc)
+
         # Director transmits on the hobby channel only (Epic 5.5).
         try:
             wlan.config(channel=DIRECTOR_CHANNEL)
@@ -1511,6 +1666,31 @@ class NocturNationApp(app.App):
         except Exception as exc:
             print("[nocturnation] director wlan.config(channel=%d) failed: %s"
                   % (DIRECTOR_CHANNEL, exc))
+            self._status = "ch %d config failed" % DIRECTOR_CHANNEL
+            self._stop_to_idle()
+            return
+
+        # Readback verify: if the actual radio channel doesn't match
+        # DIRECTOR_CHANNEL, refuse to broadcast rather than silently TX
+        # on the wrong channel. Best-effort - some MicroPython builds
+        # don't support config("channel") with a positional arg; a
+        # readback exception is logged but doesn't block the session.
+        try:
+            actual_ch = wlan.config("channel")
+            if actual_ch != DIRECTOR_CHANNEL:
+                print(
+                    "[nocturnation] director channel verify failed: wanted %d, "
+                    "actual %d; back to idle" % (DIRECTOR_CHANNEL, actual_ch)
+                )
+                self._status = "ch %d != %d" % (actual_ch, DIRECTOR_CHANNEL)
+                self._stop_to_idle()
+                return
+        except Exception as exc:
+            print("[nocturnation] director channel readback unsupported: %s" % exc)
+
+        # Reset the heartbeat pip so a stale timestamp from a prior
+        # Director session doesn't paint green before the first TX.
+        self._director_last_tx_ms = None
 
         self._controller.enter()
         self._bind_display()
@@ -1568,7 +1748,17 @@ class NocturNationApp(app.App):
         send_fn = None
         if self._esp is not None:
             try:
-                send_fn = make_sender(self._esp)
+                raw_send_fn = make_sender(self._esp)
+                # Wrap the sender so we can stamp _director_last_tx_ms
+                # on every successful send. The stamp drives the LCD
+                # heartbeat pip in _draw_director. Failure to send
+                # doesn't advance the stamp - pip stays cold if the
+                # radio's silently failing.
+                def _pip_send(payload):
+                    raw_send_fn(payload)
+                    if time is not None:
+                        self._director_last_tx_ms = time.ticks_ms()
+                send_fn = _pip_send
             except Exception as exc:
                 print("[nocturnation] espnow sender setup failed: %s" % exc)
         # The Director is its own first Lume: render_fx broadcasts AND
@@ -1801,19 +1991,38 @@ class NocturNationApp(app.App):
         """
         listen_ms = self._scanner.listen_ms
         poll_ms = 50
-        self._status = "scanning"
+        # Tagline shown on the searching / unlocked Lume screen. Users
+        # who launched the app straight into Lume mode without a
+        # Director in earshot see this until a frame arrives.
+        self._status = "Open-source crowd lighting"
 
+        # Q6 workaround: the badge's STA_IF only honours the FIRST
+        # wlan.config(channel=N) call after each wlan.active(True), so
+        # subsequent scan targets in a single session used to fail with
+        # RuntimeError 0xffffffff and the scanner froze on the first
+        # channel (usually 11). Bouncing STA_IF active(False)/active(True)
+        # around every non-first channel-set resets that counter, letting
+        # the SCAN_ORDER (11 -> 1 -> 6) actually rotate. Skip the bounce
+        # on the first iteration because _acquire_radio just brought the
+        # STA up - the first config call is already a fresh
+        # first-config-after-active.
+        first_iter = True
         while not self._scanner.is_locked and self._mode == "lume":
             ch = self._scanner.current_channel
+            if not first_iter:
+                if not self._bounce_radio():
+                    self._status = "radio bounce err ch %d" % ch
+                    print("[nocturnation] scan radio bounce failed at ch %d" % ch)
+                    return False
+            first_iter = False
             try:
                 wlan.config(channel=ch)
             except Exception as exc:
-                # Tildagon's networking layer can reject channel changes
-                # on STA_IF with a non-OSError exception (observed:
-                # RuntimeError: Wifi Unknown Error 0xffffffff). Treat any
-                # failure as "this badge does not let us steer the radio"
-                # and fall back to receive on whichever channel was last
-                # successfully set (often the first scan target).
+                # STA_IF still rejects the config even after a bounce -
+                # something deeper is wrong. Fall back to receive on
+                # whichever channel was last successfully set (often
+                # the first scan target). This preserves the pre-Q6-
+                # workaround behaviour as the ultimate fallback.
                 self._status = "ch %d err" % ch
                 print("[nocturnation] wlan.config(channel=%d) failed: %s" % (ch, exc))
                 return False

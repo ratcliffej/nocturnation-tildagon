@@ -5,12 +5,14 @@ docs/developing-shows.md "Button handling"). The Director host maps
 physical buttons to these semantic actions; some are intercepted by
 the host and never reach the Show.
 
-  PICKER     - open the Show picker          (host intercepts)
-  SETTINGS   - open the per-Show settings    (host intercepts)
-  PAUSE      - toggle ctx.paused()           (host toggles)
-  CONFIRM    - reaches the Show
-  CYCLE      - reaches the Show
-  CYCLE_PREV - reaches the Show
+  PICKER       - open the Show picker          (host intercepts)
+  SETTINGS     - open the per-Show settings    (host intercepts)
+  PAUSE        - toggle ctx.paused()           (host toggles)
+  CONFIRM      - reaches the Show
+  CYCLE        - reaches the Show
+  CYCLE_PREV   - reaches the Show
+  SECTION_NEXT - reaches the Show (v1.0.1: long-press RIGHT on Tildagon)
+  SECTION_PREV - reaches the Show (v1.0.1: long-press LEFT on Tildagon)
 
 A Show overrides `on_input_action(ctx, action)` and compares `action`
 against these constants, e.g.
@@ -33,3 +35,5 @@ class InputAction:
     CONFIRM = 3
     CYCLE = 4
     CYCLE_PREV = 5
+    SECTION_NEXT = 6
+    SECTION_PREV = 7

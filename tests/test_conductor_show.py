@@ -306,6 +306,35 @@ class TestConductorInput:
         # One pulse fired (Confirm -> on_tap_detected).
         assert len(host.renders) == 1
 
+    def test_section_next_advances_section(self, tmp_path):
+        s = make_conductor()
+        host = _FakeHost()
+        ctx = _ctx(s, tmp_path, host=host)
+        s.enter(ctx)
+        assert ctx.get_property("section") == 0  # Verse
+        s.on_input_action(ctx, InputAction.SECTION_NEXT)
+        assert ctx.get_property("section") == 1  # Chorus
+
+    def test_section_prev_wraps(self, tmp_path):
+        s = make_conductor()
+        host = _FakeHost()
+        ctx = _ctx(s, tmp_path, host=host)
+        s.enter(ctx)
+        s.on_input_action(ctx, InputAction.SECTION_PREV)
+        # 5 sections: Verse -> wrap to Breakdown (index 4).
+        assert ctx.get_property("section") == 4
+
+    def test_section_next_walks_full_arc(self, tmp_path):
+        # Verse -> Chorus -> BuildUp -> Drop -> Breakdown -> Verse.
+        s = make_conductor()
+        host = _FakeHost()
+        ctx = _ctx(s, tmp_path, host=host)
+        s.enter(ctx)
+        expected = [1, 2, 3, 4, 0]
+        for i in expected:
+            s.on_input_action(ctx, InputAction.SECTION_NEXT)
+            assert ctx.get_property("section") == i
+
 
 # ---------------------------------------------------------------------------
 # Render path - draws without crashing, includes the expected labels
