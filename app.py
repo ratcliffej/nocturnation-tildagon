@@ -165,19 +165,35 @@ from .nocturnation.repeater import DynamicRepeater
 
 # App version, loaded once at import from metadata.json (the on-badge
 # runtime artefact copied alongside app.py by deploy.sh). Displayed on
-# the Lume searching-for-signal screen as a subtle footer. Read
-# dynamically rather than baked in as a literal so the value tracks
-# metadata.json without a separate constant to keep in sync. Falls back
-# to "?" if the file is missing or unreadable - host pytest never has
-# metadata.json alongside the nocturnation/ package, so "?" is the
-# expected sentinel in test contexts.
+# the Lume searching-for-signal screen. Read dynamically rather than
+# baked in as a literal so the value tracks metadata.json without a
+# separate constant to keep in sync.
+#
+# Fallback path list because __file__ semantics differ:
+#   - Host pytest: __file__ absolute, rsplit gives project dir - reads
+#     Nocturnation-Tildagon/metadata.json.
+#   - Badge: deploy.sh copies metadata.json to /apps/nocturnation/,
+#     alongside app.py. Depending on how the launcher spawns the app,
+#     __file__ may or may not include the full path - try both.
+#
+# Falls back to "?" if every path fails; the caller renders "v?" so the
+# failure surfaces on the screen rather than reading as a healthy value.
 _APP_VERSION = "?"
 try:
     import json as _json
-    _version_path = __file__.rsplit("/", 1)[0] + "/metadata.json"
-    with open(_version_path) as _vf:
-        _APP_VERSION = _json.load(_vf).get("version", "?")
-except (OSError, ValueError, NameError, AttributeError):
+    _version_paths = ["/apps/nocturnation/metadata.json", "metadata.json"]
+    try:
+        _version_paths.insert(0, __file__.rsplit("/", 1)[0] + "/metadata.json")
+    except (NameError, AttributeError):
+        pass
+    for _p in _version_paths:
+        try:
+            with open(_p) as _vf:
+                _APP_VERSION = _json.load(_vf).get("version", "?")
+                break
+        except OSError:
+            continue
+except (ValueError, ImportError):
     pass
 
 
@@ -1051,6 +1067,15 @@ class NocturNationApp(app.App):
             f = self._last_frame
             ctx.move_to(0, 45).text("rgb %02x%02x%02x" % (f.r, f.g, f.b))
 
+        # Version line, tucked just below the brand title so it reads
+        # as "NocturNation vN.N.N" in a two-line stack. Value read once
+        # at module import from metadata.json (see _APP_VERSION); tracks
+        # whatever the on-badge manifest declares. Placed above the
+        # tagline / channel stack so the round display can't clip it -
+        # earlier position at y=105 sat on the edge of the visible arc.
+        ctx.font_size = 12
+        ctx.move_to(0, -33).text("v%s" % _APP_VERSION)
+
         # Button-hint footer. Tildagon convention: C = select (CONFIRM),
         # F = back (CANCEL). The mapping is fixed by the frontboard and
         # apps don't override it; printing the hint inline so the
@@ -1058,14 +1083,6 @@ class NocturNationApp(app.App):
         # what.
         ctx.font_size = 10
         ctx.move_to(0, 85).text("C: settings   F: exit")
-
-        # Version footer. Dim grey so it doesn't compete with the brand
-        # + tagline stack. Value read once at module import from
-        # metadata.json (see _APP_VERSION); tracks whatever the on-badge
-        # manifest declares.
-        ctx.rgb(0.5, 0.5, 0.5)
-        ctx.move_to(0, 105).text("v%s" % _APP_VERSION)
-        ctx.rgb(1, 1, 1)
 
     def _draw_debug_overlay(self, ctx) -> None:
         """Epic 15 bench follow-up: diagnostic readout for repeat-mode
