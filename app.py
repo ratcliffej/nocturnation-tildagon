@@ -1341,9 +1341,11 @@ class NocturNationApp(app.App):
             print("[nocturnation] show on_render failed: %s" % exc)
 
         # Director TX heartbeat pip. Drawn last so a Show that clears
-        # its own background can't wipe it. Positioned top-right just
-        # inside the round-display arc. Colour by age of the last
-        # successful esp.send():
+        # its own background can't wipe it. Positioned inside the round
+        # 240-diameter display: (60, -85) with 10x10 size keeps all four
+        # corners under radius 105, well inside the 120 visible arc.
+        # Previous position (95, -110) landed at radius 145 - completely
+        # off-screen. Colour by age of the last successful esp.send():
         #   < 200 ms  bright green   (a frame just went out)
         #   < 2000 ms dim green      (recent TX; healthy heartbeat cadence)
         #   >= 2000 ms or never      red (TX stalled - Q6, radio fault,
@@ -1365,7 +1367,7 @@ class NocturNationApp(app.App):
                 else:
                     pip_r, pip_g, pip_b = 0.6, 0.0, 0.0
             ctx.rgb(pip_r, pip_g, pip_b)
-            ctx.rectangle(95, -110, 8, 8).fill()
+            ctx.rectangle(60, -85, 10, 10).fill()
 
     async def background_task(self) -> None:
         """ESP-NOW receive loop: auto-scan, lock, then receive forever.
