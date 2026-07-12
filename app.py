@@ -1008,16 +1008,11 @@ class NocturNationApp(app.App):
                 tofu_locked_id=self._tofu.locked_id,
             )
         )
-        # Epic 17 B2e: FSM state label appended to the frames line when
-        # the dynamic repeater is armed. LISTEN / LISTEN? / REPEAT /
-        # CDOWN. Absent when Repeat=OFF.
-        if self._fsm is not None:
-            ctx.move_to(0, 20).text(
-                "frames: %d  %s" % (self._frame_count,
-                                     self._fsm.state_label())
-            )
-        else:
-            ctx.move_to(0, 20).text("frames: %d" % self._frame_count)
+        # Frame count + FSM state deliberately not drawn on the
+        # searching / unlocked Lume screen (2026-07-12): punters see
+        # a clean tagline + channel/lock status. Both stay available
+        # on the operator Debug Overlay (_draw_debug_overlay) where
+        # LISTEN / REPEAT / CDOWN belong.
 
         # NO SIGNAL overlay (Block 6) takes precedence over the RGB
         # triplet line: it answers the more important "is the Director
@@ -1801,7 +1796,10 @@ class NocturNationApp(app.App):
         """
         listen_ms = self._scanner.listen_ms
         poll_ms = 50
-        self._status = "scanning"
+        # Tagline shown on the searching / unlocked Lume screen. Users
+        # who launched the app straight into Lume mode without a
+        # Director in earshot see this until a frame arrives.
+        self._status = "Open-source crowd lighting"
 
         while not self._scanner.is_locked and self._mode == "lume":
             ch = self._scanner.current_channel

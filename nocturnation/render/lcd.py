@@ -87,8 +87,10 @@ class LcdRenderer:
       on_light_wash_pulse(frame, now_ms) - LIGHT_WASH_PULSE.
       current_colour(now_ms)             - on every draw() call.
 
-    Calm Mode (default) makes current_colour always return None so the
-    LCD stays with its static UI. Operator toggles via set_calm_mode().
+    Calm Mode makes current_colour always return None so the LCD stays
+    with its static UI. Default changed 2026-07-12 (v1.0.0) to Full
+    Mode (calm_mode=False); operator opts INTO Calm Mode via the in-
+    app menu for photosensitivity-sensitive contexts.
     """
 
     __slots__ = (
@@ -99,7 +101,7 @@ class LcdRenderer:
         "_last_rendered",  # (r, g, b) last output, for next pulse's src-lerp
     )
 
-    def __init__(self, calm_mode=True):
+    def __init__(self, calm_mode=False):
         # Calm Mode disables LCD pulsing AND wash entirely; the renderer
         # is effectively a no-op until the operator opts into Full mode.
         self._enabled = not bool(calm_mode)

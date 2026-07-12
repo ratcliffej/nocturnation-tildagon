@@ -53,9 +53,11 @@ class FakeFrame:
 
 
 class TestCalmMode:
-    def test_default_is_calm_mode_disabled(self):
+    def test_default_is_full_mode_enabled(self):
+        # Default flipped 2026-07-12 (v1.0.0): calm_mode=False, renderer
+        # enabled out of the box.
         r = LcdRenderer()
-        assert r.enabled is False
+        assert r.enabled is True
 
     def test_calm_mode_dispatch_returns_false(self):
         r = LcdRenderer(calm_mode=True)

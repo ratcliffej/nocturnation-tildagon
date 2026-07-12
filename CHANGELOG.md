@@ -4,6 +4,39 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-07-12 — v1.0.0: Calm Mode default OFF, tagline on searching screen, version bump
+
+Polish release ahead of EMF. Operator-visible changes:
+
+- **Searching-for-signal screen** now displays the tagline
+  `Open-source crowd lighting` in place of the internal `scanning`
+  status text, and no longer shows the running frame count / FSM state
+  label. Punters glancing at an unlocked badge see brand + channel /
+  lock status, nothing else. Operator diagnostics (frames, FSM state)
+  remain available on the Debug Overlay (`Settings > Debug`).
+- **Calm Mode default flipped OFF** (`Settings.calm_mode` default
+  `True` → `False`). A fresh install renders the authored show at
+  full authored brightness on both the perimeter LEDs and the LCD
+  wash; the operator opts INTO Calm Mode via the in-app menu for
+  photosensitivity-sensitive contexts. Existing settings files with
+  `calm_mode: true` explicitly saved still load `True` — only fresh
+  installs and files missing the key see the new default.
+- **Version 0.9.0 → 1.0.0** (`metadata.json`); app-store manifest
+  `tildagon.toml` monotonic version `9` → `10` so the EMF App Store
+  picks it up as a new release.
+
+Not included: a known Director-Tildagon-to-Lume discovery gap when
+both badges are on default `channel: "auto"`. Root cause is Epic 5 Q6
+(the badge's STA_IF only honours the first `wlan.config(channel=N)`
+call after `active(True)`), which pins auto-scan Lumes to the first
+channel tried (channel 11). Tildagon Directors broadcast on channel 1
+per the community/hobby-band design, so a Lume on `auto` never sees a
+Tildagon Director. Workaround today: pin the Lume's Channel to `"1"`
+via Settings. Proper fix needs a radio-reset workaround for Q6 or an
+upstream badge firmware change — tracked for a follow-up.
+
+All 561 host tests pass (0 skipped).
+
 ## 2026-07-02 — Terminology: drop "shell N" for "hop N" in current code
 
 The Epic 17 design used "shell N" and "hop N" for what turned out to

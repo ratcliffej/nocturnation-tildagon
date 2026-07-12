@@ -119,7 +119,7 @@ class PerimeterRenderer:
         "_rng",
     )
 
-    def __init__(self, calm_mode=True, rng=None):
+    def __init__(self, calm_mode=False, rng=None):
         if rng is None:
             import random
             rng = random.random
