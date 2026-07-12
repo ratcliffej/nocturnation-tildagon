@@ -35,15 +35,25 @@ Polish release ahead of EMF. Operator-visible changes:
   `tildagon.toml` monotonic version `9` → `10` so the EMF App Store
   picks it up as a new release.
 
-Not included: a known Director-Tildagon-to-Lume discovery gap when
-both badges are on default `channel: "auto"`. Root cause is Epic 5 Q6
-(the badge's STA_IF only honours the first `wlan.config(channel=N)`
-call after `active(True)`), which pins auto-scan Lumes to the first
-channel tried (channel 11). Tildagon Directors broadcast on channel 1
-per the community/hobby-band design, so a Lume on `auto` never sees a
-Tildagon Director. Workaround today: pin the Lume's Channel to `"1"`
-via Settings. Proper fix needs a radio-reset workaround for Q6 or an
-upstream badge firmware change — tracked for a follow-up.
+- **Director-mode Q6 workaround.** The badge's STA_IF layer only
+  honours the first `wlan.config(channel=N)` call after `active(True)`;
+  subsequent channel-sets raise `RuntimeError 0xffffffff`. If a user
+  ran Lume first (whose auto-scan sets ch 11 as its first channel)
+  then switched to Director, the `wlan.config(channel=1)` call
+  silently failed and the badge broadcast on ch 11 — invisible to any
+  Lume because StickC's `tofu_lock.cpp` filters community-range source
+  IDs on ch 11 (that's the "misconfigured Director on wrong channel"
+  guard). Director mode now releases and re-acquires the radio at
+  session start so `channel=1` is the fresh first-config call, and
+  verifies via `wlan.config("channel")` read-back that the physical
+  channel actually landed on 1 — aborting to idle with a visible
+  status message if it didn't. Fixes the "Atom can't see Tildagon
+  Director after Lume mode" bug reported 2026-07-12.
+- **Director TX heartbeat pip.** Small 8×8 pip drawn top-right of the
+  LCD in Director mode. Bright green for 200 ms after each successful
+  `esp.send()`, dim green for up to 2 s (~healthy 1 Hz heartbeat
+  cadence), red thereafter. Gives the operator a "the radio is
+  actually broadcasting" cue without hooking up USB serial.
 
 All 561 host tests pass (0 skipped).
 

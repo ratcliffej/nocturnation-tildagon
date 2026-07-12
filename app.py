@@ -363,6 +363,14 @@ class NocturNationApp(app.App):
         self._button_tap = None
         self._dir_buttons = DirectorButtonMapper()
         self._display = CtxDisplay()
+        # Director-mode TX heartbeat pip: the send-wrapper set up in
+        # _ensure_director bumps this to time.ticks_ms() on every
+        # successful esp.send(); _draw_director paints a small pip in
+        # the top-right whose colour is derived from the age of this
+        # timestamp. Gives the operator a visual "the radio is actually
+        # broadcasting" cue without hooking up USB serial. None = no
+        # TX has landed yet this session.
+        self._director_last_tx_ms = None
         # Director overlay (Show picker / per-Show settings). None when
         # the active Show owns the screen.
         self._director_overlay = None
@@ -1332,6 +1340,33 @@ class NocturNationApp(app.App):
             ctx.move_to(0, 0).text("show error")
             print("[nocturnation] show on_render failed: %s" % exc)
 
+        # Director TX heartbeat pip. Drawn last so a Show that clears
+        # its own background can't wipe it. Positioned top-right just
+        # inside the round-display arc. Colour by age of the last
+        # successful esp.send():
+        #   < 200 ms  bright green   (a frame just went out)
+        #   < 2000 ms dim green      (recent TX; healthy heartbeat cadence)
+        #   >= 2000 ms or never      red (TX stalled - Q6, radio fault,
+        #                                 or Show emits nothing)
+        # 2 s outer threshold matches the 1 Hz heartbeat cadence
+        # (dispatcher.heartbeat_tick) with margin.
+        if time is not None:
+            now_pip_ms = time.ticks_ms()
+            if self._director_last_tx_ms is None:
+                pip_r, pip_g, pip_b = 0.6, 0.0, 0.0
+            else:
+                age = ticks_diff(now_pip_ms, self._director_last_tx_ms)
+                if age < 0:
+                    age = 0
+                if age < 200:
+                    pip_r, pip_g, pip_b = 0.0, 1.0, 0.0
+                elif age < 2000:
+                    pip_r, pip_g, pip_b = 0.0, 0.4, 0.0
+                else:
+                    pip_r, pip_g, pip_b = 0.6, 0.0, 0.0
+            ctx.rgb(pip_r, pip_g, pip_b)
+            ctx.rectangle(95, -110, 8, 8).fill()
+
     async def background_task(self) -> None:
         """ESP-NOW receive loop: auto-scan, lock, then receive forever.
 
@@ -1544,6 +1579,27 @@ class NocturNationApp(app.App):
             self._stop_to_idle()
             return
 
+        # Q6 workaround: the badge's STA_IF layer only honours the FIRST
+        # wlan.config(channel=N) call after each active(True) - subsequent
+        # channel-sets raise RuntimeError 0xffffffff. If we arrived here
+        # via a prior Lume session, that first-config slot was already
+        # spent on the auto-scan's channel 11, so the config(channel=1)
+        # below would silently fail: the try/except catches the exception,
+        # the log line prints, and the Director then broadcasts on ch 11
+        # (invisible to Lumes: StickC's tofu_lock filters community-range
+        # source_ids on ch 11, Tildagon's DIRECTOR_FORBIDDEN check already
+        # rules out ch 11 as a design channel). Release and re-acquire the
+        # radio so ch 1 becomes the fresh first-config after active(True).
+        # Idempotent + fast on a Director-first flow.
+        self._release_radio()
+        self._acquire_radio()
+        if self._wlan is None:
+            print("[nocturnation] director: radio re-acquire failed; back to idle")
+            self._status = "no radio"
+            self._stop_to_idle()
+            return
+        wlan = self._wlan   # rebind: _release + _acquire rebuilt the STA_IF
+
         # Director transmits on the hobby channel only (Epic 5.5).
         try:
             wlan.config(channel=DIRECTOR_CHANNEL)
@@ -1551,6 +1607,31 @@ class NocturNationApp(app.App):
         except Exception as exc:
             print("[nocturnation] director wlan.config(channel=%d) failed: %s"
                   % (DIRECTOR_CHANNEL, exc))
+            self._status = "ch %d config failed" % DIRECTOR_CHANNEL
+            self._stop_to_idle()
+            return
+
+        # Readback verify: if the actual radio channel doesn't match
+        # DIRECTOR_CHANNEL, refuse to broadcast rather than silently TX
+        # on the wrong channel. Best-effort - some MicroPython builds
+        # don't support config("channel") with a positional arg; a
+        # readback exception is logged but doesn't block the session.
+        try:
+            actual_ch = wlan.config("channel")
+            if actual_ch != DIRECTOR_CHANNEL:
+                print(
+                    "[nocturnation] director channel verify failed: wanted %d, "
+                    "actual %d; back to idle" % (DIRECTOR_CHANNEL, actual_ch)
+                )
+                self._status = "ch %d != %d" % (actual_ch, DIRECTOR_CHANNEL)
+                self._stop_to_idle()
+                return
+        except Exception as exc:
+            print("[nocturnation] director channel readback unsupported: %s" % exc)
+
+        # Reset the heartbeat pip so a stale timestamp from a prior
+        # Director session doesn't paint green before the first TX.
+        self._director_last_tx_ms = None
 
         self._controller.enter()
         self._bind_display()
@@ -1608,7 +1689,17 @@ class NocturNationApp(app.App):
         send_fn = None
         if self._esp is not None:
             try:
-                send_fn = make_sender(self._esp)
+                raw_send_fn = make_sender(self._esp)
+                # Wrap the sender so we can stamp _director_last_tx_ms
+                # on every successful send. The stamp drives the LCD
+                # heartbeat pip in _draw_director. Failure to send
+                # doesn't advance the stamp - pip stays cold if the
+                # radio's silently failing.
+                def _pip_send(payload):
+                    raw_send_fn(payload)
+                    if time is not None:
+                        self._director_last_tx_ms = time.ticks_ms()
+                send_fn = _pip_send
             except Exception as exc:
                 print("[nocturnation] espnow sender setup failed: %s" % exc)
         # The Director is its own first Lume: render_fx broadcasts AND
