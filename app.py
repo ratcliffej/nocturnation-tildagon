@@ -1632,17 +1632,32 @@ class NocturNationApp(app.App):
         # the log line prints, and the Director then broadcasts on ch 11
         # (invisible to Lumes: StickC's tofu_lock filters community-range
         # source_ids on ch 11, Tildagon's DIRECTOR_FORBIDDEN check already
-        # rules out ch 11 as a design channel). Release and re-acquire the
-        # radio so ch 1 becomes the fresh first-config after active(True).
-        # Idempotent + fast on a Director-first flow.
-        self._release_radio()
-        self._acquire_radio()
-        if self._wlan is None:
-            print("[nocturnation] director: radio re-acquire failed; back to idle")
+        # rules out ch 11 as a design channel). Bounce STA_IF active state
+        # so ch 1 becomes the fresh first-config after active(True).
+        # Matches the Lume-scan bounce mechanism - lighter than
+        # _release_radio + _acquire_radio and preserves _esp identity so
+        # the dispatcher's send_fn closure stays valid.
+        if not self._bounce_radio():
+            print("[nocturnation] director: radio bounce failed; back to idle")
             self._status = "no radio"
             self._stop_to_idle()
             return
-        wlan = self._wlan   # rebind: _release + _acquire rebuilt the STA_IF
+
+        # ESP-NOW peer table is wiped by esp.active(False) inside the
+        # bounce. make_sender only registers the broadcast peer ONCE
+        # (during _ensure_director at first Director entry), so heartbeat
+        # sends after the bounce would raise "peer not found" and the
+        # exception would silently drop the frame. Re-add the peer here.
+        # Idempotent-with-OSError, matching make_sender's pattern.
+        if self._esp is not None:
+            try:
+                self._esp.add_peer(BROADCAST_MAC)
+            except OSError:
+                # Peer already registered (some MicroPython builds
+                # preserve peers across active-cycle). No-op path.
+                pass
+            except Exception as exc:
+                print("[nocturnation] director: peer re-add failed: %s" % exc)
 
         # Director transmits on the hobby channel only (Epic 5.5).
         try:
