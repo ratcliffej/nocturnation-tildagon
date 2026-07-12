@@ -4,7 +4,7 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
-## 2026-07-12 — v1.0.0: Calm Mode default OFF, tagline on searching screen, version bump
+## 2026-07-12 — v1.0.0: Calm Mode default OFF, tagline + version footer on searching screen, Conductor section-cycle gesture
 
 Polish release ahead of EMF. Operator-visible changes:
 
@@ -13,7 +13,17 @@ Polish release ahead of EMF. Operator-visible changes:
   status text, and no longer shows the running frame count / FSM state
   label. Punters glancing at an unlocked badge see brand + channel /
   lock status, nothing else. Operator diagnostics (frames, FSM state)
-  remain available on the Debug Overlay (`Settings > Debug`).
+  remain available on the Debug Overlay (`Settings > Debug`). A small
+  version footer (`vN.N.N`) is drawn below the button hints, read
+  dynamically from `metadata.json` at module import so the number
+  tracks the manifest without a duplicate constant to keep in sync.
+- **Conductor Show: long-press LEFT / RIGHT cycles Section** without
+  opening the Settings overlay. Short-press keeps its palette-cycle
+  role; the 500 ms hold threshold arbitrates. `SECTION_NEXT` /
+  `SECTION_PREV` added to `InputAction`; `DirectorButtonMapper` gained
+  release-fire + hold-duration detection on LEFT / RIGHT (UP / DOWN
+  stay rising-edge). The Conductor's on-screen button hint updated to
+  `< >: palette  hold: section`.
 - **Calm Mode default flipped OFF** (`Settings.calm_mode` default
   `True` → `False`). A fresh install renders the authored show at
   full authored brightness on both the perimeter LEDs and the LCD

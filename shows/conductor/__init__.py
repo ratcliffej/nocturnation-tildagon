@@ -7,10 +7,11 @@ has no microphone: a continuous wash baseline holds the song-arc layer
 gated by `chance`, and section transitions are picked manually via the
 Settings overlay (no analyser to fire them automatically).
 
-v1 ships with palette-cycle as the only Show-reachable button input.
+v1 shipped palette-cycle as the only Show-reachable button input.
+v1.0.1 adds section-cycle on long-press LEFT / RIGHT so the operator
+can drive the arc of a song without opening the Settings overlay.
 Richer scene gestures (drop release / freeze / brighten / dim) are
-deferred to v2 once the EMF 2026 keyboard hexagon expands the input
-surface (see Epic 6D B3 notes).
+still deferred to v2 pending the EMF 2026 keyboard hexagon.
 
 The wash visualisation lives on the Tildagon's own perimeter ring + LCD
 (B1's Director-side loopback) and on every other Lume on the channel.
@@ -217,6 +218,10 @@ class Conductor(Show):
             self._advance_palette(ctx, +1)
         elif action == InputAction.CYCLE_PREV:
             self._advance_palette(ctx, -1)
+        elif action == InputAction.SECTION_NEXT:
+            self._advance_section(ctx, +1)
+        elif action == InputAction.SECTION_PREV:
+            self._advance_section(ctx, -1)
         elif action == InputAction.CONFIRM:
             # Manual-tap path on hosts that route Confirm to the Show.
             self.on_tap_detected(ctx, 192)
@@ -251,7 +256,8 @@ class Conductor(Show):
                b=self._last_pulse_rgb[2])
         d.text(0, 10, section_name, size=18, r=200, g=200, b=200)
         d.text(0, 50, "tap to beat", size=12, r=160, g=160, b=160)
-        d.text(0, 90, "< >: palette  F: exit", size=10, r=120, g=120, b=120)
+        d.text(0, 85, "< >: palette  hold: section", size=10, r=120, g=120, b=120)
+        d.text(0, 98, "F: exit", size=10, r=120, g=120, b=120)
 
     # -- Internals --------------------------------------------------------
 
@@ -260,6 +266,12 @@ class Conductor(Show):
         nxt = (cur + delta) % len(_PALETTE_NAMES)
         # set_property fires on_property_changed which re-emits the wash.
         ctx.set_property("palette_set", nxt)
+
+    def _advance_section(self, ctx, delta):
+        cur = ctx.get_property("section")
+        nxt = (cur + delta) % len(_SECTION_NAMES)
+        # set_property fires on_property_changed which re-emits the wash.
+        ctx.set_property("section", nxt)
 
     def _emit_wash(self, ctx):
         palette = ctx.get_property("palette_set")

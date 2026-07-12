@@ -163,6 +163,24 @@ from .nocturnation.director.espnow_sender import make_sender, BROADCAST_MAC
 from .nocturnation.repeater import DynamicRepeater
 
 
+# App version, loaded once at import from metadata.json (the on-badge
+# runtime artefact copied alongside app.py by deploy.sh). Displayed on
+# the Lume searching-for-signal screen as a subtle footer. Read
+# dynamically rather than baked in as a literal so the value tracks
+# metadata.json without a separate constant to keep in sync. Falls back
+# to "?" if the file is missing or unreadable - host pytest never has
+# metadata.json alongside the nocturnation/ package, so "?" is the
+# expected sentinel in test contexts.
+_APP_VERSION = "?"
+try:
+    import json as _json
+    _version_path = __file__.rsplit("/", 1)[0] + "/metadata.json"
+    with open(_version_path) as _vf:
+        _APP_VERSION = _json.load(_vf).get("version", "?")
+except (OSError, ValueError, NameError, AttributeError):
+    pass
+
+
 # Cycle order for the settings menu.
 _GROUP_CYCLE = (0, 1, 2, 3)
 _CHANNEL_CYCLE = ("auto", "1", "11")
@@ -520,14 +538,16 @@ class NocturNationApp(app.App):
             self._stop_to_idle()
             return
 
-        # Nav buttons -> InputActions (mapper does its own edge
+        # Nav buttons -> InputActions (mapper does its own edge + hold
         # detection, so no button_states.clear() that would disturb the
-        # held CONFIRM tap state).
+        # held CONFIRM tap state). now_ms feeds the long-press timer
+        # for LEFT / RIGHT (short = palette, long = section).
         actions = self._dir_buttons.poll(
             up=bool(self.button_states.get(BUTTON_TYPES["UP"])),
             down=bool(self.button_states.get(BUTTON_TYPES["DOWN"])),
             left=bool(self.button_states.get(BUTTON_TYPES["LEFT"])),
             right=bool(self.button_states.get(BUTTON_TYPES["RIGHT"])),
+            now_ms=time.ticks_ms() if time is not None else 0,
         )
         for action in actions:
             result = self._controller.on_input_action(action)
@@ -1038,6 +1058,14 @@ class NocturNationApp(app.App):
         # what.
         ctx.font_size = 10
         ctx.move_to(0, 85).text("C: settings   F: exit")
+
+        # Version footer. Dim grey so it doesn't compete with the brand
+        # + tagline stack. Value read once at module import from
+        # metadata.json (see _APP_VERSION); tracks whatever the on-badge
+        # manifest declares.
+        ctx.rgb(0.5, 0.5, 0.5)
+        ctx.move_to(0, 105).text("v%s" % _APP_VERSION)
+        ctx.rgb(1, 1, 1)
 
     def _draw_debug_overlay(self, ctx) -> None:
         """Epic 15 bench follow-up: diagnostic readout for repeat-mode
