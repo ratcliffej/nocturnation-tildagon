@@ -43,12 +43,16 @@ Polish release ahead of EMF. Operator-visible changes:
   silently failed and the badge broadcast on ch 11 — invisible to any
   Lume because StickC's `tofu_lock.cpp` filters community-range source
   IDs on ch 11 (that's the "misconfigured Director on wrong channel"
-  guard). Director mode now releases and re-acquires the radio at
-  session start so `channel=1` is the fresh first-config call, and
-  verifies via `wlan.config("channel")` read-back that the physical
-  channel actually landed on 1 — aborting to idle with a visible
-  status message if it didn't. Fixes the "Atom can't see Tildagon
-  Director after Lume mode" bug reported 2026-07-12.
+  guard). Director mode now bounces STA_IF `active(False)/(True)` at
+  session start (same `_bounce_radio()` helper as the Lume scan) so
+  `channel=1` is the fresh first-config call, and verifies via
+  `wlan.config("channel")` read-back that the physical channel actually
+  landed on 1 — aborting to idle with a visible status message if it
+  didn't. The ESP-NOW broadcast peer table is wiped by
+  `esp.active(False)` on this MicroPython build, so the peer is
+  re-registered explicitly after the bounce (idempotent-with-OSError,
+  matching `make_sender`'s pattern). Fixes the "Atom can't see
+  Tildagon Director after Lume mode" bug reported 2026-07-12.
 - **Lume-mode auto-scan Q6 workaround.** Same badge-firmware bug hit
   the Lume auto-scan: only the first scan channel (ch 11) ever got
   set — the SCAN_ORDER's ch 1 and ch 6 stops silently failed and the
