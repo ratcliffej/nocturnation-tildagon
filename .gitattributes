@@ -1,0 +1,18 @@
+# Keep the app-store tarball small: the badge downloads the GitHub tag
+# archive and holds it in RAM (compressed + decompressed) while installing,
+# so anything not needed on-badge is excluded here via export-ignore.
+# Kept: app.py, uQR.py, nocturnation/, shows/, metadata.json, tildagon.toml
+# (read by the store crawler), LICENSE.
+.gitattributes export-ignore
+.gitignore export-ignore
+tests/ export-ignore
+tools/ export-ignore
+deploy.sh export-ignore
+pyproject.toml export-ignore
+CHANGELOG.md export-ignore
+CONTRIBUTING.md export-ignore
+PRIVACY.md export-ignore
+README.md export-ignore
+RELEASING.md export-ignore
+SECURITY.md export-ignore
+nocturnation/images/README.md export-ignore
