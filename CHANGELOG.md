@@ -4,6 +4,22 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-07-12 — v1.0.1: Repeat default flipped AUTO → OFF
+
+Single-behaviour patch on top of v1.0.0. `Settings.repeat` default is
+now `"OFF"` (was `"AUTO"`), so a fresh install / factory-reset badge
+no longer enters the audience-mesh election in Lume mode by default.
+The audience-mesh election adds airtime + battery load to every badge
+in the fleet, and the experienced case at EMF is that dedicated
+(StickC) repeaters cover the venue; opt INTO `AUTO` from Settings
+when running a coverage-marginal deployment without engineered
+repeaters. Existing settings files with `repeat: AUTO` explicitly
+saved still load `AUTO` — only fresh installs and files missing the
+key see the new default.
+
+Tests updated: `test_default_off`, `test_unknown_falls_back_to_off`,
+`test_from_dict_missing_defaults_to_off`. All 571 host tests pass.
+
 ## 2026-07-12 — v1.0.0: Calm Mode default OFF, tagline + version footer on searching screen, Conductor section-cycle gesture
 
 Polish release ahead of EMF. Operator-visible changes:

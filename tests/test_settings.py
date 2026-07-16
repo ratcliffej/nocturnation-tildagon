@@ -272,25 +272,27 @@ class TestHelpUrl:
 class TestRepeat:
     """Epic 17: dynamic repeater AUTO/OFF toggle."""
 
-    def test_default_auto(self):
-        # AUTO by default. Engineered repeaters naturally suppress
-        # audience election so AUTO is safe as a default.
-        assert Settings().repeat == "AUTO"
+    def test_default_off(self):
+        # Default flipped AUTO -> OFF on 2026-07-12 (v1.0.1): the
+        # audience-mesh election adds airtime + battery load to every
+        # badge; opt into AUTO for coverage-marginal deployments.
+        assert Settings().repeat == "OFF"
 
     def test_valid_values_kept(self):
         assert Settings(repeat="AUTO").repeat == "AUTO"
         assert Settings(repeat="OFF").repeat == "OFF"
 
-    def test_unknown_falls_back_to_auto(self):
-        assert Settings(repeat="on").repeat == "AUTO"
-        assert Settings(repeat="").repeat == "AUTO"
-        assert Settings(repeat=None).repeat == "AUTO"
-        assert Settings(repeat=42).repeat == "AUTO"
+    def test_unknown_falls_back_to_off(self):
+        assert Settings(repeat="on").repeat == "OFF"
+        assert Settings(repeat="").repeat == "OFF"
+        assert Settings(repeat=None).repeat == "OFF"
+        assert Settings(repeat=42).repeat == "OFF"
 
-    def test_from_dict_missing_defaults_to_auto(self):
+    def test_from_dict_missing_defaults_to_off(self):
         # An old settings file without the repeat key upgrades cleanly
-        # into AUTO - no operator action needed.
-        assert Settings.from_dict({}).repeat == "AUTO"
+        # into OFF - no operator action needed. Operator must opt into
+        # AUTO explicitly from Settings when they want the mesh.
+        assert Settings.from_dict({}).repeat == "OFF"
 
     def test_round_trips(self):
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:

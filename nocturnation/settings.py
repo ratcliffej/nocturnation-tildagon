@@ -68,7 +68,7 @@ class Settings:
 
     def __init__(self, calm_mode=False, group=0, channel="auto", active_show="",
                  mode="lume", help_url=DEFAULT_HELP_URL, debug_mode=False,
-                 repeat="AUTO"):
+                 repeat="OFF"):
         self.calm_mode = bool(calm_mode)
         self.group = self._coerce_group(group)
         self.channel = self._coerce_channel(channel)
@@ -84,10 +84,13 @@ class Settings:
         # Epic 17: dynamic repeater mode. "AUTO" enables the FSM in
         # Lume mode; the badge silently becomes an audience repeater
         # when no upstream peer is covering its vicinity, and steps
-        # down when a peer takes over. Default AUTO because engineered
-        # (StickC) repeaters naturally suppress audience election, so
-        # AUTO is safe as a default even in fully-covered deployments.
-        # "OFF" disables the FSM entirely (no election, no relay).
+        # down when a peer takes over. "OFF" disables the FSM entirely
+        # (no election, no relay). Default flipped AUTO -> OFF on
+        # 2026-07-12 (v1.0.1): the audience-mesh election adds airtime
+        # and battery load to every badge in the fleet, and the ex-
+        # perienced case at EMF is that dedicated (StickC) repeaters
+        # cover the venue; opt INTO AUTO from Settings when running a
+        # coverage-marginal deployment without engineered repeaters.
         self.repeat = self._coerce_repeat(repeat)
 
     @staticmethod
@@ -137,11 +140,11 @@ class Settings:
 
     @staticmethod
     def _coerce_repeat(r):
-        """Constrain to AUTO / OFF; anything else falls back to AUTO
-        (the audience-mesh default)."""
+        """Constrain to AUTO / OFF; anything else falls back to OFF
+        (the safe default - no audience-mesh election / relay)."""
         if r in _VALID_REPEAT:
             return r
-        return "AUTO"
+        return "OFF"
 
     def to_dict(self):
         return {
@@ -167,7 +170,7 @@ class Settings:
             mode=d.get("mode", "lume"),
             help_url=d.get("help_url", DEFAULT_HELP_URL),
             debug_mode=d.get("debug_mode", False),
-            repeat=d.get("repeat", "AUTO"),
+            repeat=d.get("repeat", "OFF"),
         )
 
     def save(self, path=DEFAULT_PATH):
