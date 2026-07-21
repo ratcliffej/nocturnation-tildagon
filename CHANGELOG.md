@@ -4,6 +4,34 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-07-19 — v1.0.2: Stop other badge OS apps while NocturNation runs
+
+Performance patch. On `__init__` NocturNation now stops the badge OS
+scheduler tasks that would otherwise compete for CPU + LCD + LED
+time while an app that ticks at ~50 Hz drives ESP-NOW simultaneously:
+
+- Frontboards (`TwentyTwentySix`, `TwentyTwentyFour`)
+- `HexpansionManagerApp`
+- `BoopSpinner`
+- `PatternDisplay`
+- `BackLEDManager`
+- `Launcher`
+- `NotificationService`
+- `PowerManager`
+
+Deliberately NOT killed: `espnow_service` (backs our radio) and
+`PowerEventHandler` (surfaces charge-state events we may want).
+
+`_quit` restarts every app we stopped in the same order, so a
+punter's badge is left as we found it once they back out. Imports
+are optional (Exception-guarded) so host pytest still passes and
+older / newer badge firmwares that expose a different set of apps
+degrade gracefully — a missing class is silently skipped for both
+stop and restart. Modelled on a pattern shared by an EMF-app
+author for MusicJam.
+
+All 571 host tests pass.
+
 ## 2026-07-12 — v1.0.1: Repeat default flipped AUTO → OFF
 
 Single-behaviour patch on top of v1.0.0. `Settings.repeat` default is

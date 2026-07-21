@@ -115,6 +115,80 @@ try:
     import wifi as _badge_wifi
 except ImportError:
     _badge_wifi = None
+# Tildagon system-app killer / restorer (v1.0.2). Several badge OS
+# scheduler tasks (hexpansion probe, back-LEDs, pattern display,
+# notifications, boop, launcher, power manager, frontboard event
+# pumps) steal CPU + LCD + LED time from an app that ticks at
+# ~50 Hz and drives ESP-NOW simultaneously. We stop them on
+# __init__ and restart them on _quit so the badge is left as we
+# found it once the punter backs out. Modelled on a pattern shared
+# by an EMF-app author for MusicJam.
+#
+# `espnow_service` and `PowerEventHandler` are deliberately NOT in
+# the kill list: espnow_service backs our radio, and the power
+# event handler surfaces charge-state events we may want to see.
+#
+# Each import is optional so host pytest still passes and older /
+# newer badge firmwares degrade gracefully. If a class isn't
+# present we skip stopping it (and skip restarting it on quit).
+try:
+    from system.scheduler import scheduler as _sys_scheduler
+except Exception:
+    _sys_scheduler = None
+try:
+    from frontboards.twentysix import TwentyTwentySix as _TwentyTwentySix
+except Exception:
+    _TwentyTwentySix = None
+try:
+    from frontboards.twentyfour import TwentyTwentyFour as _TwentyTwentyFour
+except Exception:
+    _TwentyTwentyFour = None
+try:
+    from system.hexpansion.app import HexpansionManagerApp as _HexpansionManagerApp
+except Exception:
+    _HexpansionManagerApp = None
+try:
+    from system.boopscreen.app import BoopSpinner as _BoopSpinner
+except Exception:
+    _BoopSpinner = None
+try:
+    from system.patterndisplay.app import PatternDisplay as _PatternDisplay
+except Exception:
+    _PatternDisplay = None
+try:
+    from system.backleds.app import BackLEDManager as _BackLEDManager
+except Exception:
+    _BackLEDManager = None
+try:
+    from system.launcher.app import Launcher as _Launcher
+except Exception:
+    _Launcher = None
+try:
+    from system.notification.app import NotificationService as _NotificationService
+except Exception:
+    _NotificationService = None
+try:
+    from system.power.app import PowerManager as _PowerManager
+except Exception:
+    _PowerManager = None
+
+# Ordered kill list. Non-None entries are stopped in this order at
+# app start and restarted in the same order at quit. Frontboards
+# first because they own the LCD backing store the other apps draw
+# onto; scheduler releases their tasks then, so the following stops
+# don't fight for the backboard.
+_KILLABLE_SYSTEM_APP_CLASSES = [
+    _TwentyTwentySix,
+    _TwentyTwentyFour,
+    _HexpansionManagerApp,
+    _BoopSpinner,
+    _PatternDisplay,
+    _BackLEDManager,
+    _Launcher,
+    _NotificationService,
+    _PowerManager,
+]
+
 # Standard library on both CPython and MicroPython; used by the dynamic
 # repeater FSM to seed CANDIDATE/COOLDOWN X-frame counters.
 import random
@@ -429,6 +503,13 @@ class NocturNationApp(app.App):
         ):
             eventbus.on(RequestForegroundPushEvent, self._on_foreground_push, self)
             eventbus.on(RequestForegroundPopEvent, self._on_foreground_pop, self)
+        # Stop the badge OS scheduler tasks that contend with our tick +
+        # radio use (hexpansion probe, back-LEDs, pattern display,
+        # notifications, launcher, power UI, frontboards). We restart
+        # them in _quit so the badge is left as we found it. See the
+        # _KILLABLE_SYSTEM_APP_CLASSES block at module scope for the
+        # kill list + rationale.
+        self._stop_other_system_apps()
 
     def _on_foreground_push(self, event) -> None:
         """Scheduler is bringing this app to the foreground.
@@ -693,14 +774,58 @@ class NocturNationApp(app.App):
         except Exception as exc:
             print("[nocturnation] wifi restore failed: %s" % exc)
 
+    def _stop_other_system_apps(self) -> None:
+        """Stop the badge OS scheduler tasks that contend with our
+        tick + radio use. Modelled on Kekb's MusicJam pattern. Every
+        stop is best-effort - if the scheduler isn't available (host
+        pytest / older badge firmware) or a specific class is missing,
+        we skip it. Records which classes were successfully stopped
+        so _restart_other_system_apps can restart the same set on
+        quit."""
+        self._stopped_system_apps = []
+        if _sys_scheduler is None:
+            return
+        for cls in _KILLABLE_SYSTEM_APP_CLASSES:
+            if cls is None:
+                continue
+            try:
+                _sys_scheduler.stop_app(cls())
+                self._stopped_system_apps.append(cls)
+            except Exception as exc:
+                print("[nocturnation] stop_app(%s) failed: %s"
+                      % (cls.__name__, exc))
+        if self._stopped_system_apps:
+            print("[nocturnation] stopped %d system app(s) to reduce "
+                  "scheduler contention" % len(self._stopped_system_apps))
+
+    def _restart_other_system_apps(self) -> None:
+        """Restart every badge OS app we stopped in
+        _stop_other_system_apps. Called from _quit so a punter's
+        badge is left as we found it. Best-effort; a start_app failure
+        is logged but doesn't block quit."""
+        if _sys_scheduler is None:
+            return
+        stopped = getattr(self, "_stopped_system_apps", None)
+        if not stopped:
+            return
+        for cls in stopped:
+            try:
+                _sys_scheduler.start_app(cls())
+            except Exception as exc:
+                print("[nocturnation] start_app(%s) failed: %s"
+                      % (cls.__name__, exc))
+        print("[nocturnation] restarted %d system app(s)" % len(stopped))
+        self._stopped_system_apps = []
+
     def _quit(self) -> None:
         """Cleanly leave the app and hand the radio back to the OS.
 
         We took the radio with wifi.stop() at startup, so on quit we
         release ESP-NOW, restore WiFi, return the LED ring to the badge's
-        idle animation, then ask the scheduler to stop us. RequestStopApp
-        cancels our background + update tasks and drops the launcher
-        cache, so a relaunch starts fresh."""
+        idle animation, restart the system apps we stopped at start-up,
+        then ask the scheduler to stop us. RequestStopApp cancels our
+        background + update tasks and drops the launcher cache, so a
+        relaunch starts fresh."""
         # Release ESP-NOW before WiFi reclaims the radio.
         try:
             if self._esp is not None:
@@ -711,6 +836,11 @@ class NocturNationApp(app.App):
         # Hand the LED ring back to the badge's pattern service.
         self._resume_patterns()
         self._dark_perimeter()
+        # Restart the badge OS scheduler tasks we stopped at __init__ so
+        # the launcher / notifications / power UI resume before we
+        # actually exit. Order matters: launcher must be back before
+        # RequestStopAppEvent so there's something to fall through to.
+        self._restart_other_system_apps()
         print("[nocturnation] quitting")
         if eventbus is not None and RequestStopAppEvent is not None:
             try:
