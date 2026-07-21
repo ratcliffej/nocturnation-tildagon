@@ -437,6 +437,14 @@ class NocturNationApp(app.App):
         self._button_tap = None
         self._dir_buttons = DirectorButtonMapper()
         self._display = CtxDisplay()
+        # Director-clock offset tracking (Phase 1 of §4.3 tick anchor).
+        # Populated by _observe_frame() when a HEARTBEAT arrives; kept
+        # None-valid across TOFU relocks. Phase 2 will consume via a
+        # director_now_ms() helper the perimeter + LCD renderers use
+        # in place of ticks_ms() for envelope timing.
+        self._director_offset_valid     = False
+        self._director_tick_offset_ms   = 0
+        self._director_offset_source_id = 0
         # Director-mode TX heartbeat pip: the send-wrapper set up in
         # _ensure_director bumps this to time.ticks_ms() on every
         # successful esp.send(); _draw_director paints a small pip in
@@ -2431,6 +2439,35 @@ class NocturNationApp(app.App):
             return
 
         now_ms = time.ticks_ms()
+
+        # Director-clock offset tracking (Phase 1 of §4.3 tick anchor).
+        # Each unique HEARTBEAT carries the Director's millisecond tick;
+        # maintain a smoothed offset between Director-time and our
+        # local ticks_ms(). Reserved for Phase 2 envelope-math rewire
+        # (perimeter + LCD renderers switch their ASR clocks from
+        # ticks_ms() to director_now_ms() = local + offset), so
+        # envelopes stay aligned across the fleet regardless of per-
+        # badge millis() drift + relay-path arrival jitter. TOFU
+        # relock (source_id change) invalidates the offset - the new
+        # Director's boot-relative clock has no relation to the old's.
+        if (mt == MessageType.HEARTBEAT
+                and frame.tick is not None
+                and frame.tick != 0):
+            if (self._director_offset_valid
+                    and frame.source_id != self._director_offset_source_id):
+                self._director_offset_valid = False
+            raw_offset = ticks_diff(frame.tick, now_ms)
+            if not self._director_offset_valid:
+                self._director_tick_offset_ms = raw_offset
+                self._director_offset_source_id = frame.source_id
+                self._director_offset_valid = True
+            else:
+                # 90/10 smoothing. Handles typical ~1 ms/s crystal
+                # drift smoothly and rejects one-off outliers (relay-
+                # path arrivals with abnormal latency).
+                self._director_tick_offset_ms = (
+                    (self._director_tick_offset_ms * 9 + raw_offset) // 10
+                )
 
         # HEARTBEAT and unknown / reserved-id frames just bump the frame
         # counter without further per-surface dispatch. LIGHT_PULSE plus
