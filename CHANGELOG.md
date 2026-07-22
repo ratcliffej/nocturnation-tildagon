@@ -4,46 +4,6 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
-## 2026-07-22 — v1.0.4: Wire spec v0x03 pulse-sync via send_tick
-
-Implements the design in nocturnation-docs
-`wire-spec-v0x03-pulse-sync-design.md`. Ships together with the paired
-StickC PR — **lockstep fleet upgrade required** (protocol_version
-0x02 → 0x03; v0x02 receivers reject v0x03 frames and vice versa).
-
-Wire delta:
-- `PROTOCOL_VERSION` `0x02 → 0x03`
-- `LIGHT_PULSE` payload 9 → 13 bytes (+4 B `send_tick` u32 LE)
-- `LIGHT_WASH` payload 16 → 20 bytes (+4 B)
-- `LIGHT_WASH_PULSE` payload 9 → 13 bytes (+4 B)
-
-Director side (`render_dispatch.py`):
-- `dispatch()`, `dispatch_wash()`, `dispatch_wash_pulse()` each stamp
-  `send_tick=now_ms` on the encoder call.
-
-Lume side (`app.py::_observe_frame` + `_receive_loop`):
-- New `_pending_sync_pulses` + `_pending_sync_wash_pulses` lists.
-- Enqueue on receive: `local_fire = send_tick + NOCT_FLEET_RENDER_DELAY_MS
-  - director_tick_offset_ms`. All badges compute the same fire time
-  from the same `send_tick`, so they render at a common wall-clock
-  instant regardless of hop-path arrival variance.
-- `_drain_sync_queues()` fires expired entries every 5 ms poll_ms tick.
-  Cross-Lume alignment bounded by drain cadence (~5 ms) + offset-smoothing
-  residual (~1 ms).
-- `NOCT_FLEET_RENDER_DELAY_MS = 30`. 10 % of a 200 BPM beat; imperceptible
-  in DnB context.
-
-Fallback conditions (all fire immediately, no queue):
-1. `send_tick == 0` (legacy sender)
-2. `director_offset_valid == False` (no HB heard yet)
-3. Arrival past fire deadline
-4. Queue full
-
-Late-arrival fallback logs every 8th occurrence: `[SYNC LATE] ...`.
-
-Tests: existing byte-vector tests + wire-format tests updated for
-v0x03 layout. All 571 host tests pass.
-
 ## 2026-07-19 — v1.0.3: Heartbeat unconditional 1 Hz + Lume-side tick offset tracking (Phase 1)
 
 Phase 1 of the §4.3 tick anchor guarantee. Two coordinated changes,

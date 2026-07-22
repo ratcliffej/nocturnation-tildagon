@@ -25,7 +25,6 @@ from nocturnation.protocol.constants import (
 
 class TestEncodeByteLayout:
     def test_header_and_payload_bytes(self):
-        # v0x03: payload_len 13 (9 legacy fields + 4-byte send_tick LE).
         buf = encode_light_pulse(
             source_id=0x12,
             sequence_number=0x34,
@@ -36,7 +35,6 @@ class TestEncodeByteLayout:
             sustain=Time.T_96_MS,
             release=Time.T_480_MS,
             chance=Chance.CHANCE_100,
-            send_tick=0xDEADBEEF,
         )
         assert buf == bytes((
             MAGIC_0, MAGIC_1, PROTOCOL_VERSION,
@@ -44,19 +42,17 @@ class TestEncodeByteLayout:
             0x34,            # sequence
             0x00,            # hop_count default
             MessageType.LIGHT_PULSE,
-            0x0D,            # payload_len = 13 (was 9 in v0x02)
+            0x09,            # payload_len
             0x01,            # target_class (Light)
             0x01,            # target_group
             255, 128, 0,     # rgb
             Time.T_0_MS, Time.T_96_MS, Time.T_480_MS,
             Chance.CHANCE_100,
-            0xEF, 0xBE, 0xAD, 0xDE,   # send_tick LE (v0x03)
         ))
 
-    def test_total_length_is_21(self):
-        # v0x03: header(8) + payload(13) = 21 bytes. Was 17 in v0x02.
+    def test_total_length_is_17(self):
         buf = encode_light_pulse(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-        assert len(buf) == HEADER_SIZE + 13 == 21
+        assert len(buf) == HEADER_SIZE + 9 == 17
 
     def test_hop_count_override(self):
         buf = encode_light_pulse(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, hop_count=3)
@@ -70,7 +66,7 @@ class TestEncodeByteLayout:
             r=0x1FF, g=0x200, b=0x2FF,
             attack=0x108, sustain=0x109, release=0x10A, chance=0x10B,
         )
-        assert len(buf) == 21   # v0x03
+        assert len(buf) == 17
         assert buf[3] == 0xFF   # source_id masked
         assert buf[4] == 0x00   # sequence masked (0x100 & 0xFF)
         assert buf[10] == 0xFF  # r masked
@@ -95,7 +91,7 @@ class TestEncodeParseRoundTrip:
         assert f.sequence_number == 7
         assert f.hop_count == 0
         assert f.message_type == MessageType.LIGHT_PULSE
-        assert f.payload_len == 13   # v0x03: was 9
+        assert f.payload_len == 9
         assert f.target_class == DeviceClass.MULTI_LED_SCREEN
         assert f.target_group == 2
         assert (f.r, f.g, f.b) == (10, 20, 30)
