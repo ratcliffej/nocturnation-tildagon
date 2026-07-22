@@ -193,6 +193,33 @@ _KILLABLE_SYSTEM_APP_CLASSES = [
 # repeater FSM to seed CANDIDATE/COOLDOWN X-frame counters.
 import random
 
+# ESP-NOW IRQ-context RX timestamping (Phase 1 fix experiment #2, PR #31).
+# MicroPython espnow.irq(handler) fires shortly after a frame arrives at
+# the radio - much earlier than our asyncio receive-loop poll can drain
+# it, because the poll cadence baseline is ~85 ms (badge OS / LCD /
+# other coroutines eat that time). Stamping the arrival time in the IRQ
+# handler and using it as envelope start_ms decouples the visible pulse
+# instant from the async-scheduler stalls. Two badges get matching
+# start_ms values (radio propagation < 1 ms) even when their poll loops
+# hit the arrival at different phases.
+#
+# IRQ context is restricted on MicroPython: no allocation, no
+# exceptions, tight code. time.ticks_ms() returns a smallint that
+# doesn't allocate on the heap, and writing to a pre-existing global
+# int is safe. If two frames arrive between two polls, we only keep
+# the LATEST arrival stamp (fine for Test Pulse at 2 Hz; may lose
+# accuracy in future high-rate scenarios but sparkles at 10 Hz still
+# beat the current 85 ms baseline).
+_espnow_last_arrival_ms = 0
+_espnow_irq_installed = False
+
+
+def _espnow_irq_handler(_esp):
+    # Runs in scheduled-callback context. time.ticks_ms() is
+    # allocation-free for smallint values and is safe here.
+    global _espnow_last_arrival_ms
+    _espnow_last_arrival_ms = time.ticks_ms()
+
 # Relative imports against the internal nocturnation/ package: the
 # Tildagon launcher loads this module as apps.<dir>.app and does not add
 # the app's own directory to sys.path, so a bare absolute `from
@@ -1632,6 +1659,18 @@ class NocturNationApp(app.App):
             if self._esp is None:
                 self._esp = espnow.ESPNow()
             self._esp.active(True)
+            # Install IRQ-context arrival stamper. Some MicroPython
+            # builds may not expose irq(); we degrade gracefully to
+            # the poll-time stamp used before PR #31.
+            global _espnow_irq_installed
+            if not _espnow_irq_installed:
+                try:
+                    self._esp.irq(_espnow_irq_handler)
+                    _espnow_irq_installed = True
+                    print("[nocturnation] espnow.irq installed for RX time-stamping")
+                except Exception as exc:
+                    print("[nocturnation] espnow.irq unavailable, "
+                          "using poll-time stamp: %s" % exc)
         except Exception as exc:
             print("[nocturnation] radio acquire failed: %s" % exc)
             self._wlan = None
@@ -2209,7 +2248,7 @@ class NocturNationApp(app.App):
             self._dbg_radio("scan-set-%d" % ch)
             elapsed = 0
             while elapsed < listen_ms:
-                buf = self._try_recv()
+                buf, arrival_ms = self._try_recv()
                 if buf is not None:
                     frame = parse_admittable(buf)
                     # TOFU + cross-range gate (Epic 5.5 B6). A frame
@@ -2229,7 +2268,8 @@ class NocturNationApp(app.App):
                         is_dup = self._dedup.seen(frame.source_id,
                                                   frame.sequence_number)
                         self._observe_frame(frame, is_duplicate=is_dup,
-                                            raw_buf=buf)
+                                            raw_buf=buf,
+                                            arrival_ms=arrival_ms)
                         print("[nocturnation] locking channel %d "
                               "(src_id=0x%02X)" % (ch, frame.source_id))
                         self._scanner.lock()
@@ -2264,7 +2304,7 @@ class NocturNationApp(app.App):
                     print("[BENCH-GAP] ticks=%d gap_ms=%d"
                           % (now_poll, gap))
                 last_poll_ms = now_poll
-            buf = self._try_recv()
+            buf, arrival_ms = self._try_recv()
             if buf is not None:
                 frame = parse_admittable(buf)
                 # TOFU + cross-range gate (Epic 5.5 B6). Drops frames
@@ -2281,7 +2321,8 @@ class NocturNationApp(app.App):
                     is_dup = self._dedup.seen(frame.source_id,
                                               frame.sequence_number)
                     self._observe_frame(frame, is_duplicate=is_dup,
-                                        raw_buf=buf)
+                                        raw_buf=buf,
+                                        arrival_ms=arrival_ms)
                     if frame.message_type == MessageType.LIGHT_PULSE:
                         print(
                             "[nocturnation] LIGHT r=%d g=%d b=%d cls=%d grp=%d"
@@ -2328,18 +2369,33 @@ class NocturNationApp(app.App):
             await asyncio.sleep_ms(poll_ms)
 
     def _try_recv(self):
-        """Non-blocking ESP-NOW recv. Returns the message bytes or None."""
+        """Non-blocking ESP-NOW recv. Returns (msg_bytes, arrival_ms) or
+        (None, None).
+
+        arrival_ms is stamped in _espnow_irq_handler when the frame first
+        landed at the radio (see module-level docstring). It's much
+        closer to physical arrival time than time.ticks_ms() called
+        here in poll context, because the poll cadence is 80-90 ms per
+        iteration (badge OS / LCD / other coroutines eat the sleep).
+        When espnow.irq() isn't available on this MicroPython build we
+        fall back to the poll-time stamp - same behaviour as before
+        PR #31, just no sync fix.
+        """
         if self._esp is None:
-            return None
+            return None, None
         # Tildagon espnow.recv(timeout_ms) returns (mac, msg). A zero
         # timeout returns immediately if no frame is pending.
         try:
             host, msg = self._esp.recv(0)
         except OSError:
-            return None
+            return None, None
         if msg is None:
-            return None
-        return bytes(msg)
+            return None, None
+        if _espnow_irq_installed:
+            arrival = _espnow_last_arrival_ms
+        else:
+            arrival = time.ticks_ms() if time is not None else 0
+        return bytes(msg), arrival
 
     # -- Signal-loss fallback wash ----------------------------------
 
@@ -2401,7 +2457,8 @@ class NocturNationApp(app.App):
             self._fallback_faded = True
             self._emit_fallback_wash_fade(now_ms)
 
-    def _observe_frame(self, frame, is_duplicate=False, raw_buf=None) -> None:
+    def _observe_frame(self, frame, is_duplicate=False, raw_buf=None,
+                       arrival_ms=None) -> None:
         # Epic 15 bench follow-up: diagnostic state updates on EVERY
         # admitted frame, including duplicates. This is what lets the
         # debug overlay show Hop:1 when a relayed frame arrives even
@@ -2482,7 +2539,16 @@ class NocturNationApp(app.App):
         if is_duplicate:
             return
 
-        now_ms = time.ticks_ms()
+        # Envelope start_ms comes from arrival_ms when the IRQ handler
+        # stamped it (PR #31 sync fix). Falls back to time.ticks_ms()
+        # here if the IRQ path isn't wired (older firmware) or the
+        # caller didn't pass one. Using the IRQ stamp decouples the
+        # visible pulse instant from the async-scheduler stalls that
+        # otherwise slip envelope start by 80-100 ms between two badges.
+        if arrival_ms is not None and _espnow_irq_installed:
+            now_ms = arrival_ms
+        else:
+            now_ms = time.ticks_ms()
 
         # HEARTBEAT and unknown / reserved-id frames just bump the frame
         # counter without further per-surface dispatch. LIGHT_PULSE plus
