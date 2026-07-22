@@ -1667,6 +1667,18 @@ class NocturNationApp(app.App):
                 print("[nocturnation] wlan.config(pm=PM_NONE) failed: %s" % exc)
             if self._esp is None:
                 self._esp = espnow.ESPNow()
+            # Bump the receive buffer up from the default (~526 bytes,
+            # ~13 messages) before activation. High-rate effects (Rainbow
+            # at 10 Hz + 2x StickC redundant TX = 20 msg/s; per-beat
+            # sparkles at 8+ Hz likewise) can outrun our ~12 Hz poll
+            # baseline. When the queue fills, some MicroPython builds
+            # stop delivering entirely - symptom is a burst of correct
+            # renders followed by a hard cut. 8 KB gives ~200 messages
+            # of headroom, comfortable for any traffic pattern we'd send.
+            try:
+                self._esp.config(rxbuf=8192)
+            except Exception as exc:
+                print("[nocturnation] espnow.config(rxbuf) failed: %s" % exc)
             self._esp.active(True)
             # Install IRQ-context arrival stamper. Some MicroPython
             # builds may not expose irq(); we degrade gracefully to
@@ -2313,8 +2325,18 @@ class NocturNationApp(app.App):
                     print("[BENCH-GAP] ticks=%d gap_ms=%d"
                           % (now_poll, gap))
                 last_poll_ms = now_poll
-            buf, arrival_ms = self._try_recv()
-            if buf is not None:
+            # Drain up to N frames per iteration (was: 1). At the ~85 ms
+            # poll baseline we were only reading one message per poll,
+            # so any pattern above ~12 msg/s (e.g. Rainbow at 10 Hz *
+            # 2x redundant TX = 20 msg/s) would back the espnow rxbuf
+            # up and eventually stop delivering. Draining until empty
+            # (capped at 16 per iteration so a broken sender can't
+            # starve the render/asyncio path) keeps the queue flowing.
+            drain_limit = 16
+            for _ in range(drain_limit):
+                buf, arrival_ms = self._try_recv()
+                if buf is None:
+                    break
                 frame = parse_admittable(buf)
                 # TOFU + cross-range gate (Epic 5.5 B6). Drops frames
                 # from non-locked source_ids and community-range ids
