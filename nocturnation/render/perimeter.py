@@ -49,6 +49,14 @@ LED_COUNT = LED_MAX_INDEX - LED_MIN_INDEX + 1
 CALM_MIN_INTERVAL_MS = 500   # 2 Hz - Harding-safe for audience badges
 FULL_MIN_INTERVAL_MS = 60    # ~16 Hz - covers per-beat sparkles to 200+ BPM
 
+# Bench-time dispatch drop logging (fleet-sync-design.md Phase 1
+# extended measurement). When True, dispatch() emits a [BENCH-DROP] line
+# every time a LIGHT_PULSE is filtered by rate limiter / black gate /
+# wash gate, so we can distinguish "frame arrived but dispatch chose
+# not to render" from "frame never arrived". Off in production;
+# app.py's _BENCH_HOP0 flag flips it alongside the RX/PT logging.
+_BENCH_DISPATCH_LOG = False
+
 # Peak brightness multiplier applied per Calm Mode.
 CALM_BRIGHTNESS_CAP = 0.5
 FULL_BRIGHTNESS_CAP = 1.0
@@ -296,15 +304,27 @@ class PerimeterRenderer:
         # Frequency cap. Primers and zero-duration envelopes don't count
         # against the cap so they don't consume the budget that the
         # subsequent main fire needs.
-        if ticks_diff(now_ms, self._last_dispatch_ms) < self._min_interval_ms:
+        gap = ticks_diff(now_ms, self._last_dispatch_ms)
+        if gap < self._min_interval_ms:
+            if _BENCH_DISPATCH_LOG:
+                # Grepped by bench_hop0_paint_delta.py --extended.
+                print("[BENCH-DROP] src=%d seq=%d ticks=%d reason=rate_limit gap=%d min=%d"
+                      % (frame.source_id, frame.sequence_number, now_ms,
+                         gap, self._min_interval_ms))
             return 0
 
         if frame.r == 0 and frame.g == 0 and frame.b == 0:
+            if _BENCH_DISPATCH_LOG:
+                print("[BENCH-DROP] src=%d seq=%d ticks=%d reason=black"
+                      % (frame.source_id, frame.sequence_number, now_ms))
             return 0
 
         # Wash + pulse_response gate: a non-overlay wash drops PULSE.
         if self._wash is not None and self._wash["phase"] in (_WASH_ATTACK, _WASH_HOLD):
             if self._wash["pulse_response"] == 0:
+                if _BENCH_DISPATCH_LOG:
+                    print("[BENCH-DROP] src=%d seq=%d ticks=%d reason=wash_gated"
+                          % (frame.source_id, frame.sequence_number, now_ms))
                 return 0
 
         attack_ms = TIME_MS[frame.attack]

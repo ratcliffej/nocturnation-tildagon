@@ -283,13 +283,27 @@ _CHANNEL_CYCLE = ("auto", "1", "11")
 _DEBUG = False
 
 # Bench instrumentation for Phase 1 hop-0 paint-delta measurement (see
-# Docs/fleet-sync-design.md §4.1). Emits one line per admitted LIGHT_PULSE
-# at receive time and one line per _render_perimeter tick that carries a
-# freshly-dispatched envelope. Parse both Tildagons' serial captures with
-# tools/bench_hop0_paint_delta.py to compute intra-device paint delay and
-# inter-device paint delta. Off by default; flip to True on both devices
-# for the measurement window, then flip back off.
+# Docs/fleet-sync-design.md §4.1). Emits per-frame log lines:
+#   [BENCH-RX]   -- LIGHT_PULSE admitted, ready to dispatch
+#   [BENCH-PT]   -- first _render_perimeter tick that painted this frame
+#   [BENCH-DROP] -- perimeter dispatch dropped the frame (rate_limit /
+#                   black / wash_gated); fired from perimeter.dispatch
+#                   after this flag is mirrored onto perimeter._BENCH_DISPATCH_LOG
+#                   in the module-load section below.
+#   [BENCH-GAP]  -- receive-loop poll took >=25 ms since the previous poll
+#                   (should be ~5 ms + jitter); catches asyncio stalls
+#                   and MicroPython GC pauses that can slip envelope
+#                   start times by hundreds of ms between two badges.
+# Parse both Tildagons' serial captures with
+# tools/bench_hop0_paint_delta.py (add --extended for DROP / GAP report).
+# Off by default; flip to True on both devices for the measurement
+# window, then flip back off.
 _BENCH_HOP0 = True
+
+# Mirror the flag onto the perimeter module so its drop-log gate matches.
+# Imported after PerimeterRenderer above so the module object exists.
+from .nocturnation.render import perimeter as _bench_perimeter_mod
+_bench_perimeter_mod._BENCH_DISPATCH_LOG = _BENCH_HOP0
 
 # Director mode transmits on the hobby channel only (Epic 5.5: the
 # Tildagon must not broadcast on the channel-11 Performance band).
@@ -2237,9 +2251,19 @@ class NocturNationApp(app.App):
         render_interval_ms = 50  # ~20 Hz perimeter tick
         last_render_ms = 0 if time is None else time.ticks_ms()
         last_dbg_ms = last_render_ms
-        # Return when the mode leaves "lume" so background_task can
-        # switch to the Director session.
+        # Bench: watch for asyncio-scheduler stalls (MicroPython GC pause,
+        # radio state churn, etc.) that could slip envelope start times
+        # between two badges by tens or hundreds of ms. Poll cadence is
+        # 5 ms; anything >= 25 ms is a stall worth noting.
+        last_poll_ms = last_render_ms
         while self._mode == "lume":
+            if _BENCH_HOP0 and time is not None:
+                now_poll = time.ticks_ms()
+                gap = ticks_diff(now_poll, last_poll_ms)
+                if gap >= 25:
+                    print("[BENCH-GAP] ticks=%d gap_ms=%d"
+                          % (now_poll, gap))
+                last_poll_ms = now_poll
             buf = self._try_recv()
             if buf is not None:
                 frame = parse_admittable(buf)
