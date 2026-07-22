@@ -401,6 +401,15 @@ class NocturNationApp(app.App):
         # paint delay for that frame on this device.
         self._bench_dispatched_key = None
         self._bench_dispatched_ms = 0
+        # Render-tick fleet alignment. Every admitted frame stamps
+        # arrival_ms here (from peers_table where possible); the receive
+        # loop's perimeter tick anchor snaps to it so subsequent renders
+        # fire relative to a shared physical event (last frame arrival)
+        # rather than each device's independent "when did we last
+        # paint" phase. LIGHT_PULSE handles busy periods; unconditional
+        # 1 Hz HEARTBEAT keeps everyone aligned during quiet stretches
+        # so drift doesn't accumulate between shows.
+        self._render_snap_ms = None
         # Epic 15 bench follow-up: diagnostic capture for the debug-overlay
         # LCD view. _last_frame_ms is the timestamp of the most recent
         # accepted frame of any type (drives the "Last: N.Ns" gap readout
@@ -2365,7 +2374,17 @@ class NocturNationApp(app.App):
                 now = time.ticks_ms()
                 if ticks_diff(now, last_render_ms) >= render_interval_ms:
                     self._render_perimeter()
-                    last_render_ms = now
+                    # Fleet render-tick anchor. If an arrival stamped
+                    # _render_snap_ms during this iteration, anchor
+                    # future ticks to that shared physical instant
+                    # rather than to now (which drifts per device).
+                    # Falls back to now when nothing arrived, so ticks
+                    # keep firing at 20 Hz on pure-local schedule.
+                    if self._render_snap_ms is not None:
+                        last_render_ms = self._render_snap_ms
+                        self._render_snap_ms = None
+                    else:
+                        last_render_ms = now
             await asyncio.sleep_ms(poll_ms)
 
     def _try_recv(self):
@@ -2490,6 +2509,18 @@ class NocturNationApp(app.App):
         # output surfaces - that's still the dedup contract.
         self._frame_count += 1
         self._last_frame = frame
+        # Render-tick fleet alignment. Every admitted frame (including
+        # duplicates, LIGHT_WASH, and HEARTBEAT) is a shared physical
+        # event both this device and every other Lume saw at the same
+        # wall-clock instant (within ~1 ms via peers_table). Snapping
+        # the perimeter tick anchor to arrival_ms keeps subsequent
+        # renders on a shared reference across the fleet - so envelope
+        # progression frames land at approximately the same moments on
+        # every Tildagon, not each device's independent "local
+        # ticks_ms() paint phase". HEARTBEAT arrivals cover quiet
+        # stretches when no LIGHT_PULSE would otherwise re-anchor.
+        if arrival_ms is not None:
+            self._render_snap_ms = arrival_ms
         # Epic 17 B1: notify the repeater FSM (if wired). Fires for
         # BOTH first-seen and duplicate admitted frames - the FSM needs
         # duplicates because a peer's relay of (src, seq) arriving after
