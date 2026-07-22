@@ -282,6 +282,15 @@ _CHANNEL_CYCLE = ("auto", "1", "11")
 # work; flip this back on to re-enable the logging.
 _DEBUG = False
 
+# Bench instrumentation for Phase 1 hop-0 paint-delta measurement (see
+# Docs/fleet-sync-design.md §4.1). Emits one line per admitted LIGHT_PULSE
+# at receive time and one line per _render_perimeter tick that carries a
+# freshly-dispatched envelope. Parse both Tildagons' serial captures with
+# tools/bench_hop0_paint_delta.py to compute intra-device paint delay and
+# inter-device paint delta. Off by default; flip to True on both devices
+# for the measurement window, then flip back off.
+_BENCH_HOP0 = True
+
 # Director mode transmits on the hobby channel only (Epic 5.5: the
 # Tildagon must not broadcast on the channel-11 Performance band).
 # Channel 11 is reserved for commercial / show Directors with random-
@@ -343,6 +352,14 @@ class NocturNationApp(app.App):
         self._dedup = DedupRing()
         self._frame_count = 0
         self._last_frame = None
+        # Phase 1 hop-0 paint-delta bench (_BENCH_HOP0). Keys are
+        # (source_id, sequence_number). "Dispatched" is set when a
+        # LIGHT_PULSE is handed to the perimeter renderer; "painted" is
+        # cleared to match on the first _render_perimeter call after
+        # dispatch. The delta between those two ticks_ms values is the
+        # paint delay for that frame on this device.
+        self._bench_dispatched_key = None
+        self._bench_dispatched_ms = 0
         # Epic 15 bench follow-up: diagnostic capture for the debug-overlay
         # LCD view. _last_frame_ms is the timestamp of the most recent
         # accepted frame of any type (drives the "Last: N.Ns" gap readout
@@ -1073,6 +1090,17 @@ class NocturNationApp(app.App):
         except Exception as exc:
             # Don't let a hardware glitch take down the app's update loop.
             print("[nocturnation] perimeter render failed: %s" % exc)
+        # Phase 1 hop-0 paint-delta bench (_BENCH_HOP0). Emit a PT line
+        # the FIRST render tick after each new LIGHT_PULSE dispatch;
+        # clear the key so subsequent ticks of the same envelope don't
+        # re-log. Delta between the RX ticks and PT ticks (same device
+        # clock) is that frame's paint delay.
+        if _BENCH_HOP0 and self._bench_dispatched_key is not None:
+            key = self._bench_dispatched_key
+            print("[BENCH-PT] src=%d seq=%d ticks=%d delay_ms=%d"
+                  % (key[0], key[1], now_ms,
+                     ticks_diff(now_ms, self._bench_dispatched_ms)))
+            self._bench_dispatched_key = None
 
     def draw(self, ctx) -> None:
         # Settings menu owns the entire screen when it is open.
@@ -2479,6 +2507,16 @@ class NocturNationApp(app.App):
         cls = frame.target_class
 
         if mt == MessageType.LIGHT_PULSE:
+            if _BENCH_HOP0 and cls in PERIMETER_CLASSES:
+                # Log receive-and-dispatch instant; the matching PT
+                # line arrives on the next _render_perimeter tick.
+                # Format is grepped by tools/bench_hop0_paint_delta.py.
+                print("[BENCH-RX] src=%d seq=%d hop=%d ticks=%d"
+                      % (frame.source_id, frame.sequence_number,
+                         frame.hop_count, now_ms))
+                self._bench_dispatched_key = (frame.source_id,
+                                               frame.sequence_number)
+                self._bench_dispatched_ms = now_ms
             if cls in PERIMETER_CLASSES:
                 self._renderer.dispatch(frame, now_ms)
             if cls in LCD_CLASSES:
