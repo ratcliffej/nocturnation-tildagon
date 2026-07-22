@@ -196,6 +196,7 @@ class RenderDispatcher:
             ev.sustain,
             ev.release,
             ev.chance,
+            send_tick=now_ms,   # v0x03: cross-Lume sync anchor
         )
         self._advance_sequence()
 
@@ -269,6 +270,7 @@ class RenderDispatcher:
             ev.cycle_ms,
             ev.ttl_seconds,
             ev.pulse_response,
+            send_tick=now_ms,   # v0x03: only meaningful for attack=0 cues, always stamped
         )
         self._advance_sequence()
 
@@ -382,6 +384,7 @@ class RenderDispatcher:
             ev.sustain,
             ev.release,
             ev.chance,
+            send_tick=now_ms,   # v0x03: cross-Lume sync anchor
         )
         self._advance_sequence()
 

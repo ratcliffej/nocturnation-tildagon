@@ -13,7 +13,7 @@ simplicity thesis), 0x09 is now TEXT_DISPLAY. The display family
 MAGIC_0 = 0x4E
 MAGIC_1 = 0x4E
 
-PROTOCOL_VERSION = 0x02
+PROTOCOL_VERSION = 0x03   # bumped from 0x02 for send_tick on Light* payloads (see wire-spec-v0x03-pulse-sync-design.md)
 
 HEADER_SIZE = 8
 
@@ -33,12 +33,16 @@ class MessageType:
 
 # Fixed-size payloads only. Variable-length payloads (TEXT_DISPLAY,
 # BITMAP_PLANE) are validated by their own range checks during parse.
+#
+# v0x02 -> v0x03: LIGHT_PULSE, LIGHT_WASH, LIGHT_WASH_PULSE each gain
+# a 4-byte little-endian send_tick (Director's now_ms() at emit) for
+# cross-Lume render sync. See wire-spec-v0x03-pulse-sync-design.md.
 PAYLOAD_LENGTHS = {
     MessageType.HEARTBEAT       : 9,
-    MessageType.LIGHT_PULSE     : 9,
-    MessageType.LIGHT_WASH      : 16,
+    MessageType.LIGHT_PULSE     : 13,   # 9 + 4 (send_tick)
+    MessageType.LIGHT_WASH      : 20,   # 16 + 4 (send_tick)
     MessageType.LIGHT_WASH_END  : 3,
-    MessageType.LIGHT_WASH_PULSE: 9,
+    MessageType.LIGHT_WASH_PULSE: 13,   # 9 + 4 (send_tick)
     MessageType.BITMAP_HEADER   : 37,
     MessageType.CLEAR_SCREEN    : 3,
 }

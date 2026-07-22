@@ -63,6 +63,11 @@ class Frame:
         "sustain",
         "release",
         "chance",
+        # v0x03: Director's now_ms() at emit. Present on LIGHT_PULSE,
+        # LIGHT_WASH, and LIGHT_WASH_PULSE. Lumes schedule the render
+        # for (send_tick + kFleetRenderDelayMs) in director-time so
+        # all badges converge on a common wall-clock fire instant.
+        "send_tick",
         # HEARTBEAT-specific (spec v0.29 §3.3.1)
         "tick",
         "days_since_2026",
@@ -102,6 +107,7 @@ class Frame:
         self.sustain = None
         self.release = None
         self.chance = None
+        self.send_tick = None   # v0x03
         self.tick = None
         self.days_since_2026 = None
         self.centiseconds_today = None
@@ -183,6 +189,7 @@ def parse_frame(buf):
         f.sustain = p[6]
         f.release = p[7]
         f.chance = p[8]
+        f.send_tick = p[9] | (p[10] << 8) | (p[11] << 16) | (p[12] << 24)   # v0x03
     elif f.message_type == MessageType.HEARTBEAT:
         # Spec v0.29 §3.3.1: tick (u32 LE) + days_since_2026 (u16 LE)
         # + centiseconds_today (u24 LE). All little-endian.
@@ -191,7 +198,8 @@ def parse_frame(buf):
         f.days_since_2026 = p[4] | (p[5] << 8)
         f.centiseconds_today = p[6] | (p[7] << 8) | (p[8] << 16)
     elif f.message_type == MessageType.LIGHT_WASH:
-        # Epic 6C Phase D 16-byte layout. See protocol manual §3.3.3.
+        # v0x03 20-byte layout (v0x02 was 16 bytes; +4 for send_tick).
+        # See protocol manual §3.3.3 and wire-spec-v0x03-pulse-sync-design.md.
         p = f.payload
         f.target_class   = p[0]
         f.target_group   = p[1]
@@ -203,6 +211,7 @@ def parse_frame(buf):
         f.cycle_ms       = p[11] | (p[12] << 8)
         f.ttl_seconds    = p[13] | (p[14] << 8)
         f.pulse_response = p[15]
+        f.send_tick      = p[16] | (p[17] << 8) | (p[18] << 16) | (p[19] << 24)   # v0x03
     elif f.message_type == MessageType.LIGHT_WASH_END:
         # Epic 6C Phase D 3-byte layout. See protocol manual §3.3.4.
         p = f.payload
@@ -222,6 +231,7 @@ def parse_frame(buf):
         f.sustain = p[6]
         f.release = p[7]
         f.chance  = p[8]
+        f.send_tick = p[9] | (p[10] << 8) | (p[11] << 16) | (p[12] << 24)   # v0x03
     elif f.message_type == MessageType.TEXT_DISPLAY:
         # Epic 13 variable-length layout. See protocol manual §3.3.6.
         #
@@ -300,17 +310,23 @@ def encode_light_pulse(
     release,
     chance,
     hop_count=0,
+    send_tick=0,   # v0x03: director's now_ms() at emit; u32 LE
 ):
     """Build the wire bytes for a LIGHT_PULSE frame.
 
     Inverse of the LIGHT_PULSE branch in ``parse_frame``: 8-byte
-    header + 9-byte payload = 17 bytes. Every field is masked to a
-    byte so an out-of-range argument can't corrupt the frame length.
+    header + 13-byte payload = 21 bytes (v0x03; was 17 in v0x02).
+    Every field is masked to a byte so an out-of-range argument
+    can't corrupt the frame length.
 
     The Director originates frames at ``hop_count`` 0; relays increment
     it. ``sequence_number`` wraps at 256 and the caller owns the
-    counter (see RenderDispatcher).
+    counter (see RenderDispatcher). ``send_tick`` is the Director's
+    ``time.ticks_ms()`` at emit; Lumes schedule their render at
+    ``send_tick + kFleetRenderDelayMs`` in director-time for cross-
+    fleet unison. See wire-spec-v0x03-pulse-sync-design.md.
     """
+    send_tick &= 0xFFFFFFFF
     return bytes((
         MAGIC_0,
         MAGIC_1,
@@ -329,6 +345,10 @@ def encode_light_pulse(
         sustain & 0xFF,
         release & 0xFF,
         chance & 0xFF,
+        send_tick & 0xFF,
+        (send_tick >> 8) & 0xFF,
+        (send_tick >> 16) & 0xFF,
+        (send_tick >> 24) & 0xFF,
     ))
 
 
@@ -345,6 +365,7 @@ def make_light_pulse_frame(
     source_id=0,
     sequence_number=0,
     hop_count=0,
+    send_tick=0,   # v0x03
 ):
     """Construct a LIGHT_PULSE Frame directly, for local loopback.
 
@@ -354,7 +375,8 @@ def make_light_pulse_frame(
     this builds the Frame the renderers consume directly. The header
     fields default to zero because the loopback path doesn't inspect
     them - only the LIGHT_PULSE payload attributes matter to the
-    perimeter / LCD renderers.
+    perimeter / LCD renderers. ``send_tick`` is v0x03 field for
+    cross-Lume sync; loopback path can ignore or use it.
     """
     f = Frame()
     f.protocol_version = PROTOCOL_VERSION
@@ -373,6 +395,7 @@ def make_light_pulse_frame(
     f.sustain = sustain
     f.release = release
     f.chance = chance
+    f.send_tick = send_tick
     return f
 
 
@@ -395,15 +418,16 @@ def encode_light_wash(
     ttl_seconds,     # u16 LE; 0 = infinite
     pulse_response,  # 0 = drop PULSE while washing; 1 = additive overlay
     hop_count=0,
+    send_tick=0,     # v0x03: director's now_ms() at emit; u32 LE
 ):
     """Build the wire bytes for a LIGHT_WASH frame (Epic 6C Phase D).
 
-    16-byte payload; see protocol manual §3.3.3. Tildagon Director mode
-    is pulse-only in v1 - this encoder exists for round-trip tests and
-    future cross-platform parity, not for routine Director-side use.
+    20-byte payload (v0x03; was 16 in v0x02, gained send_tick).
+    See protocol manual §3.3.3 + wire-spec-v0x03-pulse-sync-design.md.
     """
     cycle_ms     &= 0xFFFF
     ttl_seconds  &= 0xFFFF
+    send_tick    &= 0xFFFFFFFF
     return bytes((
         MAGIC_0,
         MAGIC_1,
@@ -425,6 +449,10 @@ def encode_light_wash(
         ttl_seconds & 0xFF,
         (ttl_seconds >> 8) & 0xFF,
         pulse_response & 0xFF,
+        send_tick & 0xFF,
+        (send_tick >> 8) & 0xFF,
+        (send_tick >> 16) & 0xFF,
+        (send_tick >> 24) & 0xFF,
     ))
 
 
@@ -464,12 +492,15 @@ def encode_light_wash_pulse(
     attack, sustain, release,
     chance,
     hop_count=0,
+    send_tick=0,     # v0x03: director's now_ms() at emit; u32 LE
 ):
     """Build the wire bytes for a LIGHT_WASH_PULSE frame.
 
-    9-byte payload, identical layout to LIGHT_PULSE. Dispatch semantics
-    differ (fires only on washing Lumes). See protocol manual §3.3.5.
+    13-byte payload (v0x03; was 9 in v0x02). Identical layout to
+    LIGHT_PULSE. Dispatch semantics differ (fires only on washing
+    Lumes). See protocol manual §3.3.5 + wire-spec-v0x03-pulse-sync-design.md.
     """
+    send_tick &= 0xFFFFFFFF
     return bytes((
         MAGIC_0,
         MAGIC_1,
@@ -486,6 +517,10 @@ def encode_light_wash_pulse(
         sustain & 0xFF,
         release & 0xFF,
         chance & 0xFF,
+        send_tick & 0xFF,
+        (send_tick >> 8) & 0xFF,
+        (send_tick >> 16) & 0xFF,
+        (send_tick >> 24) & 0xFF,
     ))
 
 
@@ -503,6 +538,7 @@ def make_light_wash_frame(
     source_id=0,
     sequence_number=0,
     hop_count=0,
+    send_tick=0,   # v0x03
 ):
     """Construct a LIGHT_WASH Frame directly, for local loopback.
 
@@ -529,6 +565,7 @@ def make_light_wash_frame(
     f.cycle_ms = cycle_ms
     f.ttl_seconds = ttl_seconds
     f.pulse_response = pulse_response
+    f.send_tick = send_tick   # v0x03
     return f
 
 
@@ -568,6 +605,7 @@ def make_light_wash_pulse_frame(
     source_id=0,
     sequence_number=0,
     hop_count=0,
+    send_tick=0,   # v0x03
 ):
     """Construct a LIGHT_WASH_PULSE Frame directly, for local loopback.
 
@@ -592,6 +630,7 @@ def make_light_wash_pulse_frame(
     f.sustain = sustain
     f.release = release
     f.chance = chance
+    f.send_tick = send_tick   # v0x03
     return f
 
 
