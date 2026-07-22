@@ -117,7 +117,7 @@ class RenderDispatcher:
     """
 
     __slots__ = ("_send_fn", "_perimeter", "_lcd", "_source_id", "_sequence",
-                 "_last_tx_ms", "_last_hb_ms", "_redundancy")
+                 "_last_tx_ms", "_redundancy")
 
     def __init__(self, send_fn=None, perimeter=None, lcd=None, source_id=0x01,
                  redundancy=1):
@@ -139,18 +139,10 @@ class RenderDispatcher:
         # redundant over time).
         self._redundancy = max(1, redundancy)
         # Wall-clock of the last frame actually broadcast (any type).
-        # Kept for potential diagnostic use; no longer gates heartbeats
-        # (see _last_hb_ms below).
+        # Drives heartbeat skip-if-recent: a LIGHT_PULSE already
+        # proves liveness, so a heartbeat is only sent to fill quiet
+        # gaps. None = nothing sent yet (beacon immediately on entry).
         self._last_tx_ms = None
-        # Wall-clock of the last HEARTBEAT actually broadcast. Gates
-        # heartbeat cadence independently of general TX traffic. Pre-
-        # v1.0.3 the gate was _last_tx_ms (skip-if-recent), which
-        # suppressed heartbeats under continuous DMX-bridge / sparkle-
-        # rate traffic and left Lumes without a stable 1 Hz anchor.
-        # Now heartbeat fires every `interval_ms` regardless of other
-        # TX activity - the §4.3 tick anchor guarantee: Lumes see a
-        # HEARTBEAT with a fresh `tick` at least every second.
-        self._last_hb_ms = None
 
     @property
     def source_id(self):
@@ -196,7 +188,6 @@ class RenderDispatcher:
             ev.sustain,
             ev.release,
             ev.chance,
-            send_tick=now_ms,   # v0x03: cross-Lume sync anchor
         )
         self._advance_sequence()
 
@@ -270,7 +261,6 @@ class RenderDispatcher:
             ev.cycle_ms,
             ev.ttl_seconds,
             ev.pulse_response,
-            send_tick=now_ms,   # v0x03: only meaningful for attack=0 cues, always stamped
         )
         self._advance_sequence()
 
@@ -384,7 +374,6 @@ class RenderDispatcher:
             ev.sustain,
             ev.release,
             ev.chance,
-            send_tick=now_ms,   # v0x03: cross-Lume sync anchor
         )
         self._advance_sequence()
 
@@ -424,23 +413,19 @@ class RenderDispatcher:
         return DispatchResult(sent, perimeter_lit, lcd_armed)
 
     def heartbeat_tick(self, now_ms, interval_ms=1000):
-        """Beacon a HEARTBEAT every `interval_ms` unconditionally.
+        """Beacon a HEARTBEAT if no frame has gone out in `interval_ms`.
 
-        Called every loop tick; self-throttles to ~1 Hz. §4.3 tick
-        anchor guarantee: Lumes see a HEARTBEAT with a fresh `tick`
-        at least every `interval_ms` regardless of any other TX
-        activity, so Phase 2 Lume-side envelope-clock anchoring has
-        a stable reference. Pre-v1.0.3 this was skip-if-recent
-        against _last_tx_ms; that suppressed heartbeats under
-        continuous DMX-bridge / sparkle-rate traffic and left Lumes
-        starved of tick updates.
+        Called every loop tick; self-throttles to ~1 Hz. Skip-if-recent:
+        a LIGHT_PULSE broadcast already proves liveness, so a tapping
+        Director needs no extra heartbeats - they only fill quiet gaps
+        so a Lume can discover the channel and keep its TOFU lock.
 
         Heartbeats broadcast only (no local loopback - they're a beacon,
         not a light). Returns True if a heartbeat was sent this call.
         """
         if self._send_fn is None:
             return False
-        if self._last_hb_ms is not None and (now_ms - self._last_hb_ms) < interval_ms:
+        if self._last_tx_ms is not None and (now_ms - self._last_tx_ms) < interval_ms:
             return False
         payload = encode_heartbeat(self._source_id, self._sequence, tick=now_ms)
         self._advance_sequence()
@@ -448,5 +433,5 @@ class RenderDispatcher:
             self._send_fn(payload)
         except Exception:
             return False
-        self._last_hb_ms = now_ms
+        self._last_tx_ms = now_ms
         return True

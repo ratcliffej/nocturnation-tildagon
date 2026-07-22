@@ -437,24 +437,6 @@ class NocturNationApp(app.App):
         self._button_tap = None
         self._dir_buttons = DirectorButtonMapper()
         self._display = CtxDisplay()
-        # Director-clock offset tracking (Phase 1 of §4.3 tick anchor).
-        # Populated by _observe_frame() when a HEARTBEAT arrives; kept
-        # None-valid across TOFU relocks. v0x03 consumes this via the
-        # _enqueue_sync_* helpers to defer pulse rendering to a common
-        # director-time fire instant across the fleet.
-        self._director_offset_valid     = False
-        self._director_tick_offset_ms   = 0
-        self._director_offset_source_id = 0
-
-        # v0x03 sync-scheduling queues. On admittable LIGHT_PULSE /
-        # LIGHT_WASH_PULSE arrival we compute local_fire_ms and hold
-        # the frame here until the next background_task tick sees
-        # fire_at_ms <= ticks_ms(). Each entry is (fire_at_ms, frame,
-        # cls). Capped at 8 entries per queue; overflow falls back to
-        # immediate render. See wire-spec-v0x03-pulse-sync-design.md.
-        self._pending_sync_pulses      = []
-        self._pending_sync_wash_pulses = []
-        self._sync_fallback_count      = 0
         # Director-mode TX heartbeat pip: the send-wrapper set up in
         # _ensure_director bumps this to time.ticks_ms() on every
         # successful esp.send(); _draw_director paints a small pip in
@@ -2283,13 +2265,6 @@ class NocturNationApp(app.App):
             # on the 100 ms deadline even when no new frame arrives.
             if self._fsm is not None and time is not None:
                 self._fsm.tick(time.ticks_ms())
-            # v0x03 sync-scheduling drain. Runs every 5 ms poll_ms
-            # tick, so a scheduled fire lands within one poll of its
-            # target (better than the 50 ms render-tick jitter of the
-            # perimeter). Cross-Lume alignment ≈ 5 ms bounded by this
-            # drain cadence + ~1 ms of offset-smoothing residual.
-            if time is not None:
-                self._drain_sync_queues(time.ticks_ms())
             # Tick the perimeter at ~20 Hz independent of foreground
             # state. The settings menu, if open, skips this tick (the
             # menu owns the screen visually and our LEDs stay dark).
@@ -2457,35 +2432,6 @@ class NocturNationApp(app.App):
 
         now_ms = time.ticks_ms()
 
-        # Director-clock offset tracking (Phase 1 of §4.3 tick anchor).
-        # Each unique HEARTBEAT carries the Director's millisecond tick;
-        # maintain a smoothed offset between Director-time and our
-        # local ticks_ms(). Reserved for Phase 2 envelope-math rewire
-        # (perimeter + LCD renderers switch their ASR clocks from
-        # ticks_ms() to director_now_ms() = local + offset), so
-        # envelopes stay aligned across the fleet regardless of per-
-        # badge millis() drift + relay-path arrival jitter. TOFU
-        # relock (source_id change) invalidates the offset - the new
-        # Director's boot-relative clock has no relation to the old's.
-        if (mt == MessageType.HEARTBEAT
-                and frame.tick is not None
-                and frame.tick != 0):
-            if (self._director_offset_valid
-                    and frame.source_id != self._director_offset_source_id):
-                self._director_offset_valid = False
-            raw_offset = ticks_diff(frame.tick, now_ms)
-            if not self._director_offset_valid:
-                self._director_tick_offset_ms = raw_offset
-                self._director_offset_source_id = frame.source_id
-                self._director_offset_valid = True
-            else:
-                # 90/10 smoothing. Handles typical ~1 ms/s crystal
-                # drift smoothly and rejects one-off outliers (relay-
-                # path arrivals with abnormal latency).
-                self._director_tick_offset_ms = (
-                    (self._director_tick_offset_ms * 9 + raw_offset) // 10
-                )
-
         # HEARTBEAT and unknown / reserved-id frames just bump the frame
         # counter without further per-surface dispatch. LIGHT_PULSE plus
         # the LIGHT_WASH family (Epic 6C Phase G) are the routed types;
@@ -2533,25 +2479,14 @@ class NocturNationApp(app.App):
         cls = frame.target_class
 
         if mt == MessageType.LIGHT_PULSE:
-            # v0x03 sync-scheduling: defer render to a common director-
-            # time fire instant so this Tildagon and every other Lume
-            # in the fleet paint the pulse at the same wall-clock
-            # moment regardless of hop-path arrival variance. Returns
-            # False when fallback conditions apply (no offset yet,
-            # send_tick == 0 legacy sender, arrival past deadline,
-            # queue full) - fire immediately in that case.
-            if not self._enqueue_sync_pulse(frame, now_ms):
-                if cls in PERIMETER_CLASSES:
-                    self._renderer.dispatch(frame, now_ms)
-                if cls in LCD_CLASSES:
-                    self._lcd_renderer.dispatch(frame, now_ms)
+            if cls in PERIMETER_CLASSES:
+                self._renderer.dispatch(frame, now_ms)
+            if cls in LCD_CLASSES:
+                self._lcd_renderer.dispatch(frame, now_ms)
         elif mt == MessageType.LIGHT_WASH:
             # Tildagon is wash-capable on both surfaces (can_pulse +
             # can_wash + can_overlay). Hand the wash to whichever
-            # surface(s) match the target class. Wash send_tick is
-            # available on the frame for attack=0 cues but the
-            # renderer's own start-time semantics dominate - not
-            # sync-queued at this layer.
+            # surface(s) match the target class.
             if cls in PERIMETER_CLASSES:
                 self._renderer.on_light_wash(frame, now_ms)
             if cls in LCD_CLASSES:
@@ -2565,131 +2500,10 @@ class NocturNationApp(app.App):
             # The renderer's on_light_wash_pulse handler internally
             # drops the frame if it has no active wash (per design),
             # so the receive-side dispatch routes unconditionally.
-            # v0x03 sync-scheduling same shape as LIGHT_PULSE above.
-            if not self._enqueue_sync_wash_pulse(frame, now_ms):
-                if cls in PERIMETER_CLASSES:
-                    self._renderer.on_light_wash_pulse(frame, now_ms)
-                if cls in LCD_CLASSES:
-                    self._lcd_renderer.on_light_wash_pulse(frame, now_ms)
-
-    # -------------------------------------------------------------------
-    # v0x03 sync-scheduling helpers (wire-spec-v0x03-pulse-sync-design.md)
-    # -------------------------------------------------------------------
-
-    # Build-flag-overridable render delay. Default 30 ms per the design
-    # doc §7. Matches the StickC constexpr default.
-    NOCT_FLEET_RENDER_DELAY_MS = 30
-    _K_PENDING_SYNC_CAP        = 8
-
-    def _director_now_ms(self, local_ms):
-        """Convert local ticks_ms to director-time via the tracked
-        offset. Returns None if the offset isn't valid yet (caller
-        should fall back to immediate render)."""
-        if not self._director_offset_valid:
-            return None
-        return (local_ms + self._director_tick_offset_ms) & 0xFFFFFFFF
-
-    def _local_fire_ms_for(self, send_tick):
-        """Compute the local ticks_ms at which a v0x03 frame with
-        send_tick should fire, per §6 of the design doc:
-            local_fire = send_tick + kFleetRenderDelayMs - director_offset
-
-        Returns None if the offset isn't valid (caller should fall
-        back to immediate render).
-        """
-        if not self._director_offset_valid:
-            return None
-        raw = (send_tick + self.NOCT_FLEET_RENDER_DELAY_MS
-               - self._director_tick_offset_ms)
-        # Clamp negative (Lume clock ahead of Director) to 0 defensively;
-        # then mod u32 wrap for ticks_ms compatibility.
-        if raw < 0:
-            raw = 0
-        return raw & 0xFFFFFFFF
-
-    def _enqueue_sync_pulse(self, frame, now_ms):
-        """Try to defer a LIGHT_PULSE frame to the sync queue. Returns
-        True if enqueued (fire deferred to _drain_sync_queues on the
-        next tick), False if the caller should fire immediately.
-
-        Fallback conditions:
-          - send_tick == 0 (legacy sender)
-          - director_offset_valid == False (fresh boot, no HB yet)
-          - arrival past fire deadline (rate-limited log)
-          - queue full (unlikely at cap=8)
-        """
-        if not frame.send_tick:
-            return False
-        local_fire = self._local_fire_ms_for(frame.send_tick)
-        if local_fire is None:
-            return False
-        delta = ticks_diff(local_fire, now_ms)
-        if delta <= 0:
-            # Late arrival - log every 8th occurrence + fire now.
-            if (self._sync_fallback_count & 0x07) == 0:
-                print("[SYNC LATE] send_tick=%d offset=%d now=%d fire=%d"
-                      % (frame.send_tick,
-                         self._director_tick_offset_ms,
-                         now_ms, local_fire))
-            self._sync_fallback_count += 1
-            return False
-        if len(self._pending_sync_pulses) >= self._K_PENDING_SYNC_CAP:
-            print("[SYNC QUEUE FULL] pulse falling back to immediate")
-            return False
-        self._pending_sync_pulses.append((local_fire, frame))
-        return True
-
-    def _enqueue_sync_wash_pulse(self, frame, now_ms):
-        """Same shape as _enqueue_sync_pulse but for LIGHT_WASH_PULSE."""
-        if not frame.send_tick:
-            return False
-        local_fire = self._local_fire_ms_for(frame.send_tick)
-        if local_fire is None:
-            return False
-        delta = ticks_diff(local_fire, now_ms)
-        if delta <= 0:
-            if (self._sync_fallback_count & 0x07) == 0:
-                print("[SYNC LATE WP] send_tick=%d offset=%d now=%d fire=%d"
-                      % (frame.send_tick,
-                         self._director_tick_offset_ms,
-                         now_ms, local_fire))
-            self._sync_fallback_count += 1
-            return False
-        if len(self._pending_sync_wash_pulses) >= self._K_PENDING_SYNC_CAP:
-            print("[SYNC QUEUE FULL] wash_pulse falling back to immediate")
-            return False
-        self._pending_sync_wash_pulses.append((local_fire, frame))
-        return True
-
-    def _drain_sync_queues(self, now_ms):
-        """Fire any queued frames whose fire_at_ms has arrived.
-        Called every poll_ms iteration of _receive_loop so cross-Lume
-        alignment is bounded by the drain cadence."""
-        if self._pending_sync_pulses:
-            keep = []
-            for (fire_at, frame) in self._pending_sync_pulses:
-                if ticks_diff(fire_at, now_ms) <= 0:
-                    cls = frame.target_class
-                    if cls in PERIMETER_CLASSES:
-                        self._renderer.dispatch(frame, now_ms)
-                    if cls in LCD_CLASSES:
-                        self._lcd_renderer.dispatch(frame, now_ms)
-                else:
-                    keep.append((fire_at, frame))
-            self._pending_sync_pulses = keep
-
-        if self._pending_sync_wash_pulses:
-            keep = []
-            for (fire_at, frame) in self._pending_sync_wash_pulses:
-                if ticks_diff(fire_at, now_ms) <= 0:
-                    cls = frame.target_class
-                    if cls in PERIMETER_CLASSES:
-                        self._renderer.on_light_wash_pulse(frame, now_ms)
-                    if cls in LCD_CLASSES:
-                        self._lcd_renderer.on_light_wash_pulse(frame, now_ms)
-                else:
-                    keep.append((fire_at, frame))
-            self._pending_sync_wash_pulses = keep
+            if cls in PERIMETER_CLASSES:
+                self._renderer.on_light_wash_pulse(frame, now_ms)
+            if cls in LCD_CLASSES:
+                self._lcd_renderer.on_light_wash_pulse(frame, now_ms)
 
     def _lcd_background_rgb01(self):
         """Return (r, g, b) in 0..1 floats for ctx.rgb() to paint as the

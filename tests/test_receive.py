@@ -10,17 +10,16 @@ from nocturnation.receive import process_frame, parse_admittable, MAX_HOP_COUNT
 
 
 # Manual annex C.1 reference vector. Modified per-test with helpers.
-# Spec v3: 2-byte "NN" magic prefix + protocol_version 0x03; LIGHT_PULSE
-# payload is 13 bytes (was 9 in v0x02); the +4 bytes are send_tick LE.
+# Spec v2: 2-byte "NN" magic prefix + protocol_version 0x02.
 LIGHT_PULSE_VECTOR = bytes([
     0x4E,  # magic byte 0 ('N')
     0x4E,  # magic byte 1 ('N')
-    0x03,  # protocol_version (v0x03)
+    0x02,  # protocol_version
     0x01,  # source_id
     0x2A,  # sequence (42)
     0x00,  # hop_count
     0x03,  # message_type LIGHT_PULSE
-    0x0D,  # payload_len = 13 (v0x03)
+    0x09,  # payload_len
     0x00,  # target_class
     0x00,  # target_group
     0xFF,  # r
@@ -30,7 +29,6 @@ LIGHT_PULSE_VECTOR = bytes([
     0x00,  # sustain T_0_MS
     0x04,  # release T_480_MS
     0x00,  # chance CHANCE_100
-    0x00, 0x00, 0x00, 0x00,   # send_tick = 0 LE (v0x03; zero is fine for a receive-path test)
 ])
 
 
