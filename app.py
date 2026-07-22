@@ -410,6 +410,17 @@ class NocturNationApp(app.App):
         # 1 Hz HEARTBEAT keeps everyone aligned during quiet stretches
         # so drift doesn't accumulate between shows.
         self._render_snap_ms = None
+        # Force-paint flag. Set by _observe_frame whenever a pulse-family
+        # dispatch (LIGHT_PULSE or LIGHT_WASH_PULSE) lands. The receive
+        # loop consumes it and paints inline in the same iteration,
+        # bypassing the 20 Hz render_interval_ms gate. Without this,
+        # colour transitions on Rainbow / DMX-bridge / any high-cadence
+        # traffic land 0-50 ms after dispatch, and different devices
+        # hit those paints at different phases (visible in slow-mo as
+        # speed drift). With it, all Lumes paint the new envelope
+        # within a poll-cadence of dispatch, which is the tightest
+        # cross-device sync Python-level scheduling allows.
+        self._render_force_paint = False
         # Epic 15 bench follow-up: diagnostic capture for the debug-overlay
         # LCD view. _last_frame_ms is the timestamp of the most recent
         # accepted frame of any type (drives the "Last: N.Ns" gap readout
@@ -2389,13 +2400,26 @@ class NocturNationApp(app.App):
             # on the 100 ms deadline even when no new frame arrives.
             if self._fsm is not None and time is not None:
                 self._fsm.tick(time.ticks_ms())
-            # Tick the perimeter at ~20 Hz independent of foreground
-            # state. The settings menu, if open, skips this tick (the
-            # menu owns the screen visually and our LEDs stay dark).
+            # Tick the perimeter. Two triggers:
+            #   1. Fresh pulse-family dispatch this iteration (any of
+            #      LIGHT_PULSE / LIGHT_WASH_PULSE _observe_frame paths
+            #      set self._render_force_paint). Bypasses the 20 Hz
+            #      gate so colour transitions become visible within one
+            #      poll cadence of dispatch on every device - critical
+            #      for cross-Lume sync under high-cadence show traffic
+            #      (Rainbow, DMX bridge, per-beat sparkles at DnB
+            #      tempos).
+            #   2. 20 Hz idle cadence for envelope decay smoothing
+            #      between arrivals (attack/release ramps on
+            #      Test Pulse / Fade / sparkles).
+            # The settings menu, if open, skips both (menu owns the
+            # screen visually and our LEDs stay dark).
             if time is not None and not self._settings_open:
                 now = time.ticks_ms()
-                if ticks_diff(now, last_render_ms) >= render_interval_ms:
+                if (self._render_force_paint
+                        or ticks_diff(now, last_render_ms) >= render_interval_ms):
                     self._render_perimeter()
+                    self._render_force_paint = False
                     # Fleet render-tick anchor. If an arrival stamped
                     # _render_snap_ms during this iteration, anchor
                     # future ticks to that shared physical instant
@@ -2680,6 +2704,7 @@ class NocturNationApp(app.App):
                 self._bench_dispatched_ms = now_ms
             if cls in PERIMETER_CLASSES:
                 self._renderer.dispatch(frame, now_ms)
+                self._render_force_paint = True
             if cls in LCD_CLASSES:
                 self._lcd_renderer.dispatch(frame, now_ms)
         elif mt == MessageType.LIGHT_WASH:
@@ -2701,6 +2726,7 @@ class NocturNationApp(app.App):
             # so the receive-side dispatch routes unconditionally.
             if cls in PERIMETER_CLASSES:
                 self._renderer.on_light_wash_pulse(frame, now_ms)
+                self._render_force_paint = True
             if cls in LCD_CLASSES:
                 self._lcd_renderer.on_light_wash_pulse(frame, now_ms)
 
