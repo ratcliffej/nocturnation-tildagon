@@ -325,7 +325,7 @@ _DEBUG = False
 # tools/bench_hop0_paint_delta.py (add --extended for DROP / GAP report).
 # Off by default; flip to True on both devices for the measurement
 # window, then flip back off.
-_BENCH_HOP0 = True
+_BENCH_HOP0 = False
 
 # Mirror the flag onto the perimeter module so its drop-log gate matches.
 # Imported after PerimeterRenderer above so the module object exists.
