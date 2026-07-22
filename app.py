@@ -2391,10 +2391,28 @@ class NocturNationApp(app.App):
             return None, None
         if msg is None:
             return None, None
-        if _espnow_irq_installed:
-            arrival = _espnow_last_arrival_ms
-        else:
-            arrival = time.ticks_ms() if time is not None else 0
+        # Arrival-time source, in preferred order:
+        #   1. self._esp.peers_table[host][1] -- updated in the ESP-IDF
+        #      receive callback (raw C context, earliest possible stamp).
+        #      This is what emfcamp/badge-2024-software's EspNowService
+        #      uses; see modules/system/espnow/service.py background_task.
+        #   2. _espnow_last_arrival_ms -- stamped in our mp_sched IRQ
+        #      handler; slightly later than #1 because it's scheduled
+        #      from the main loop rather than the raw callback.
+        #   3. time.ticks_ms() poll-time stamp -- worst case, matches
+        #      pre-PR#31 behaviour.
+        arrival = None
+        try:
+            entry = self._esp.peers_table.get(host)
+            if entry is not None and len(entry) >= 2:
+                arrival = entry[1]
+        except (AttributeError, TypeError):
+            pass
+        if arrival is None:
+            if _espnow_irq_installed:
+                arrival = _espnow_last_arrival_ms
+            else:
+                arrival = time.ticks_ms() if time is not None else 0
         return bytes(msg), arrival
 
     # -- Signal-loss fallback wash ----------------------------------
