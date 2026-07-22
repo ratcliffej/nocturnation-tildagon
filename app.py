@@ -193,6 +193,18 @@ _KILLABLE_SYSTEM_APP_CLASSES = [
 # repeater FSM to seed CANDIDATE/COOLDOWN X-frame counters.
 import random
 
+# MicroPython auto-GC triggers on memory pressure and produces one big
+# ~50-150 ms pause when it fires. Bench data (2026-07-22, PR #28)
+# showed those pauses stall the receive loop and cause cross-device
+# arrival skew up to ~100 ms between two Tildagons. Calling gc.collect()
+# proactively at a controlled cadence keeps the heap flat and prevents
+# the big auto-GC spike. Only used inside the Lume receive loop; import
+# is optional so host-side tests importing app.py on CPython still work.
+try:
+    import gc as _gc
+except ImportError:   # pragma: no cover
+    _gc = None
+
 # Relative imports against the internal nocturnation/ package: the
 # Tildagon launcher loads this module as apps.<dir>.app and does not add
 # the app's own directory to sys.path, so a bare absolute `from
@@ -2256,6 +2268,13 @@ class NocturNationApp(app.App):
         # between two badges by tens or hundreds of ms. Poll cadence is
         # 5 ms; anything >= 25 ms is a stall worth noting.
         last_poll_ms = last_render_ms
+        # Proactive-GC cadence. Bench data showed uncontrolled auto-GC
+        # produced 130-160 ms poll gaps every ~2.8 s per device (PR #28).
+        # Running a small gc.collect() every 250 ms keeps the heap flat
+        # so the big spike doesn't build up. gc.collect() itself costs
+        # ~2-5 ms on this hardware.
+        _proactive_gc_ms = 250
+        last_gc_ms = last_render_ms
         while self._mode == "lume":
             if _BENCH_HOP0 and time is not None:
                 now_poll = time.ticks_ms()
@@ -2264,6 +2283,11 @@ class NocturNationApp(app.App):
                     print("[BENCH-GAP] ticks=%d gap_ms=%d"
                           % (now_poll, gap))
                 last_poll_ms = now_poll
+            if _gc is not None and time is not None:
+                now_gc = time.ticks_ms()
+                if ticks_diff(now_gc, last_gc_ms) >= _proactive_gc_ms:
+                    _gc.collect()
+                    last_gc_ms = now_gc
             buf = self._try_recv()
             if buf is not None:
                 frame = parse_admittable(buf)
