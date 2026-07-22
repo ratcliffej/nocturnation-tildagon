@@ -4,40 +4,6 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
-## 2026-07-19 — v1.0.3: Heartbeat unconditional 1 Hz + Lume-side tick offset tracking (Phase 1)
-
-Phase 1 of the §4.3 tick anchor guarantee. Two coordinated changes,
-neither of which alters envelope rendering today — Phase 2 (rewiring
-the perimeter + LCD renderers' ASR clocks to `director_now_ms()`) is
-the follow-up that actually consumes the offset.
-
-TX side (`RenderDispatcher`):
-- New `_last_hb_ms` field, bumped only after a HEARTBEAT fires.
-- `heartbeat_tick` gates on `_last_hb_ms` instead of `_last_tx_ms`.
-  Continuous LIGHT_PULSE / WASH traffic no longer suppresses the
-  heartbeat; Lumes see a fresh `tick` at least every `interval_ms`
-  regardless of other frame traffic.
-- `_last_tx_ms` kept — may be useful for bench diagnostics.
-
-RX side (`app.py::_observe_frame`):
-- Every unique HEARTBEAT (post-dedup) has its payload's `tick` read.
-- Compute `raw_offset = ticks_diff(frame.tick, now_ms)`.
-- Smoothed with 90/10 EWMA into `self._director_tick_offset_ms`.
-- `self._director_offset_source_id` tracks the source; TOFU relock
-  to a different Director invalidates + reseeds on the next HB.
-- `self._director_offset_valid` flag — Phase 2 envelope math will
-  guard on this so a badge with no tick anchor yet falls back to
-  raw `time.ticks_ms()`.
-
-Test updated: `test_recent_light_pulse_does_not_suppress_heartbeat`
-(renamed from `test_recent_light_pulse_suppresses_heartbeat`) —
-enforces the new unconditional cadence. All 571 host tests pass.
-
-Version bumps:
-- `tildagon.toml`   `14 → 15` (App Store crawler)
-- `metadata.json`   `1.0.3 → 1.0.4` (on-badge runtime)
-- `pyproject.toml`  `0.1.4 → 0.1.5` (Python package)
-
 ## 2026-07-19 — v1.0.2: Stop other badge OS apps while NocturNation runs
 
 Performance patch. On `__init__` NocturNation now stops the badge OS

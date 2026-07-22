@@ -269,20 +269,15 @@ class TestHeartbeat:
         assert d.heartbeat_tick(1000) is True
         assert len(sent) == 2
 
-    def test_recent_light_pulse_does_not_suppress_heartbeat(self):
-        # v1.0.3 §4.3 tick anchor: heartbeat cadence is independent
-        # of general TX traffic. Recent LIGHT_PULSE / WASH sends do
-        # NOT reset the heartbeat gate - Phase 2 Lume-side envelope
-        # anchoring needs a stable 1 Hz tick regardless of other
-        # traffic. Pre-v1.0.3 the gate was _last_tx_ms (any send
-        # suppressed HB); now it's _last_hb_ms (HB-only).
+    def test_recent_light_pulse_suppresses_heartbeat(self):
+        # Skip-if-recent: a tap broadcast resets the timer, so no
+        # heartbeat is needed for the next second.
         sent = []
         d = RenderDispatcher(send_fn=sent.append)
         d.dispatch("01:00", _pulse(), now_ms=0)   # LIGHT_PULSE
-        assert len(sent) == 1
-        # First HB at t=500 fires regardless of the recent pulse.
-        assert d.heartbeat_tick(500) is True
-        assert len(sent) == 2
+        assert d.heartbeat_tick(500) is False
+        # ...but once the gap exceeds the interval, the beacon resumes.
+        assert d.heartbeat_tick(1001) is True
 
     def test_no_heartbeat_without_send_fn(self):
         d = RenderDispatcher(send_fn=None)
