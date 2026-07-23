@@ -141,9 +141,23 @@ class DynamicRepeater:
     app's ``_repeater_observer`` slot in Lume mode.
     """
 
-    def __init__(self, send_fn, random_int_fn, now_ms=0):
+    def __init__(self, send_fn, random_int_fn, now_ms=0,
+                 on_relay_state_change=None, skip_tx=False):
         self._send_fn = send_fn
         self._random_int = random_int_fn
+        # Notified whenever the FSM enters or leaves an relay-eligible
+        # state (ACTIVE, COOLDOWN). Signature: fn(enabled: bool,
+        # output_hop: int). Used by the app to keep an IRQ-context fast
+        # relay path in step with the FSM's elected role - see
+        # _espnow_irq_handler in app.py.
+        self._on_relay_state_change = on_relay_state_change
+        # When True, _transmit_relay skips the actual send_fn() call and
+        # only updates bookkeeping (relayed_count, _record_tx, etc.).
+        # The IRQ-context fast path handled the physical TX first;
+        # duplicating it here would double airtime per hop for no
+        # benefit. When IRQ isn't installed (older firmware) this stays
+        # False and _transmit_relay is the sole TX path.
+        self._skip_tx = skip_tx
 
         self._state = STATE_LISTENING
         self._state_entered_ms = now_ms
@@ -412,6 +426,11 @@ class DynamicRepeater:
         # to relay.
         self._last_relay_ms = now_ms
         self._activations += 1
+        # Notify the IRQ fast-relay path that we're now expected to TX
+        # at this hop. From COOLDOWN → ACTIVE the state was already
+        # relay-enabled, but re-notifying is idempotent and cheap.
+        if self._on_relay_state_change is not None:
+            self._on_relay_state_change(True, self._output_hop)
 
     def _to_cooldown(self, now_ms):
         # _output_hop inherited from ACTIVE.
@@ -421,6 +440,11 @@ class DynamicRepeater:
                                                 COOLDOWN_MAX_FRAMES)
         self._frames_in_state = 0
         self._frames_since_peer = 0
+        # Still relay-enabled (COOLDOWN keeps relaying at the same hop
+        # until the peer stops or the frame window elapses). Re-notify
+        # in case the IRQ globals drifted.
+        if self._on_relay_state_change is not None:
+            self._on_relay_state_change(True, self._output_hop)
 
     def _to_listening(self, now_ms):
         self._state = STATE_LISTENING
@@ -430,6 +454,10 @@ class DynamicRepeater:
         # Reset elected role. Next election picks a fresh output_hop
         # based on which watch expires uncovered.
         self._output_hop = 0
+        # Tell the IRQ fast-relay path to stand down. Any inbound
+        # frame that hits the IRQ handler now will NOT be relayed.
+        if self._on_relay_state_change is not None:
+            self._on_relay_state_change(False, 0)
 
     # ------------------------------------------------------------------
     # Peer-watch mechanics.
@@ -560,22 +588,34 @@ class DynamicRepeater:
     # ------------------------------------------------------------------
 
     def _transmit_relay(self, frame, raw_buf, now_ms):
-        """Mutate byte 5 (hop_count) in a copy of raw_buf and TX it.
+        """Update bookkeeping for a relayed frame and TX it (unless the
+        IRQ fast-relay path already did the TX).
 
-        Copy first so we don't corrupt the caller's buffer - the same
-        raw_buf is used downstream for diagnostics.
+        When ``self._skip_tx`` is True, the IRQ-context handler in
+        app.py._espnow_irq_handler already mutated hop_count and called
+        esp.send() at radio-callback latency (~5 ms) rather than at
+        async-poll latency (~85 ms). We still run the bookkeeping so
+        peer detection (_record_tx), self-diagnostics (_relayed_count,
+        _last_relay_ms), and cooldown timers stay in sync. When False,
+        this is the sole TX path - preserves compatibility with older
+        MicroPython builds that don't expose espnow.irq().
+
+        Copy raw_buf first when we do TX so we don't corrupt the
+        caller's buffer - the same raw_buf is used downstream for
+        diagnostics.
         """
         new_hop = frame.hop_count + 1
         if new_hop > MAX_HOP_COUNT:
             return
-        out = bytearray(raw_buf)
-        out[HOP_COUNT_BYTE_OFFSET] = new_hop & 0xFF
-        try:
-            self._send_fn(bytes(out))
-        except Exception:
-            # A radio failure is not FSM-fatal; the receive loop will
-            # keep supplying frames and the peer detector unchanged.
-            return
+        if not self._skip_tx:
+            out = bytearray(raw_buf)
+            out[HOP_COUNT_BYTE_OFFSET] = new_hop & 0xFF
+            try:
+                self._send_fn(bytes(out))
+            except Exception:
+                # A radio failure is not FSM-fatal; the receive loop will
+                # keep supplying frames and the peer detector unchanged.
+                return
         self._relayed_count += 1
         self._last_relay_ms = now_ms
         self._record_tx(frame.source_id, frame.sequence_number,

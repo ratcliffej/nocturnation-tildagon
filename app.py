@@ -213,12 +213,96 @@ import random
 _espnow_last_arrival_ms = 0
 _espnow_irq_installed = False
 
+# IRQ-context fast-relay state. Allocated at radio-acquire; kept as
+# module globals so the mp_sched-scheduled irq handler can access them
+# without touching a Python object attribute (which may involve a dict
+# lookup allocation). Semantics:
+#   _pending_msgs: list of (host, msg, arrival_ms) drained from espnow
+#       queue in the IRQ handler; async loop's _try_recv reads here
+#       first before falling back to the raw esp.recv() call.
+#   _relay_send_enabled: mirrored from the FSM's ACTIVE / COOLDOWN
+#       state (see repeater.on_relay_state_change wiring in
+#       _start_repeater).
+#   _relay_send_output_hop: the hop level we should TX at (frames whose
+#       hop_count + 1 == this value are relay candidates). Set from
+#       FSM._output_hop on the same signal as _relay_send_enabled.
+#   _relay_send_buffer: pre-allocated 32 B bytearray reused for every
+#       relay TX to avoid heap traffic in the hot path. 32 B matches
+#       protocol manual kMaxFrameSize.
+#   _broadcast_mac_bytes: pre-existing bytes literal.
+_pending_msgs = None
+_relay_send_enabled = False
+_relay_send_output_hop = 0
+_relay_send_buffer = None
+_broadcast_mac_bytes = b'\xff\xff\xff\xff\xff\xff'
 
-def _espnow_irq_handler(_esp):
-    # Runs in scheduled-callback context. time.ticks_ms() is
-    # allocation-free for smallint values and is safe here.
+# Wire-spec byte offsets for the IRQ fast-path relay. Duplicated as
+# module constants so the handler doesn't have to import them from
+# the protocol package (import machinery is heavier than needed here).
+_HOP_COUNT_BYTE_OFFSET = 5
+_MAX_HOP_COUNT_FOR_RELAY = 3
+_MIN_FRAME_LEN_FOR_RELAY = 8   # 8-byte header (magic + version + src + seq + hop + type + len)
+
+
+def _espnow_irq_handler(esp):
+    # Runs in mp_sched context (main task, scheduled from the ESP-NOW
+    # WiFi-task receive callback). Full Python semantics apply -
+    # allocation is allowed - but the handler is on the sync-hot path
+    # so we keep it tight.
     global _espnow_last_arrival_ms
     _espnow_last_arrival_ms = time.ticks_ms()
+
+    if _pending_msgs is None:
+        return
+
+    try:
+        host, msg = esp.recv(0)
+    except OSError:
+        return
+    if msg is None:
+        return
+
+    arrival = _espnow_last_arrival_ms
+    _pending_msgs.append((host, msg, arrival))
+
+    # Fast relay path. When the FSM is ACTIVE / COOLDOWN and the
+    # incoming frame's hop_count + 1 matches our elected output_hop,
+    # mutate the pre-allocated relay buffer and send. Bookkeeping
+    # (relayed_count, _record_tx) happens later on the async path
+    # via FSM.on_admitted_frame -> _transmit_relay(skip_tx=True).
+    if not _relay_send_enabled:
+        return
+    if _relay_send_buffer is None:
+        return
+    n = len(msg)
+    if n < _MIN_FRAME_LEN_FOR_RELAY:
+        return
+    hop = msg[_HOP_COUNT_BYTE_OFFSET]
+    new_hop = hop + 1
+    if new_hop != _relay_send_output_hop:
+        return
+    if new_hop > _MAX_HOP_COUNT_FOR_RELAY:
+        return
+
+    max_n = len(_relay_send_buffer)
+    if n > max_n:
+        n = max_n
+    for i in range(n):
+        _relay_send_buffer[i] = msg[i]
+    _relay_send_buffer[_HOP_COUNT_BYTE_OFFSET] = new_hop
+    try:
+        esp.send(_broadcast_mac_bytes,
+                 memoryview(_relay_send_buffer)[:n])
+    except OSError:
+        pass
+
+
+def _relay_state_change_cb(enabled, output_hop):
+    # Called by DynamicRepeater on state transitions to keep the
+    # module-global IRQ fast-path in step with the FSM's elected role.
+    global _relay_send_enabled, _relay_send_output_hop
+    _relay_send_enabled = enabled
+    _relay_send_output_hop = output_hop
 
 # Relative imports against the internal nocturnation/ package: the
 # Tildagon launcher loads this module as apps.<dir>.app and does not add
@@ -1117,9 +1201,19 @@ class NocturNationApp(app.App):
             return random.randint(lo, hi)
 
         now = time.ticks_ms() if time is not None else 0
-        self._fsm = DynamicRepeater(_relay_send, _relay_random, now_ms=now)
+        # skip_tx=True when the IRQ path is available: the mp_sched
+        # handler already TX'd the relay at ~5 ms latency (vs the
+        # ~85 ms async poll baseline). FSM still runs bookkeeping so
+        # peer detection + cooldown timers stay accurate. Falls back
+        # to async-only TX when irq() wasn't installable.
+        self._fsm = DynamicRepeater(
+            _relay_send, _relay_random, now_ms=now,
+            on_relay_state_change=_relay_state_change_cb,
+            skip_tx=_espnow_irq_installed,
+        )
         self._repeater_observer = self._fsm.on_admitted_frame
-        print("[nocturnation] dynamic repeater armed (Repeat=AUTO)")
+        print("[nocturnation] dynamic repeater armed (Repeat=AUTO"
+              "%s)" % (", IRQ fast relay" if _espnow_irq_installed else ""))
 
     def _stop_repeater(self) -> None:
         """Epic 17 B2: tear down the FSM. Idempotent - safe to call in
@@ -1691,18 +1785,29 @@ class NocturNationApp(app.App):
             except Exception as exc:
                 print("[nocturnation] espnow.config(rxbuf) failed: %s" % exc)
             self._esp.active(True)
-            # Install IRQ-context arrival stamper. Some MicroPython
-            # builds may not expose irq(); we degrade gracefully to
-            # the poll-time stamp used before PR #31.
+            # Pre-allocate the IRQ fast-path buffers before installing
+            # the handler. Once irq() is set, the callback can fire on
+            # the next message arrival, so these must exist first.
+            global _pending_msgs, _relay_send_buffer
+            if _pending_msgs is None:
+                _pending_msgs = []
+            if _relay_send_buffer is None:
+                _relay_send_buffer = bytearray(32)   # protocol max frame
+            # Install IRQ-context handler. Handles arrival timestamping
+            # (PR #31), drain-into-_pending_msgs (PR #35), and fast-
+            # relay TX when the FSM is elected (this PR). Older
+            # MicroPython builds without irq() degrade to the async
+            # poll path - _try_recv falls back to esp.recv() when the
+            # pending list is empty.
             global _espnow_irq_installed
             if not _espnow_irq_installed:
                 try:
                     self._esp.irq(_espnow_irq_handler)
                     _espnow_irq_installed = True
-                    print("[nocturnation] espnow.irq installed for RX time-stamping")
+                    print("[nocturnation] espnow.irq installed for RX + fast relay")
                 except Exception as exc:
                     print("[nocturnation] espnow.irq unavailable, "
-                          "using poll-time stamp: %s" % exc)
+                          "using poll-time stamp + async relay: %s" % exc)
         except Exception as exc:
             print("[nocturnation] radio acquire failed: %s" % exc)
             self._wlan = None
@@ -2437,15 +2542,33 @@ class NocturNationApp(app.App):
         """Non-blocking ESP-NOW recv. Returns (msg_bytes, arrival_ms) or
         (None, None).
 
-        arrival_ms is stamped in _espnow_irq_handler when the frame first
-        landed at the radio (see module-level docstring). It's much
-        closer to physical arrival time than time.ticks_ms() called
-        here in poll context, because the poll cadence is 80-90 ms per
-        iteration (badge OS / LCD / other coroutines eat the sleep).
-        When espnow.irq() isn't available on this MicroPython build we
-        fall back to the poll-time stamp - same behaviour as before
-        PR #31, just no sync fix.
+        Two drain paths in preference order:
+          1. _pending_msgs list, filled by _espnow_irq_handler at
+             mp_sched latency (~5 ms after physical arrival). This is
+             the hot path when irq() is installed - the IRQ handler
+             has already stamped the arrival time AND (if the FSM
+             is in a relay-eligible state) TX'd the relay frame.
+          2. Direct self._esp.recv(0). Fallback for MicroPython
+             builds where irq() couldn't be installed, or the rare
+             case where the IRQ handler missed a message.
+
+        arrival_ms comes from peers_table[host][1] (raw ESP-IDF C
+        callback stamp) preferentially, then _espnow_last_arrival_ms
+        (mp_sched stamp), then poll-time.
         """
+        # IRQ-drained path first.
+        if _pending_msgs is not None and len(_pending_msgs) > 0:
+            host, msg, irq_arrival = _pending_msgs.pop(0)
+            # Prefer peers_table's C-callback stamp if we can get it;
+            # else use the mp_sched stamp captured at IRQ time.
+            arrival = irq_arrival
+            try:
+                entry = self._esp.peers_table.get(host)
+                if entry is not None and len(entry) >= 2:
+                    arrival = entry[1]
+            except (AttributeError, TypeError):
+                pass
+            return bytes(msg), arrival
         if self._esp is None:
             return None, None
         # Tildagon espnow.recv(timeout_ms) returns (mac, msg). A zero
