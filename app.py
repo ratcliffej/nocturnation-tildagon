@@ -251,27 +251,14 @@ def _relay_state_change_cb(enabled, output_hop):
 
 _boot_mark("before nocturnation imports")
 
-# --- Lume-critical imports (always loaded at boot) --------------------
-from .nocturnation.channel_scan import ChannelScanner
-from .nocturnation.clock import ticks_diff
-from .nocturnation import images as bg_images
-from .nocturnation.protocol import DedupRing, MessageType
-from .nocturnation.protocol.frame import (
-    make_light_wash_frame, make_light_wash_end_frame,
-)
-from .nocturnation.receive import parse_admittable
-from .nocturnation.render import (
-    LcdRenderer,
-    LumeTextRenderer,
-    PerimeterRenderer,
-    CtxDisplay,
-    PERIMETER_CLASSES,
-    LCD_CLASSES,
-)
-from .nocturnation.settings import Settings
-from .nocturnation.signal_tracker import SignalTracker
-from .nocturnation.tofu import TofuLock, format_lock_label
-from .nocturnation.repeater import DynamicRepeater
+# All nocturnation.* imports are deferred to _load_lume_stack (async
+# method on NocturNationApp). Reason: at module load time the badge OS
+# has already handed control to us, and the launcher/display coroutine
+# can't paint anything of ours until app.py finishes importing. Moving
+# 200 KB of parse work off the critical path drops the "black screen"
+# window from ~4 s to ~0.3 s and lets the splash paint almost
+# immediately. Details in docs/tildagon-history.md.
+_LUME_STACK_LOADED = False
 
 _boot_mark("nocturnation imports done")
 
@@ -341,9 +328,8 @@ _DEBUG = False
 # both devices for the measurement window then flip back.
 _BENCH_HOP0 = False
 
-# Mirror the flag onto the perimeter module so its drop-log gate matches.
-from .nocturnation.render import perimeter as _bench_perimeter_mod
-_bench_perimeter_mod._BENCH_DISPATCH_LOG = _BENCH_HOP0
+# The perimeter module's _BENCH_DISPATCH_LOG mirror moves into
+# _load_lume_stack, alongside the rest of the nocturnation.* imports.
 
 # Director must not broadcast on channel 11 (Performance band reserved
 # for commercial Directors with random-per-boot IDs). Explicit blocklist
@@ -378,7 +364,12 @@ class NocturNationApp(app.App):
     def __init__(self) -> None:
         _boot_mark("NocturNationApp.__init__ enter")
         self.button_states = Buttons(self)
-        self._dedup = DedupRing()
+        # Lume stack loaded asynchronously from background_task so the
+        # splash paints first. Everything below that would need a class
+        # imported from nocturnation.* is set to None here and populated
+        # by _load_lume_stack once the imports have run.
+        self._lume_stack_loaded = False
+        self._dedup = None
         self._frame_count = 0
         self._last_frame = None
         # Phase 1 hop-0 paint-delta bench (_BENCH_HOP0) state.
@@ -412,14 +403,14 @@ class NocturNationApp(app.App):
         # LCD so the operator can align the Director Stick when
         # auto-scan is off.
         self._receive_channel = None
-        self._settings = Settings.load()
-        self._scanner = self._make_scanner()
-        self._renderer = PerimeterRenderer(calm_mode=self._settings.calm_mode)
-        self._lcd_renderer = LcdRenderer(calm_mode=self._settings.calm_mode)
-        # LCD text renderer (TEXT_DISPLAY overlay). Independent of the
-        # pulse/wash state machine - operator-paced content, no calm-mode
-        # gate.
-        self._lume_text_renderer = LumeTextRenderer()
+        # Deferred to _load_lume_stack (Settings, PerimeterRenderer,
+        # LcdRenderer, LumeTextRenderer all require nocturnation.* imports
+        # that haven't run yet).
+        self._settings = None
+        self._scanner = None
+        self._renderer = None
+        self._lcd_renderer = None
+        self._lume_text_renderer = None
         self._settings_open = False
         self._settings_menu = None
         # App role: "idle" (no radio, WiFi up), "lume" (receive), or
@@ -439,7 +430,7 @@ class NocturNationApp(app.App):
         self._button_tap = None
         # Built lazily by _ensure_director; Director module isn't imported yet.
         self._dir_buttons = None
-        self._display = CtxDisplay()
+        self._display = None
         # TX heartbeat pip timestamp. Bumped on every successful
         # esp.send(); _draw_director paints a pip whose colour is
         # derived from its age. None = no TX has landed yet.
@@ -447,16 +438,14 @@ class NocturNationApp(app.App):
         self._director_overlay = None
         self._dir_settings_defs = []
         self._picker_show_ids = []
-        self._signal_tracker = SignalTracker()
+        # Deferred to _load_lume_stack.
+        self._signal_tracker = None
         # Signal-loss fallback wash state. _fallback_last_check_ms
         # suppresses repeated emission while in the same state.
         self._fallback_active = False
         self._fallback_faded  = False
-        # Trust-On-First-Use lock on Director source_id. Locks to the
-        # first valid frame from a non-broadcast source; subsequent
-        # frames from other IDs are dropped silently. Ch 11 only accepts
-        # Performance-range IDs. Expires after 10 s of inactivity.
-        self._tofu = TofuLock()
+        # Deferred to _load_lume_stack.
+        self._tofu = None
         # Bring the perimeter LEDs out of low-power before the first tick.
         if tildagonos is not None:
             try:
@@ -478,7 +467,8 @@ class NocturNationApp(app.App):
         ):
             eventbus.on(RequestForegroundPushEvent, self._on_foreground_push, self)
             eventbus.on(RequestForegroundPopEvent, self._on_foreground_pop, self)
-        self._stop_other_system_apps()
+        # _stop_other_system_apps() moves into _load_lume_stack so it
+        # doesn't block the splash from painting.
         self._first_update_traced = False
         self._first_draw_traced = False
         # Boot splash: covers the launcher->first-frame gap so the user
@@ -492,6 +482,83 @@ class NocturNationApp(app.App):
         self._splash_paint_start_ms = None
         _boot_mark("NocturNationApp.__init__ exit")
 
+    async def _load_lume_stack(self) -> None:
+        """Import + construct the Lume runtime asynchronously.
+
+        Called once per NocturNationApp instance from background_task.
+        The module-level _LUME_STACK_LOADED flag guards the imports
+        only - once nocturnation.* is in sys.modules the second import
+        pass is trivial; but the instance renderers still must be
+        constructed for every new app instance, because the launcher
+        creates a fresh NocturNationApp on relaunch and its
+        self._settings/_renderer/... start as None.
+        """
+        global _LUME_STACK_LOADED
+        global ChannelScanner, ticks_diff, bg_images
+        global DedupRing, MessageType
+        global make_light_wash_frame, make_light_wash_end_frame
+        global parse_admittable
+        global LcdRenderer, LumeTextRenderer, PerimeterRenderer, CtxDisplay
+        global PERIMETER_CLASSES, LCD_CLASSES
+        global Settings, SignalTracker, TofuLock, format_lock_label
+        global DynamicRepeater
+
+        if self._lume_stack_loaded:
+            return
+        _boot_mark("lume stack load start")
+
+        if not _LUME_STACK_LOADED:
+            from .nocturnation.channel_scan import ChannelScanner
+            from .nocturnation.clock import ticks_diff
+            await asyncio.sleep_ms(0)
+            from .nocturnation import images as bg_images
+            from .nocturnation.protocol import DedupRing, MessageType
+            await asyncio.sleep_ms(0)
+            from .nocturnation.protocol.frame import (
+                make_light_wash_frame, make_light_wash_end_frame,
+            )
+            await asyncio.sleep_ms(0)
+            from .nocturnation.receive import parse_admittable
+            await asyncio.sleep_ms(0)
+            from .nocturnation.render import (
+                LcdRenderer, LumeTextRenderer, PerimeterRenderer, CtxDisplay,
+                PERIMETER_CLASSES, LCD_CLASSES,
+            )
+            await asyncio.sleep_ms(0)
+            from .nocturnation.settings import Settings
+            from .nocturnation.signal_tracker import SignalTracker
+            from .nocturnation.tofu import TofuLock, format_lock_label
+            await asyncio.sleep_ms(0)
+            from .nocturnation.repeater import DynamicRepeater
+            await asyncio.sleep_ms(0)
+
+            # Perimeter module bench flag mirror (was module-scope).
+            from .nocturnation.render import perimeter as _bench_perimeter_mod
+            _bench_perimeter_mod._BENCH_DISPATCH_LOG = _BENCH_HOP0
+
+            _LUME_STACK_LOADED = True
+            _boot_mark("lume stack imports done")
+
+        # Instance state: always constructed, even on relaunch when the
+        # imports are already cached.
+        self._settings = Settings.load()
+        self._dedup = DedupRing()
+        self._renderer = PerimeterRenderer(calm_mode=self._settings.calm_mode)
+        self._lcd_renderer = LcdRenderer(calm_mode=self._settings.calm_mode)
+        self._lume_text_renderer = LumeTextRenderer()
+        self._display = CtxDisplay()
+        self._signal_tracker = SignalTracker()
+        self._tofu = TofuLock()
+        await asyncio.sleep_ms(0)
+
+        # Deferred out of __init__ so the splash isn't blocked by the
+        # ~450 ms of scheduler kills. Only fires once per session
+        # because the badge OS scheduler tracks stopped apps globally.
+        self._stop_other_system_apps()
+
+        self._lume_stack_loaded = True
+        _boot_mark("lume stack load done")
+
     def _on_foreground_push(self, event) -> None:
         # Perimeter continued animating in the background so renderer
         # state is fresh; the LCD envelope was dispatched but not drawn -
@@ -500,8 +567,13 @@ class NocturNationApp(app.App):
             return
         self._is_foreground = True
         self._inhibit_patterns()
-        self._lcd_renderer.clear()
-        self._lume_text_renderer.clear()
+        # Renderers are None until the Lume stack finishes loading; this
+        # event can fire before that. Skip the clear() calls until they
+        # exist - on first-time boot the state is fresh anyway.
+        if self._lcd_renderer is not None:
+            self._lcd_renderer.clear()
+        if self._lume_text_renderer is not None:
+            self._lume_text_renderer.clear()
         print("[nocturnation] foreground push - LCD wash resumed")
 
     def _on_foreground_pop(self, event) -> None:
@@ -534,6 +606,10 @@ class NocturNationApp(app.App):
         if not self._first_update_traced:
             self._first_update_traced = True
             _boot_mark("first update() tick")
+        # Nothing meaningful for update() to do until Settings is loaded
+        # (the whole idle/settings/help/lume state machine reads it).
+        if not self._lume_stack_loaded:
+            return
         if self._settings_open and self._settings_menu is not None:
             self._settings_menu.update(delta)
             return
@@ -982,9 +1058,6 @@ class NocturNationApp(app.App):
             if self._splash_paint_start_ms is None:
                 self._splash_paint_start_ms = now_ms
             paint_elapsed = _ticks_diff(now_ms, self._splash_paint_start_ms)
-            boot_elapsed = _ticks_diff(now_ms, self._splash_start_ms)
-            # Hard cap so we never hang on the splash if radio setup wedges.
-            hard_timeout = boot_elapsed >= 6000
             # Minimum visible time after first paint so the splash is
             # legible even when a Director is already broadcasting.
             min_visible_met = paint_elapsed >= 1500
@@ -993,7 +1066,13 @@ class NocturNationApp(app.App):
                 or self._idle_menu is not None
                 or self._settings_open
             )
-            if hard_timeout or (min_visible_met and trigger):
+            # Splash MUST stay up while the Lume stack is still importing:
+            # every non-splash path below touches renderers that are None
+            # until _load_lume_stack finishes.
+            if not self._lume_stack_loaded:
+                self._draw_splash(ctx)
+                return
+            if min_visible_met and trigger:
                 self._splash_active = False
             else:
                 self._draw_splash(ctx)
@@ -1331,6 +1410,13 @@ class NocturNationApp(app.App):
             self._status = "no radio module"
             print("[nocturnation] required modules unavailable; receive disabled")
             return
+
+        # Lume stack (nocturnation.* imports + renderer/settings/tofu
+        # construction) is deferred out of __init__ so the splash paints
+        # first. Load it now, yielding between imports so the display
+        # coroutine keeps updating the splash.
+        if not self._lume_stack_loaded:
+            await self._load_lume_stack()
 
         # Session loop: idle -> WiFi up, no radio; mode -> take radio
         # (wifi.stop + ESP-NOW); back to idle -> release and restore.
