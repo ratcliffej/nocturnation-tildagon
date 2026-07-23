@@ -480,6 +480,13 @@ class NocturNationApp(app.App):
             eventbus.on(RequestForegroundPopEvent, self._on_foreground_pop, self)
         self._stop_other_system_apps()
         self._first_update_traced = False
+        self._first_draw_traced = False
+        # Boot splash: covers the launcher->first-frame gap so the user
+        # sees "NocturNation / vX / Loading..." instead of a blank screen.
+        # Cleared on first admitted frame, first idle-menu open, or 5 s
+        # timeout - whichever comes first.
+        self._splash_active = True
+        self._splash_start_ms = _boot_t0
         _boot_mark("NocturNationApp.__init__ exit")
 
     def _on_foreground_push(self, event) -> None:
@@ -963,6 +970,20 @@ class NocturNationApp(app.App):
             self._bench_dispatched_key = None
 
     def draw(self, ctx) -> None:
+        if not self._first_draw_traced:
+            self._first_draw_traced = True
+            _boot_mark("first draw() tick")
+
+        if self._splash_active:
+            if (self._last_frame is not None
+                    or self._idle_menu is not None
+                    or self._settings_open
+                    or _ticks_diff(_ticks_ms(), self._splash_start_ms) >= 5000):
+                self._splash_active = False
+            else:
+                self._draw_splash(ctx)
+                return
+
         if self._settings_open and self._settings_menu is not None:
             if clear_background is not None:
                 clear_background(ctx)
@@ -1058,6 +1079,18 @@ class NocturNationApp(app.App):
         # Tildagon convention: C = select, F = back.
         ctx.font_size = 10
         ctx.move_to(0, 85).text("C: settings   F: exit")
+
+    def _draw_splash(self, ctx) -> None:
+        ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
+        ctx.rgb(1, 1, 1)
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+        ctx.font_size = 28
+        ctx.move_to(0, -30).text("NocturNation")
+        ctx.font_size = 14
+        ctx.move_to(0, 5).text("v%s" % _APP_VERSION)
+        ctx.font_size = 18
+        ctx.move_to(0, 45).text("Loading...")
 
     def _draw_debug_overlay(self, ctx) -> None:
         """Diagnostic readout for repeat-mode + range testing.
