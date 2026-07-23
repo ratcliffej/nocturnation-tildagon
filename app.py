@@ -485,9 +485,13 @@ class NocturNationApp(app.App):
     async def _load_lume_stack(self) -> None:
         """Import + construct the Lume runtime asynchronously.
 
-        Called once from background_task. asyncio.sleep_ms(0) between
-        each import block yields to the render coroutine so the splash
-        keeps painting through the ~2 s of parse work.
+        Called once per NocturNationApp instance from background_task.
+        The module-level _LUME_STACK_LOADED flag guards the imports
+        only - once nocturnation.* is in sys.modules the second import
+        pass is trivial; but the instance renderers still must be
+        constructed for every new app instance, because the launcher
+        creates a fresh NocturNationApp on relaunch and its
+        self._settings/_renderer/... start as None.
         """
         global _LUME_STACK_LOADED
         global ChannelScanner, ticks_diff, bg_images
@@ -499,42 +503,44 @@ class NocturNationApp(app.App):
         global Settings, SignalTracker, TofuLock, format_lock_label
         global DynamicRepeater
 
-        if _LUME_STACK_LOADED:
-            self._lume_stack_loaded = True
+        if self._lume_stack_loaded:
             return
         _boot_mark("lume stack load start")
 
-        from .nocturnation.channel_scan import ChannelScanner
-        from .nocturnation.clock import ticks_diff
-        await asyncio.sleep_ms(0)
-        from .nocturnation import images as bg_images
-        from .nocturnation.protocol import DedupRing, MessageType
-        await asyncio.sleep_ms(0)
-        from .nocturnation.protocol.frame import (
-            make_light_wash_frame, make_light_wash_end_frame,
-        )
-        await asyncio.sleep_ms(0)
-        from .nocturnation.receive import parse_admittable
-        await asyncio.sleep_ms(0)
-        from .nocturnation.render import (
-            LcdRenderer, LumeTextRenderer, PerimeterRenderer, CtxDisplay,
-            PERIMETER_CLASSES, LCD_CLASSES,
-        )
-        await asyncio.sleep_ms(0)
-        from .nocturnation.settings import Settings
-        from .nocturnation.signal_tracker import SignalTracker
-        from .nocturnation.tofu import TofuLock, format_lock_label
-        await asyncio.sleep_ms(0)
-        from .nocturnation.repeater import DynamicRepeater
-        await asyncio.sleep_ms(0)
+        if not _LUME_STACK_LOADED:
+            from .nocturnation.channel_scan import ChannelScanner
+            from .nocturnation.clock import ticks_diff
+            await asyncio.sleep_ms(0)
+            from .nocturnation import images as bg_images
+            from .nocturnation.protocol import DedupRing, MessageType
+            await asyncio.sleep_ms(0)
+            from .nocturnation.protocol.frame import (
+                make_light_wash_frame, make_light_wash_end_frame,
+            )
+            await asyncio.sleep_ms(0)
+            from .nocturnation.receive import parse_admittable
+            await asyncio.sleep_ms(0)
+            from .nocturnation.render import (
+                LcdRenderer, LumeTextRenderer, PerimeterRenderer, CtxDisplay,
+                PERIMETER_CLASSES, LCD_CLASSES,
+            )
+            await asyncio.sleep_ms(0)
+            from .nocturnation.settings import Settings
+            from .nocturnation.signal_tracker import SignalTracker
+            from .nocturnation.tofu import TofuLock, format_lock_label
+            await asyncio.sleep_ms(0)
+            from .nocturnation.repeater import DynamicRepeater
+            await asyncio.sleep_ms(0)
 
-        # Perimeter module bench flag mirror (previously module-scope).
-        from .nocturnation.render import perimeter as _bench_perimeter_mod
-        _bench_perimeter_mod._BENCH_DISPATCH_LOG = _BENCH_HOP0
+            # Perimeter module bench flag mirror (was module-scope).
+            from .nocturnation.render import perimeter as _bench_perimeter_mod
+            _bench_perimeter_mod._BENCH_DISPATCH_LOG = _BENCH_HOP0
 
-        _boot_mark("lume stack imports done")
+            _LUME_STACK_LOADED = True
+            _boot_mark("lume stack imports done")
 
-        # Construct the Lume runtime that __init__ used to build eagerly.
+        # Instance state: always constructed, even on relaunch when the
+        # imports are already cached.
         self._settings = Settings.load()
         self._dedup = DedupRing()
         self._renderer = PerimeterRenderer(calm_mode=self._settings.calm_mode)
@@ -546,10 +552,10 @@ class NocturNationApp(app.App):
         await asyncio.sleep_ms(0)
 
         # Deferred out of __init__ so the splash isn't blocked by the
-        # ~450 ms of scheduler kills.
+        # ~450 ms of scheduler kills. Only fires once per session
+        # because the badge OS scheduler tracks stopped apps globally.
         self._stop_other_system_apps()
 
-        _LUME_STACK_LOADED = True
         self._lume_stack_loaded = True
         _boot_mark("lume stack load done")
 
