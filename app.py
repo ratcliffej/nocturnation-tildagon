@@ -20,6 +20,40 @@ try:
 except Exception as _exc:  # pragma: no cover - defensive only
     print("[nocturnation] could not extend sys.path: %s" % _exc)
 
+# Boot-time instrumentation. Prints [boot] +Nms at each checkpoint so
+# reflashing gives a self-contained boot budget on the serial console.
+# ticks_ms is MicroPython; fall back to time.time on host CPython.
+try:
+    from time import ticks_ms as _ticks_ms, ticks_diff as _ticks_diff
+except ImportError:  # pragma: no cover - host CPython path
+    from time import time as _time_time
+    def _ticks_ms():
+        return int(_time_time() * 1000)
+    def _ticks_diff(a, b):
+        return a - b
+try:
+    import gc as _gc
+except ImportError:  # pragma: no cover - unreachable on both runtimes
+    _gc = None
+
+_boot_t0 = _ticks_ms()
+_BOOT_TRACE = True
+
+def _boot_mark(label):
+    if not _BOOT_TRACE:
+        return
+    dt = _ticks_diff(_ticks_ms(), _boot_t0)
+    if _gc is not None and hasattr(_gc, "mem_free"):
+        try:
+            print("[boot] +%dms  free=%d  alloc=%d  %s" % (
+                dt, _gc.mem_free(), _gc.mem_alloc(), label))
+            return
+        except Exception:
+            pass
+    print("[boot] +%dms  %s" % (dt, label))
+
+_boot_mark("sys.path ready")
+
 import app
 from events.input import Buttons, BUTTON_TYPES
 
@@ -138,6 +172,8 @@ _KILLABLE_SYSTEM_APP_CLASSES = [
 
 import random
 
+_boot_mark("badge OS imports done")
+
 # IRQ-context RX timestamp + fast-relay state. Kept as module globals so
 # the mp_sched-scheduled handler can access them without a Python-object
 # attribute lookup (which may allocate). See docs/tildagon-history.md.
@@ -213,6 +249,8 @@ def _relay_state_change_cb(enabled, output_hop):
     _relay_send_enabled = enabled
     _relay_send_output_hop = output_hop
 
+_boot_mark("before nocturnation imports")
+
 from .nocturnation.channel_scan import ChannelScanner
 from .nocturnation.clock import ticks_diff
 from .nocturnation import images as bg_images
@@ -247,6 +285,8 @@ from .nocturnation.director import (
 )
 from .nocturnation.director.espnow_sender import make_sender, BROADCAST_MAC
 from .nocturnation.repeater import DynamicRepeater
+
+_boot_mark("nocturnation imports done")
 
 
 # App version, read once from metadata.json. Fallback path list because
@@ -319,6 +359,7 @@ class NocturNationApp(app.App):
     """
 
     def __init__(self) -> None:
+        _boot_mark("NocturNationApp.__init__ enter")
         self.button_states = Buttons(self)
         self._dedup = DedupRing()
         self._frame_count = 0
@@ -420,6 +461,8 @@ class NocturNationApp(app.App):
             eventbus.on(RequestForegroundPushEvent, self._on_foreground_push, self)
             eventbus.on(RequestForegroundPopEvent, self._on_foreground_pop, self)
         self._stop_other_system_apps()
+        self._first_update_traced = False
+        _boot_mark("NocturNationApp.__init__ exit")
 
     def _on_foreground_push(self, event) -> None:
         # Perimeter continued animating in the background so renderer
@@ -460,6 +503,9 @@ class NocturNationApp(app.App):
             print("[nocturnation] PatternEnable emit failed: %s" % exc)
 
     def update(self, delta: float) -> None:
+        if not self._first_update_traced:
+            self._first_update_traced = True
+            _boot_mark("first update() tick")
         if self._settings_open and self._settings_menu is not None:
             self._settings_menu.update(delta)
             return
