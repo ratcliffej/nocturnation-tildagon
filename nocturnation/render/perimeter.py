@@ -1,23 +1,17 @@
 """Perimeter LED renderer for the Tildagon's twelve-LED ring.
 
-Each inbound LIGHT_PULSE becomes per-LED envelopes (chance-gated
-independently per LED, then ramped through attack/sustain/release).
-LIGHT_WASH adds a uniform baseline that all twelve LEDs follow with
-cosine-eased ping-pong drift; pulses overlay additively on top.
+Each LIGHT_PULSE becomes per-LED envelopes (chance-gated independently
+per LED, then ramped through attack/sustain/release). LIGHT_WASH adds a
+uniform baseline all twelve LEDs follow with cosine-eased ping-pong
+drift; pulses overlay additively on top.
 
-The caller drives the actual hardware (tildagonos.leds[i] = (r,g,b))
-via the set_led callback passed to tick(); this module stays pure
-logic so the whole render contract is host-testable.
+Pure logic - the caller drives the actual hardware via the set_led
+callback passed to tick().
 
-Frequency cap and brightness cap implement Calm Mode per architecture
-spec section 15. Calm Mode (default on): 2 Hz dispatch cap, 50 % peak
-brightness. Full-effect (operator opt-in): 4 Hz dispatch cap, 100 %.
+Calm Mode (default on): 2 Hz dispatch cap, 50 % peak brightness.
+Full-effect (operator opt-in): 16 Hz dispatch cap, 100 %.
 
-Reference manuals:
-- Protocol manual section 3.3.2/3/4/5 (LIGHT_PULSE + LIGHT_WASH family)
-- Architecture spec section 15 (photosensitivity / Calm Mode)
-- lume-capabilities-design.md (wash semantics)
-- Epic 5 Block 3, Epic 6C Phase G
+Design decisions: docs/tildagon-history.md.
 """
 
 import math
@@ -25,53 +19,38 @@ import math
 from ..clock import ticks_diff
 from .envelope import TIME_MS, envelope_brightness  # noqa: F401 (re-exported)
 
-# Map the protocol's Chance enum (0..7) to a probability 0..1.
-# Mirrors include/pixmob_protocol.h Chance in the M5 firmware.
+# Protocol Chance enum (0..7) -> probability. Mirrors
+# include/pixmob_protocol.h in the M5 firmware.
 CHANCE_PROB = (1.00, 0.88, 0.67, 0.50, 0.32, 0.16, 0.10, 0.04)
 
-# Tildagon hardware: 12 perimeter LEDs, indexed 1..12. The API uses
-# 1-based indexing (tildagonos.leds[1]..tildagonos.leds[12]); we mirror
-# that here so a single integer flows from this module straight into the
-# tildagonos call without translation.
+# Tildagon perimeter API is 1-based (tildagonos.leds[1]..leds[12]).
+# We mirror the indexing so a single integer flows straight through.
 LED_MIN_INDEX = 1
 LED_MAX_INDEX = 12
 LED_COUNT = LED_MAX_INDEX - LED_MIN_INDEX + 1
 
-# Frequency caps: minimum milliseconds between accepted dispatch calls.
-# Calm mode keeps the 500 ms (2 Hz) Harding-safe floor for badges worn
-# by non-consenting audience. Full mode was 250 ms (4 Hz) but that
-# silently dropped every other sparkle at 140 BPM (sparkle_on_beat at
-# 7 Hz = 143 ms gap); raised to 60 ms (~16 Hz) so per-beat sparkles
-# land through 200+ BPM and sub-beat sparkles still fit. The operator
-# opts into Full mode knowing it's bright; the cap exists only to
-# protect against pathological back-to-back dispatches, not to throttle
-# legitimate music tempo.
-CALM_MIN_INTERVAL_MS = 500   # 2 Hz - Harding-safe for audience badges
-FULL_MIN_INTERVAL_MS = 60    # ~16 Hz - covers per-beat sparkles to 200+ BPM
+# Frequency caps - minimum ms between accepted dispatch calls. Calm mode
+# keeps the Harding-safe 500 ms (2 Hz) floor for audience badges. Full
+# mode 60 ms (~16 Hz) covers per-beat sparkles to 200+ BPM; guards
+# against pathological back-to-back dispatches, not legitimate music
+# tempo. See docs/tildagon-history.md.
+CALM_MIN_INTERVAL_MS = 500
+FULL_MIN_INTERVAL_MS = 60
 
-# Bench-time dispatch drop logging (fleet-sync-design.md Phase 1
-# extended measurement). When True, dispatch() emits a [BENCH-DROP] line
-# every time a LIGHT_PULSE is filtered by rate limiter / black gate /
-# wash gate, so we can distinguish "frame arrived but dispatch chose
-# not to render" from "frame never arrived". Off in production;
-# app.py's _BENCH_HOP0 flag flips it alongside the RX/PT logging.
+# Bench-time dispatch drop logging. Flipped on by app.py._BENCH_HOP0.
 _BENCH_DISPATCH_LOG = False
 
-# Peak brightness multiplier applied per Calm Mode.
 CALM_BRIGHTNESS_CAP = 0.5
 FULL_BRIGHTNESS_CAP = 1.0
 
-# Lost-WASH_END failsafe (not a protocol change). A LIGHT_WASH with
-# ttl_seconds == 0 is "infinite" per the spec: it holds until an
-# explicit LIGHT_WASH_END frame arrives. If that frame is lost, a
-# wash with pulse_response = 0 also gates PULSE - so the Lume sits
-# unresponsive forever. After WASH_MAX_HOLD_MS the receiver
-# self-releases the wash so a missed WASH_END eventually recovers.
-# Mirrors the cap in the LCD renderer.
+# Lost-WASH_END failsafe: a wash with ttl_seconds == 0 is "infinite" per
+# spec. If the WASH_END frame is lost and pulse_response = 0 gates
+# PULSE, the Lume sits unresponsive forever. Self-release after this
+# holds even if the END never arrives. Mirrors the LCD renderer.
 WASH_MAX_HOLD_MS = 30 * 60 * 1000   # 30 minutes
 
 
-# WashPhase string constants (no IntEnum on MicroPython).
+# WashPhase constants (no IntEnum on MicroPython).
 _WASH_INACTIVE  = 0
 _WASH_ATTACK    = 1
 _WASH_HOLD      = 2
@@ -103,17 +82,10 @@ class PerimeterRenderer:
                                        fires if a wash is active.
       tick(now_ms, set_led_fn)      - on every UI frame (~20 Hz).
 
-    Calm Mode is on by default; the caller can flip it via
-    set_calm_mode(). Caps only apply to the pulse rate-limit and the
-    overall brightness cap. WASH is not rate-limited (it's a Director-
-    side state transition, not a periodic flash).
-
-    Pulse semantics (Epic 6C Phase G ADR fix): the attack phase now
-    lerps from the LED's *current rendered colour* (wash baseline +
-    any prior pulse output) to the new pulse's target colour. Pre-fix
-    behaviour ramped from brightness 0, so a series of rainbow pulses
-    snapped through black between colours; this fix produces smooth
-    crossfades when attack > 0 (T_0_MS attacks still snap, by design).
+    Pulse attack lerps from the LED's current rendered colour (wash
+    baseline + any prior pulse output) to the new pulse's target -
+    produces smooth crossfades when attack > 0. T_0_MS attacks still
+    snap, by design.
     """
 
     __slots__ = (
@@ -121,9 +93,9 @@ class PerimeterRenderer:
         "_min_interval_ms",
         "_brightness_cap",
         "_last_dispatch_ms",
-        "_envelopes",          # per-LED active pulse envelopes (1..LED_MAX_INDEX)
-        "_last_rendered",   # per-LED last output (r,g,b) for next pulse's src-lerp
-        "_wash",            # active wash dict, or None
+        "_envelopes",
+        "_last_rendered",
+        "_wash",
         "_rng",
     )
 
@@ -133,7 +105,7 @@ class PerimeterRenderer:
             rng = random.random
         self._rng = rng
 
-        # _envelopes[0] / _last_rendered[0] are unused so LED index 1..12 maps in.
+        # Index 0 unused so LED index 1..12 maps in directly.
         self._envelopes        = [None] * (LED_MAX_INDEX + 1)
         self._last_rendered = [(0, 0, 0)] * (LED_MAX_INDEX + 1)
         self._wash          = None
@@ -153,7 +125,7 @@ class PerimeterRenderer:
         self._brightness_cap = CALM_BRIGHTNESS_CAP if self._calm_mode else FULL_BRIGHTNESS_CAP
 
     # ------------------------------------------------------------------
-    # Wash baseline (Epic 6C Phase G) - one wash struct for all 12 LEDs.
+    # Wash baseline - one wash struct for all 12 LEDs.
     # ------------------------------------------------------------------
 
     def _wash_baseline_at(self, now_ms):
@@ -167,8 +139,7 @@ class PerimeterRenderer:
         if phase == _WASH_INACTIVE:
             return (0, 0, 0)
 
-        # Drift between r1/g1/b1 and r2/g2/b2 (cosine ease) - the "hold"
-        # baseline post-attack.
+        # Cosine-ease drift between r1/g1/b1 and r2/g2/b2.
         if w["cycle_ms"] != 0:
             ph = 2.0 * math.pi * (now_ms - w["started_ms"]) / w["cycle_ms"]
             t = 0.5 - 0.5 * math.cos(ph)
@@ -178,7 +149,6 @@ class PerimeterRenderer:
         else:
             base_r, base_g, base_b = w["r1"], w["g1"], w["b1"]
 
-        # Apply intensity (0..255 -> 0..1 scalar) + Calm-Mode brightness cap.
         scale = (w["intensity"] / 255.0) * self._brightness_cap
 
         post_r = _clip(base_r * scale)
@@ -188,15 +158,13 @@ class PerimeterRenderer:
         if phase == _WASH_HOLD:
             return (post_r, post_g, post_b)
 
-        # Attack: lerp from pre_wash_* to (post_r, post_g, post_b) over
-        # attack_units * 100 ms. Use the pre-cap pre_wash so the cap and
-        # intensity already in post_* don't double-apply.
+        # Attack lerps pre_wash_* -> (post_r, post_g, post_b) over
+        # attack_units * 100 ms. Use pre-cap pre_wash so the cap +
+        # intensity already applied in post_* don't double-apply.
         elapsed = now_ms - w["phase_started_ms"]
         if phase == _WASH_ATTACK:
             atk_ms = w["attack_units"] * 100
             if atk_ms == 0 or elapsed >= atk_ms:
-                # Done attacking - transition to Hold at end of tick math.
-                # (Caller handles the transition.)
                 return (post_r, post_g, post_b)
             t = elapsed / atk_ms
             return (
@@ -205,8 +173,8 @@ class PerimeterRenderer:
                 _lerp(w["pre_wash_b"], post_b, t),
             )
 
-        # Release: lerp from pre_wash_* (the wash colour we left from)
-        # to (release_end_r, _g, _b) over release_units_active * 100 ms.
+        # Release: lerp pre_wash_* -> (release_end_r, _g, _b) over
+        # release_units_active * 100 ms.
         rel_ms = w["release_units_active"] * 100
         if phase == _WASH_RELEASE:
             if rel_ms == 0 or elapsed >= rel_ms:
@@ -221,10 +189,8 @@ class PerimeterRenderer:
         return (0, 0, 0)
 
     def on_light_wash(self, frame, now_ms):
-        """Enter / supersede the wash state from a LIGHT_WASH frame."""
-        # If a wash is already in flight, capture its instantaneous
-        # baseline as the attack-lerp source so the transition is
-        # visually continuous.
+        # Capture the in-flight wash's instantaneous baseline as the
+        # attack-lerp source so a transition is visually continuous.
         if self._wash is not None and self._wash["phase"] != _WASH_INACTIVE:
             pre = self._wash_baseline_at(now_ms)
         else:
@@ -245,7 +211,7 @@ class PerimeterRenderer:
             "pre_wash_r":          pre[0],
             "pre_wash_g":          pre[1],
             "pre_wash_b":          pre[2],
-            # Release defaults to "fade to black"; LIGHT_WASH_END may
+            # Release defaults to fade-to-black; LIGHT_WASH_END may
             # override (or TTL expiry which reuses the wash's own release).
             "release_units_active": frame.wash_release,
             "release_end_r":       0,
@@ -254,10 +220,9 @@ class PerimeterRenderer:
         }
 
     def on_light_wash_end(self, frame, now_ms):
-        """Cancel the active wash with the operator-supplied release_time."""
         if self._wash is None or self._wash["phase"] == _WASH_INACTIVE:
             return
-        # Capture the instantaneous wash colour as the fade-source.
+        # Capture instantaneous wash colour as the fade-source.
         cur = self._wash_baseline_at(now_ms)
         self._wash["pre_wash_r"]           = cur[0]
         self._wash["pre_wash_g"]           = cur[1]
@@ -270,17 +235,15 @@ class PerimeterRenderer:
         self._wash["phase_started_ms"]     = now_ms
 
     def is_washing(self):
-        """True when the renderer is in Attack or Hold phase. Used by
-        the wash_pulse dispatch (drop on non-washing Lume per design)."""
+        # True in Attack or Hold; used by wash_pulse dispatch (drops on
+        # non-washing Lume per design).
         if self._wash is None:
             return False
         return self._wash["phase"] in (_WASH_ATTACK, _WASH_HOLD)
 
     def wash_pulse_response(self):
         """0 = ignore PULSE while washing; 1 = accept as overlay.
-        Caller of dispatch_light_pulse uses this to decide whether to
-        drop the pulse when wash is active. Returns 1 (accept) when no
-        wash is active - pre-Phase-G semantics."""
+        Returns 1 when no wash is active (pre-wash semantics)."""
         if self._wash is None or self._wash["phase"] != _WASH_HOLD and self._wash["phase"] != _WASH_ATTACK:
             return 1
         return self._wash["pulse_response"]
@@ -292,22 +255,15 @@ class PerimeterRenderer:
     def dispatch(self, frame, now_ms):
         """Apply one LIGHT_PULSE to the perimeter ring.
 
-        Returns the number of LEDs that were lit (0 if rate-limited,
-        chance-gated to zero, the frame was a primer, or the envelope
-        was zero-duration).
-
-        Epic 6C Phase G: when a wash is active and `pulse_response = 0`,
-        the pulse is silently dropped (per lume-capabilities-design.md
-        §5). With pulse_response = 1 (the default for wash demos) the
-        pulse overlays additively on the wash baseline.
+        Returns the number of LEDs lit. When a wash is active and
+        pulse_response = 0, the pulse is silently dropped; with
+        pulse_response = 1 (the wash-demo default) it overlays additively.
         """
-        # Frequency cap. Primers and zero-duration envelopes don't count
-        # against the cap so they don't consume the budget that the
-        # subsequent main fire needs.
+        # Primers and zero-duration envelopes don't count against the
+        # cap so they don't consume the budget the main fire needs.
         gap = ticks_diff(now_ms, self._last_dispatch_ms)
         if gap < self._min_interval_ms:
             if _BENCH_DISPATCH_LOG:
-                # Grepped by bench_hop0_paint_delta.py --extended.
                 print("[BENCH-DROP] src=%d seq=%d ticks=%d reason=rate_limit gap=%d min=%d"
                       % (frame.source_id, frame.sequence_number, now_ms,
                          gap, self._min_interval_ms))
@@ -319,7 +275,7 @@ class PerimeterRenderer:
                       % (frame.source_id, frame.sequence_number, now_ms))
             return 0
 
-        # Wash + pulse_response gate: a non-overlay wash drops PULSE.
+        # A non-overlay wash drops PULSE.
         if self._wash is not None and self._wash["phase"] in (_WASH_ATTACK, _WASH_HOLD):
             if self._wash["pulse_response"] == 0:
                 if _BENCH_DISPATCH_LOG:
@@ -340,11 +296,9 @@ class PerimeterRenderer:
         lit = 0
         for i in range(LED_MIN_INDEX, LED_MAX_INDEX + 1):
             if self._rng() < chance_prob:
-                # Source colour for the attack lerp: the LED's current
-                # rendered colour (last_rendered). This is the ADR fix -
-                # previously the source was implicitly 0 (black), so a
-                # series of fast-arriving colour-different pulses snapped
-                # through black between colours rather than crossfading.
+                # Source colour for attack lerp: the LED's current
+                # rendered colour, so consecutive rainbow pulses
+                # crossfade rather than snap through black.
                 src_r, src_g, src_b = self._last_rendered[i]
                 self._envelopes[i] = (
                     now_ms,
@@ -360,15 +314,13 @@ class PerimeterRenderer:
         return lit
 
     def on_light_wash_pulse(self, frame, now_ms):
-        """LIGHT_WASH_PULSE - same shape as PULSE, but only fires if
-        wash is active. The design treats this as the LD's "explicit
-        overlay" mechanism that bypasses pulse_response.
-        """
+        # Same shape as PULSE but bypasses pulse_response (the "explicit
+        # overlay" mechanism). Only fires if wash is active.
         if not self.is_washing():
             return 0
-        # Force-accept the overlay regardless of pulse_response by
-        # temporarily setting pulse_response=1, then restoring. Easier
-        # than duplicating the dispatch body.
+        # Force-accept the overlay by temporarily setting
+        # pulse_response=1, then restoring - easier than duplicating
+        # dispatch.
         original = self._wash["pulse_response"]
         self._wash["pulse_response"] = 1
         try:
@@ -383,16 +335,13 @@ class PerimeterRenderer:
     def tick(self, now_ms, set_led):
         """Compute current LED states; call set_led(index, r, g, b) per LED.
 
-        `set_led` is invoked for every LED on every tick. The output is
-        the wash baseline (uniform across the ring, post-intensity +
-        post-cap) plus any active per-LED pulse overlay.
+        set_led is invoked for every LED on every tick. Output is the
+        wash baseline (uniform, post-intensity, post-cap) plus any
+        active per-LED pulse overlay.
         """
-        # Wash phase machine: advance Attack -> Hold, handle TTL expiry,
-        # finish Release.
         if self._wash is not None and self._wash["phase"] != _WASH_INACTIVE:
             self._advance_wash_phase(now_ms)
 
-        # Compute the wash baseline once (uniform across the ring).
         base = self._wash_baseline_at(now_ms)
 
         for i in range(LED_MIN_INDEX, LED_MAX_INDEX + 1):
@@ -406,12 +355,9 @@ class PerimeterRenderer:
                 elif elapsed >= total:
                     self._envelopes[i] = None
                 else:
-                    # Compute the pulse output (attack-lerps from src to
-                    # dst, sustain holds dst, release lerps dst back to
-                    # baseline) and OVERWRITE the baseline. Pulse fully
-                    # replaces baseline during its lifetime; on a
-                    # wash-active LED, release fades back to baseline
-                    # rather than to black.
+                    # Pulse fully replaces baseline during its lifetime;
+                    # on a wash-active LED, release fades back to
+                    # baseline rather than to black.
                     pr, pg, pb = self._pulse_color_at(env, elapsed, base)
                     r, g, b = pr, pg, pb
 
@@ -419,9 +365,8 @@ class PerimeterRenderer:
             set_led(i, r, g, b)
 
     def _pulse_color_at(self, env, elapsed, baseline):
-        """Compute the (r,g,b) output for a pulse at `elapsed` ms in.
-        Falls back to `baseline` during release so a wash-active LED
-        fades back to the wash baseline rather than to black."""
+        # Release falls back to baseline so a wash-active LED fades
+        # back to the wash rather than to black.
         _, src_r, src_g, src_b, dst_r, dst_g, dst_b, atk, sus, rel, _total = env
         if elapsed < atk:
             if atk == 0:
@@ -436,7 +381,6 @@ class PerimeterRenderer:
         if elapsed < sus:
             return (dst_r, dst_g, dst_b)
         elapsed -= sus
-        # Release: fade dst -> baseline.
         if rel == 0:
             return baseline
         t = elapsed / rel
@@ -454,19 +398,17 @@ class PerimeterRenderer:
             if atk_ms == 0 or (now_ms - w["phase_started_ms"]) >= atk_ms:
                 w["phase"] = _WASH_HOLD
                 w["phase_started_ms"] = now_ms
-                # No need to retain pre_wash_* once attack is over.
         elif phase == _WASH_HOLD:
-            # Effective hold cap: the operator's explicit ttl_seconds
-            # when set; the lost-WASH_END failsafe (WASH_MAX_HOLD_MS)
-            # when ttl_seconds == 0 ("infinite" per spec).
+            # Effective hold cap: explicit ttl_seconds when set, else
+            # WASH_MAX_HOLD_MS failsafe.
             effective_ttl_ms = (
                 w["ttl_seconds"] * 1000
                 if w["ttl_seconds"] != 0
                 else WASH_MAX_HOLD_MS
             )
             if ticks_diff(now_ms, w["started_ms"]) >= effective_ttl_ms:
-                # TTL expiry: kick off a release using the wash's
-                # own release as the fade duration.
+                # TTL expiry: release using the wash's own release as
+                # the fade duration.
                 cur = self._wash_baseline_at(now_ms)
                 w["pre_wash_r"]           = cur[0]
                 w["pre_wash_g"]           = cur[1]
@@ -480,11 +422,11 @@ class PerimeterRenderer:
         elif phase == _WASH_RELEASE:
             rel_ms = w["release_units_active"] * 100
             if rel_ms == 0 or (now_ms - w["phase_started_ms"]) >= rel_ms:
-                self._wash = None    # exit wash mode
+                self._wash = None
 
     def clear(self):
-        """Reset every LED envelope to idle + drop any active wash.
-        Useful on Calm Mode change or backgrounding."""
+        """Reset every LED envelope + drop any active wash. Useful on
+        Calm Mode change or backgrounding."""
         for i in range(LED_MIN_INDEX, LED_MAX_INDEX + 1):
             self._envelopes[i] = None
             self._last_rendered[i] = (0, 0, 0)

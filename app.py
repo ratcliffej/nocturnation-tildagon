@@ -1,54 +1,19 @@
 """NocturNation Tildagon receiver app.
 
-Block 1 (shipped): minimal Tildagon OS app draws the brand-mark and
-exits cleanly on CANCEL.
+Draws the brand-mark, drives ESP-NOW receive with auto-scan / dedup / hop
+enforcement, dispatches LIGHT_* frames to perimeter + LCD renderers, and
+offers a Director mode for authored Shows.
 
-Block 2 (shipped): async background_task drives ESP-NOW receive with
-channel auto-scan, deduplication, and hop-count enforcement per the
-protocol manual.
-
-Block 3 (shipped): each accepted LIGHT_PULSE is dispatched to the
-PerimeterRenderer which arms per-LED envelopes; the update() tick
-advances envelopes and pushes the resulting (r, g, b) per LED via
-tildagonos.leds[i].
-
-Block 4 (shipped): the LCD pulse renderer arms a full-screen colour
-wash on each accepted dispatch; draw() paints it as the background
-beneath the UI text. Calm Mode disables LCD pulsing entirely.
-
-Block 5 (shipped): persistent settings (Calm Mode, group, channel) +
-in-app menu via app_components.Menu. CONFIRM opens the menu; CANCEL
-backs out. Class + group filter on inbound LIGHT_PULSE per protocol
-manual section 4.2 and Epic 5 Q1 / Q2.
-
-Block 6: NO SIGNAL indication after a 3 s frame gap (protocol
-manual section 6.2); backgrounded operation per architecture spec
-section 7.3 (perimeter LEDs continue, LCD reverts to foreground
-app). Local DROP / BREAKDOWN synthetic fires from MUSIC_EVENT were
-removed in the spec v0.29 protocol trim.
-
-Reference: https://tildagon.badge.emfcamp.org/tildagon-apps/development/
-Block plan: nocturnation-m5 docs/epics/epic-05-tildagon.md
+Design decisions and historical rationale: docs/tildagon-history.md.
 """
 
 # The Tildagon launcher loads this module as ``apps.<dir>.app`` and does
-# NOT add the app's own directory to sys.path, so this app's modules use
-# relative imports (``from .nocturnation.X import Y`` below). The Show
-# library is imported *absolutely* - by ``discover_shows()``
-# (``__import__("shows")``) and by each Show's ``from nocturnation.X import
-# Y`` - so the identical Show source runs unchanged under host pytest
-# (where ``nocturnation`` / ``shows`` are importable via pyproject).
-#
-# Derive this app's own directory from the launcher module name and add it
-# to sys.path so those absolute imports resolve on the badge too, whatever
-# the install directory is called: ``/apps/nocturnation`` when deployed via
-# deploy.sh, or ``/apps/nocturnation_tildagon`` when installed from the EMF
-# app store (the store derives the dir from the repo name). app.py and its
-# ``nocturnation`` / ``shows`` packages sit at the repo root so the store
-# tarball has ``app.py`` at the top, as the installer requires.
+# NOT add the app's own directory to sys.path. Derive it from the
+# launcher module name so absolute imports resolve on the badge whatever
+# the install dir is called. See docs/tildagon-history.md.
 import sys as _sys
 try:
-    _pkg = __name__.rsplit(".", 1)[0]  # e.g. "apps.nocturnation"
+    _pkg = __name__.rsplit(".", 1)[0]
     _APP_DIR = "/" + _pkg.replace(".", "/") if "." in __name__ else "/apps/nocturnation"
     if _APP_DIR not in _sys.path:
         _sys.path.append(_APP_DIR)
@@ -59,7 +24,7 @@ import app
 from events.input import Buttons, BUTTON_TYPES
 
 # Optional imports: only available on the badge runtime. On the host
-# (pytest), these modules don't exist; the async background_task simply
+# (pytest) these modules don't exist; the async background_task simply
 # logs and exits without doing radio work.
 try:
     import asyncio
@@ -103,34 +68,21 @@ try:
 except ImportError:
     Menu = None
     clear_background = None
-# IMU is a badge built-in (Epic 6B Director tap-to-beat). Optional so
-# host imports / non-IMU badges degrade gracefully.
 try:
     import imu
 except ImportError:
     imu = None
-# Badge WiFi manager. We stop it before ESP-NOW so the radio stops
-# sweeping channels (B9 root cause). Optional import for host / sim.
+# Stop badge WiFi manager before ESP-NOW or the firmware channel-sweeps
+# for an AP and wrecks reception.
 try:
     import wifi as _badge_wifi
 except ImportError:
     _badge_wifi = None
-# Tildagon system-app killer / restorer (v1.0.2). Several badge OS
-# scheduler tasks (hexpansion probe, back-LEDs, pattern display,
-# notifications, boop, launcher, power manager, frontboard event
-# pumps) steal CPU + LCD + LED time from an app that ticks at
-# ~50 Hz and drives ESP-NOW simultaneously. We stop them on
-# __init__ and restart them on _quit so the badge is left as we
-# found it once the punter backs out. Modelled on a pattern shared
-# by an EMF-app author for MusicJam.
-#
-# `espnow_service` and `PowerEventHandler` are deliberately NOT in
-# the kill list: espnow_service backs our radio, and the power
-# event handler surfaces charge-state events we may want to see.
-#
-# Each import is optional so host pytest still passes and older /
-# newer badge firmwares degrade gracefully. If a class isn't
-# present we skip stopping it (and skip restarting it on quit).
+# Kill list of badge OS scheduler tasks that contend with our tick +
+# radio use. Stopped in __init__, restarted in _quit. Frontboards first
+# because they own the LCD backing store the other apps draw onto.
+# espnow_service and PowerEventHandler deliberately kept alive (radio
+# backing + charge-state events). See docs/tildagon-history.md.
 try:
     from system.scheduler import scheduler as _sys_scheduler
 except Exception:
@@ -172,11 +124,6 @@ try:
 except Exception:
     _PowerManager = None
 
-# Ordered kill list. Non-None entries are stopped in this order at
-# app start and restarted in the same order at quit. Frontboards
-# first because they own the LCD backing store the other apps draw
-# onto; scheduler releases their tasks then, so the following stops
-# don't fight for the backboard.
 _KILLABLE_SYSTEM_APP_CLASSES = [
     _TwentyTwentySix,
     _TwentyTwentyFour,
@@ -189,66 +136,31 @@ _KILLABLE_SYSTEM_APP_CLASSES = [
     _PowerManager,
 ]
 
-# Standard library on both CPython and MicroPython; used by the dynamic
-# repeater FSM to seed CANDIDATE/COOLDOWN X-frame counters.
 import random
 
-# ESP-NOW IRQ-context RX timestamping (Phase 1 fix experiment #2, PR #31).
-# MicroPython espnow.irq(handler) fires shortly after a frame arrives at
-# the radio - much earlier than our asyncio receive-loop poll can drain
-# it, because the poll cadence baseline is ~85 ms (badge OS / LCD /
-# other coroutines eat that time). Stamping the arrival time in the IRQ
-# handler and using it as envelope start_ms decouples the visible pulse
-# instant from the async-scheduler stalls. Two badges get matching
-# start_ms values (radio propagation < 1 ms) even when their poll loops
-# hit the arrival at different phases.
-#
-# IRQ context is restricted on MicroPython: no allocation, no
-# exceptions, tight code. time.ticks_ms() returns a smallint that
-# doesn't allocate on the heap, and writing to a pre-existing global
-# int is safe. If two frames arrive between two polls, we only keep
-# the LATEST arrival stamp (fine for Test Pulse at 2 Hz; may lose
-# accuracy in future high-rate scenarios but sparkles at 10 Hz still
-# beat the current 85 ms baseline).
+# IRQ-context RX timestamp + fast-relay state. Kept as module globals so
+# the mp_sched-scheduled handler can access them without a Python-object
+# attribute lookup (which may allocate). See docs/tildagon-history.md.
 _espnow_last_arrival_ms = 0
 _espnow_irq_installed = False
 
-# IRQ-context fast-relay state. Allocated at radio-acquire; kept as
-# module globals so the mp_sched-scheduled irq handler can access them
-# without touching a Python object attribute (which may involve a dict
-# lookup allocation). Semantics:
-#   _pending_msgs: list of (host, msg, arrival_ms) drained from espnow
-#       queue in the IRQ handler; async loop's _try_recv reads here
-#       first before falling back to the raw esp.recv() call.
-#   _relay_send_enabled: mirrored from the FSM's ACTIVE / COOLDOWN
-#       state (see repeater.on_relay_state_change wiring in
-#       _start_repeater).
-#   _relay_send_output_hop: the hop level we should TX at (frames whose
-#       hop_count + 1 == this value are relay candidates). Set from
-#       FSM._output_hop on the same signal as _relay_send_enabled.
-#   _relay_send_buffer: pre-allocated 32 B bytearray reused for every
-#       relay TX to avoid heap traffic in the hot path. 32 B matches
-#       protocol manual kMaxFrameSize.
-#   _broadcast_mac_bytes: pre-existing bytes literal.
 _pending_msgs = None
 _relay_send_enabled = False
 _relay_send_output_hop = 0
 _relay_send_buffer = None
 _broadcast_mac_bytes = b'\xff\xff\xff\xff\xff\xff'
 
-# Wire-spec byte offsets for the IRQ fast-path relay. Duplicated as
-# module constants so the handler doesn't have to import them from
-# the protocol package (import machinery is heavier than needed here).
+# Wire-spec byte offsets duplicated as module constants so the IRQ
+# fast-path doesn't have to import them from the protocol package.
+# Must match protocol frame layout.
 _HOP_COUNT_BYTE_OFFSET = 5
 _MAX_HOP_COUNT_FOR_RELAY = 3
-_MIN_FRAME_LEN_FOR_RELAY = 8   # 8-byte header (magic + version + src + seq + hop + type + len)
+_MIN_FRAME_LEN_FOR_RELAY = 8
 
 
 def _espnow_irq_handler(esp):
-    # Runs in mp_sched context (main task, scheduled from the ESP-NOW
-    # WiFi-task receive callback). Full Python semantics apply -
-    # allocation is allowed - but the handler is on the sync-hot path
-    # so we keep it tight.
+    # mp_sched context (scheduled from the WiFi-task receive callback).
+    # Full Python semantics apply but stay tight - sync-hot path.
     global _espnow_last_arrival_ms
     _espnow_last_arrival_ms = time.ticks_ms()
 
@@ -265,11 +177,10 @@ def _espnow_irq_handler(esp):
     arrival = _espnow_last_arrival_ms
     _pending_msgs.append((host, msg, arrival))
 
-    # Fast relay path. When the FSM is ACTIVE / COOLDOWN and the
-    # incoming frame's hop_count + 1 matches our elected output_hop,
-    # mutate the pre-allocated relay buffer and send. Bookkeeping
-    # (relayed_count, _record_tx) happens later on the async path
-    # via FSM.on_admitted_frame -> _transmit_relay(skip_tx=True).
+    # Fast-relay path: when the FSM is ACTIVE/COOLDOWN and this frame's
+    # hop+1 matches our elected output_hop, mutate the pre-allocated
+    # relay buffer and send. Bookkeeping runs later on the async path via
+    # FSM.on_admitted_frame -> _transmit_relay(skip_tx=True).
     if not _relay_send_enabled:
         return
     if _relay_send_buffer is None:
@@ -298,19 +209,10 @@ def _espnow_irq_handler(esp):
 
 
 def _relay_state_change_cb(enabled, output_hop):
-    # Called by DynamicRepeater on state transitions to keep the
-    # module-global IRQ fast-path in step with the FSM's elected role.
     global _relay_send_enabled, _relay_send_output_hop
     _relay_send_enabled = enabled
     _relay_send_output_hop = output_hop
 
-# Relative imports against the internal nocturnation/ package: the
-# Tildagon launcher loads this module as apps.<dir>.app and does not add
-# the app's own directory to sys.path, so a bare absolute `from
-# nocturnation.X import Y` would fail on the badge. Relative imports
-# resolve via the parent package (apps.<dir>) and work on both runtimes.
-# Host-side pytest never imports this file (only the nocturnation/
-# package below), so the dot prefix is invisible to the test suite.
 from .nocturnation.channel_scan import ChannelScanner
 from .nocturnation.clock import ticks_diff
 from .nocturnation import images as bg_images
@@ -330,7 +232,6 @@ from .nocturnation.render import (
 from .nocturnation.settings import Settings
 from .nocturnation.signal_tracker import SignalTracker
 from .nocturnation.tofu import TofuLock, format_lock_label
-# Epic 6B Director mode.
 from .nocturnation.plugins import PropertyType
 from .nocturnation.shows import discover_shows, show_registry, InputAction
 from .nocturnation.director import (
@@ -348,21 +249,9 @@ from .nocturnation.director.espnow_sender import make_sender, BROADCAST_MAC
 from .nocturnation.repeater import DynamicRepeater
 
 
-# App version, loaded once at import from metadata.json (the on-badge
-# runtime artefact copied alongside app.py by deploy.sh). Displayed on
-# the Lume searching-for-signal screen. Read dynamically rather than
-# baked in as a literal so the value tracks metadata.json without a
-# separate constant to keep in sync.
-#
-# Fallback path list because __file__ semantics differ:
-#   - Host pytest: __file__ absolute, rsplit gives project dir - reads
-#     Nocturnation-Tildagon/metadata.json.
-#   - Badge: deploy.sh copies metadata.json to /apps/nocturnation/,
-#     alongside app.py. Depending on how the launcher spawns the app,
-#     __file__ may or may not include the full path - try both.
-#
-# Falls back to "?" if every path fails; the caller renders "v?" so the
-# failure surfaces on the screen rather than reading as a healthy value.
+# App version, read once from metadata.json. Fallback path list because
+# __file__ semantics differ between host pytest and badge deploy;
+# fallback to "?" surfaces as "v?" on the screen.
 _APP_VERSION = "?"
 try:
     import json as _json
@@ -382,82 +271,39 @@ except (ValueError, ImportError):
     pass
 
 
-# Cycle order for the settings menu.
 _GROUP_CYCLE = (0, 1, 2, 3)
 _CHANNEL_CYCLE = ("auto", "1", "11")
 
-# B9 bench debug: when True, the receive path logs the *actual* radio
-# channel (wlan.config('channel')) vs the app's belief, WiFi
-# association state, and every raw frame with its parse + TOFU verdict.
-# The gated helpers (_dbg_radio / _dbg_frame) stay for future bench
-# work; flip this back on to re-enable the logging.
+# Bench debug: log actual radio channel vs the app's belief and every
+# raw frame with its parse + TOFU verdict. Off by default.
 _DEBUG = False
 
-# Bench instrumentation for Phase 1 hop-0 paint-delta measurement (see
-# Docs/fleet-sync-design.md §4.1). Emits per-frame log lines:
-#   [BENCH-RX]   -- LIGHT_PULSE admitted, ready to dispatch
-#   [BENCH-PT]   -- first _render_perimeter tick that painted this frame
-#   [BENCH-DROP] -- perimeter dispatch dropped the frame (rate_limit /
-#                   black / wash_gated); fired from perimeter.dispatch
-#                   after this flag is mirrored onto perimeter._BENCH_DISPATCH_LOG
-#                   in the module-load section below.
-#   [BENCH-GAP]  -- receive-loop poll took >=25 ms since the previous poll
-#                   (should be ~5 ms + jitter); catches asyncio stalls
-#                   and MicroPython GC pauses that can slip envelope
-#                   start times by hundreds of ms between two badges.
-# Parse both Tildagons' serial captures with
-# tools/bench_hop0_paint_delta.py (add --extended for DROP / GAP report).
-# Off by default; flip to True on both devices for the measurement
-# window, then flip back off.
+# Bench instrumentation for Phase 1 hop-0 paint-delta measurement.
+# Emits [BENCH-RX] / [BENCH-PT] / [BENCH-DROP] / [BENCH-GAP] serial lines
+# parsed by tools/bench_hop0_paint_delta.py. Off by default; flip on
+# both devices for the measurement window then flip back.
 _BENCH_HOP0 = False
 
 # Mirror the flag onto the perimeter module so its drop-log gate matches.
-# Imported after PerimeterRenderer above so the module object exists.
 from .nocturnation.render import perimeter as _bench_perimeter_mod
 _bench_perimeter_mod._BENCH_DISPATCH_LOG = _BENCH_HOP0
 
-# Director mode transmits on the hobby channel only (Epic 5.5: the
-# Tildagon must not broadcast on the channel-11 Performance band).
-# Channel 11 is reserved for commercial / show Directors with random-
-# per-boot Performance-range source IDs (Epic 5.5 §3.4). A swarm of
-# Tildagons at EMF transmitting on ch 11 would compete with the
-# orchestrator's StickC Director and drown out cue traffic.
+# Director must not broadcast on channel 11 (Performance band reserved
+# for commercial Directors with random-per-boot IDs). Explicit blocklist
+# is a hard runtime gate catching accidental drift in DIRECTOR_CHANNEL.
 DIRECTOR_CHANNEL = 1
-
-# Channels a Tildagon is FORBIDDEN to broadcast Director on. The
-# constant above is the only authorised channel today, but this
-# explicit blocklist gives us a hard runtime gate that catches any
-# accidental change to DIRECTOR_CHANNEL (future bug, fork divergence,
-# settings-file injection) before the radio is brought up.
 DIRECTOR_FORBIDDEN_TX_CHANNELS = frozenset((11,))
-
-# Director's source_id. A fixed community-range id (0x00-0x3F) is fine
-# for the hobby channel; the Epic 5.5 random-per-boot allocation is a
-# channel-11 concern and the Tildagon never transmits there.
 DIRECTOR_SOURCE_ID = 0x20
 
-# Signal-loss fallback wash (EMF prep). Same timings as the StickC
-# LumeMode constants so the fleet converges on the same idle effect
-# at the same moment:
-#
-#   3 s   silence -> NO SIGNAL diagnostic text (SignalTracker.is_lost)
-#  10 s   silence -> synthesised LIGHT_WASH (blue<->purple ping-pong)
-#                    with attack=FALLBACK_ATTACK_TICKS, intensity=
-#                    FALLBACK_INTENSITY, cycle_ms=FALLBACK_CYCLE_PERIOD_MS
-#  40 s   silence -> synthesised LIGHT_WASH_END (release_time=
-#                    FALLBACK_FADE_TICKS in 100 ms units) starts the
-#                    fade-to-black. release_time is u8 (~25.5 s cap)
-#                    so the "30 s fade" the operator asked for is
-#                    served by the maximum the wash state machine
-#                    accepts - functionally equivalent to the eye.
-# Any inbound frame cancels the fallback with a short-release END so
-# the Director's returning wash/pulse traffic isn't fighting the
-# synthetic baseline.
+# Signal-loss fallback wash timings. Match the StickC LumeMode constants
+# so the fleet converges on the same idle effect at the same moment.
+# release_time is u8 (~25.5 s cap), so the "30 s fade" the operator asked
+# for is served by the maximum the wash state machine accepts.
 FALLBACK_ENTER_MS         = 10000
 FALLBACK_FADE_START_MS    = 40000
 FALLBACK_CYCLE_PERIOD_MS  = 10000
 FALLBACK_ATTACK_TICKS     = 30    # 100 ms units = 3 s
-FALLBACK_FADE_TICKS       = 255   # 100 ms units, ~25.5 s
+FALLBACK_FADE_TICKS       = 255   # 100 ms units, ~25.5 s (u8 max)
 FALLBACK_INTENSITY        = 60    # 0..255; ~24 % brightness
 FALLBACK_RECOVERY_TICKS   = 5     # 100 ms units = 500 ms
 FALLBACK_COLOUR_A         = (20, 0, 80)    # dark violet
@@ -477,121 +323,57 @@ class NocturNationApp(app.App):
         self._dedup = DedupRing()
         self._frame_count = 0
         self._last_frame = None
-        # Phase 1 hop-0 paint-delta bench (_BENCH_HOP0). Keys are
-        # (source_id, sequence_number). "Dispatched" is set when a
-        # LIGHT_PULSE is handed to the perimeter renderer; "painted" is
-        # cleared to match on the first _render_perimeter call after
-        # dispatch. The delta between those two ticks_ms values is the
-        # paint delay for that frame on this device.
+        # Phase 1 hop-0 paint-delta bench (_BENCH_HOP0) state.
         self._bench_dispatched_key = None
         self._bench_dispatched_ms = 0
-        # Render-tick fleet alignment. Every admitted frame stamps
-        # arrival_ms here (from peers_table where possible); the receive
-        # loop's perimeter tick anchor snaps to it so subsequent renders
-        # fire relative to a shared physical event (last frame arrival)
-        # rather than each device's independent "when did we last
-        # paint" phase. LIGHT_PULSE handles busy periods; unconditional
-        # 1 Hz HEARTBEAT keeps everyone aligned during quiet stretches
-        # so drift doesn't accumulate between shows.
+        # Render-tick fleet alignment: perimeter tick anchor snaps to the
+        # arrival_ms of each admitted frame so subsequent renders fire
+        # relative to a shared physical event, not each device's local
+        # paint phase. See docs/tildagon-history.md.
         self._render_snap_ms = None
-        # Force-paint flag. Set by _observe_frame whenever a pulse-family
-        # dispatch (LIGHT_PULSE or LIGHT_WASH_PULSE) lands. The receive
-        # loop consumes it and paints inline in the same iteration,
-        # bypassing the 20 Hz render_interval_ms gate. Without this,
-        # colour transitions on Rainbow / DMX-bridge / any high-cadence
-        # traffic land 0-50 ms after dispatch, and different devices
-        # hit those paints at different phases (visible in slow-mo as
-        # speed drift). With it, all Lumes paint the new envelope
-        # within a poll-cadence of dispatch, which is the tightest
-        # cross-device sync Python-level scheduling allows.
+        # Force-paint flag: set by _observe_frame on every pulse-family
+        # dispatch so colour transitions land within one poll cadence of
+        # dispatch, bypassing the 20 Hz render_interval_ms gate.
         self._render_force_paint = False
-        # Epic 15 bench follow-up: diagnostic capture for the debug-overlay
-        # LCD view. _last_frame_ms is the timestamp of the most recent
-        # accepted frame of any type (drives the "Last: N.Ns" gap readout
-        # + the background-colour signal-health band). _last_hop_count is
-        # the hop_count field of the most recent accepted frame.
-        # _frame_window is a ring of recent frame timestamps so the
-        # overlay can show frames-per-10s (more useful than heartbeats-
-        # only since real traffic = LIGHT_PULSE + LIGHT_WASH + heartbeats).
-        # _hops_seen[h] flips True the first time a frame at hop=h
-        # arrives. Indexed by hop_count (0..3). Drives the overlay's
-        # "(1 2 3)" live meter - presence/absence per hop level,
-        # no counts. Any non-zero entry at hop>=1 is cast-iron
-        # evidence the relay path reached us during this session.
-        # _last_heartbeat_ms kept for completeness but no longer shown.
+        # Debug-overlay diagnostic state.
         self._last_frame_ms     = 0
         self._last_heartbeat_ms = 0
         self._last_hop_count    = 0
         self._frame_window      = []   # list[int_ms], pruned to last 10 s
         self._heartbeat_window  = []   # list[int_ms], pruned to last 10 s
-        self._hops_seen         = [False, False, False, False]   # by hop 0..3
-        # Epic 17 B1: optional observer notified for every admitted frame
-        # (both first-seen and dedup-duplicate). B2 wires an FSM instance
-        # here when Repeat=AUTO. Signature: on_admitted_frame(frame,
-        # is_duplicate, now_ms, raw_buf). raw_buf is the untouched ESP-NOW
-        # payload so the FSM can relay by mutating hop_count (byte 5) and
-        # calling esp.send() without re-encoding. now_ms/raw_buf may be
-        # None on the host (no time module or in tests).
+        self._hops_seen         = [False, False, False, False]
+        # Optional observer notified for every admitted frame (both
+        # first-seen and dedup-duplicate). Wired to the FSM in AUTO mode.
+        # Signature: on_admitted_frame(frame, is_duplicate, now_ms, raw_buf).
         self._repeater_observer = None
-        # Epic 17 B2: DynamicRepeater FSM instance, created on Lume-mode
-        # entry when settings.repeat == "AUTO" and torn down on exit.
         self._fsm = None
         self._status = "starting"
         self._esp = None
-        # WiFi STA handle, stored so the receive loop can read back the
-        # actual radio channel for B9 debug.
         self._wlan = None
-        # Last channel for which wlan.config(channel=N) succeeded. None
-        # if we never managed to set the radio channel at all. Shown on
-        # the LCD so the operator knows which channel to align the
-        # Director Stick to when auto-scan is disabled.
+        # Last channel wlan.config(channel=N) succeeded on; shown on the
+        # LCD so the operator can align the Director Stick when
+        # auto-scan is off.
         self._receive_channel = None
-        # Load persisted settings before constructing renderers so the
-        # initial Calm Mode state matches what the operator last chose.
         self._settings = Settings.load()
-        # Build the channel scanner from the persisted Channel setting:
-        # "1" / "11" pin a single channel (no scan, no mis-lock); "auto"
-        # cycles the full order. Constructed after settings load so the
-        # pin takes effect.
         self._scanner = self._make_scanner()
-        # Perimeter LED renderer. Calm Mode default per persisted
-        # settings (default True). Architecture spec section 15.
         self._renderer = PerimeterRenderer(calm_mode=self._settings.calm_mode)
-        # LCD pulse renderer. Calm Mode disables the LCD wash entirely
-        # per architecture spec section 15.3.
         self._lcd_renderer = LcdRenderer(calm_mode=self._settings.calm_mode)
-        # Epic 13: LCD text renderer. Layers TEXT_DISPLAY content (header
-        # + body) on top of the wash background. Independent of the
-        # pulse/wash state machine - operator-paced display content,
-        # not music-paced visuals. Lifecycle is event-driven (no calm-
-        # mode gate; lyric content is the point of declaring DisplayText).
+        # LCD text renderer (TEXT_DISPLAY overlay). Independent of the
+        # pulse/wash state machine - operator-paced content, no calm-mode
+        # gate.
         self._lume_text_renderer = LumeTextRenderer()
-        # In-app settings menu state.
         self._settings_open = False
         self._settings_menu = None
-        # Epic 6B: app role. "idle" (no radio, WiFi left up so the badge
-        # stays connected while the operator is in the start menu),
-        # "lume" (receive), or "director" (Show framework + IMU + TX).
-        # Epic 12: launch straight into Lume - the background loop sees
-        # the mode change on its first iteration and acquires the radio
-        # (stopping WiFi). F (CANCEL) in Lume calls _stop_to_idle, which
-        # restores WiFi and opens the idle menu as the route to Director
-        # / settings / help.
+        # App role: "idle" (no radio, WiFi up), "lume" (receive), or
+        # "director" (Show + IMU + TX). Launch straight into Lume; F
+        # (CANCEL) in Lume calls _stop_to_idle.
         self._mode = "lume"
-        # Idle start-menu (Menu component); built lazily on first idle
-        # tick. None while a mode is running.
         self._idle_menu = None
-        # Help screen (QR code) state. _help_matrix is the cached uQR
-        # matrix; built once on open so QR generation doesn't run every
-        # draw frame.
         self._help_open = False
         self._help_matrix = None
-        # True while we hold the radio (WiFi stopped + ESP-NOW up). The
-        # background loop acquires it on entering a mode and releases it
-        # (restoring WiFi) on returning to idle.
+        # True while we hold the radio (WiFi stopped + ESP-NOW up).
         self._radio_held = False
-        # Director runtime, built lazily on first Director-mode entry
-        # (_ensure_director). None in Lume mode / before first entry.
+        # Director runtime, built lazily on first Director-mode entry.
         self._controller = None
         self._director_host = None
         self._dispatcher = None
@@ -599,65 +381,37 @@ class NocturNationApp(app.App):
         self._button_tap = None
         self._dir_buttons = DirectorButtonMapper()
         self._display = CtxDisplay()
-        # Director-mode TX heartbeat pip: the send-wrapper set up in
-        # _ensure_director bumps this to time.ticks_ms() on every
-        # successful esp.send(); _draw_director paints a small pip in
-        # the top-right whose colour is derived from the age of this
-        # timestamp. Gives the operator a visual "the radio is actually
-        # broadcasting" cue without hooking up USB serial. None = no
-        # TX has landed yet this session.
+        # TX heartbeat pip timestamp. Bumped on every successful
+        # esp.send(); _draw_director paints a pip whose colour is
+        # derived from its age. None = no TX has landed yet.
         self._director_last_tx_ms = None
-        # Director overlay (Show picker / per-Show settings). None when
-        # the active Show owns the screen.
         self._director_overlay = None
         self._dir_settings_defs = []
         self._picker_show_ids = []
-        # Block 6: Director-liveness tracker. Records every accepted
-        # frame; the draw loop overlays NO SIGNAL when the gap exceeds
-        # 3 s per protocol manual section 6.2.
         self._signal_tracker = SignalTracker()
-        # Signal-loss fallback wash (EMF prep). After kFallbackEnterMs
-        # of silence we synthesise a LIGHT_WASH locally (blue<->purple
-        # cycle, muted intensity) and feed it to the renderers via the
-        # same on_light_wash path real frames take; after a further
-        # kFallbackFadeStartMs we emit a synthetic LIGHT_WASH_END to
-        # fade to black. Any inbound frame cancels the fallback with
-        # a short-release END. _fallback_last_check_ms suppresses
-        # repeated emission while in the same state.
+        # Signal-loss fallback wash state. _fallback_last_check_ms
+        # suppresses repeated emission while in the same state.
         self._fallback_active = False
         self._fallback_faded  = False
-        # Epic 5.5 B6: Trust-On-First-Use lock on Director source_id.
-        # Locks to the first valid frame from a non-broadcast source
-        # after construction or clear(); subsequent frames from other
-        # source_ids are dropped silently. On channel 11, only
-        # Performance-range source_ids (0x40..0xFE) are eligible to
-        # be locked. Lock expires after 10 s of inactivity.
+        # Trust-On-First-Use lock on Director source_id. Locks to the
+        # first valid frame from a non-broadcast source; subsequent
+        # frames from other IDs are dropped silently. Ch 11 only accepts
+        # Performance-range IDs. Expires after 10 s of inactivity.
         self._tofu = TofuLock()
-        # Bring the perimeter LEDs out of low-power before the first
-        # tick. Harmless if tildagonos is None (host environment).
+        # Bring the perimeter LEDs out of low-power before the first tick.
         if tildagonos is not None:
             try:
                 tildagonos.set_led_power(True)
             except Exception as exc:
                 print("[nocturnation] tildagonos.set_led_power failed: %s" % exc)
-        # Tell the badge's system patterndisplay service to stop driving
-        # the perimeter LEDs while this app is running. Without this the
-        # system pattern and our renderer.tick() both write the LED ring
-        # and the result flickers. We re-enable on minimise so the badge
-        # idle animation resumes once the operator backs out.
+        # Stop the badge patterndisplay service from writing the LED ring
+        # while we're active - both writing simultaneously flickers.
         self._patterns_inhibited = False
         self._inhibit_patterns()
-        # Foreground state. The app starts foreground (the launcher push
-        # that brought us here happens before __init__ in some firmware
-        # versions). The scheduler events below keep this in sync.
         self._is_foreground = True
-        # Subscribe to the scheduler's foreground push / pop events so
-        # we can pause receive and release LED control while the app is
-        # not in the foreground. The Tildagon launcher caches the app
-        # instance, so __init__ runs only once - we cannot rely on it
-        # for entry/exit lifecycle. The eventbus broadcasts these
-        # events; we filter by event.app is self to ignore transitions
-        # affecting other apps.
+        # Subscribe to scheduler foreground events. The launcher caches
+        # the app instance so __init__ runs only once; the events keep
+        # _is_foreground in sync. Filter by event.app is self.
         if (
             eventbus is not None
             and RequestForegroundPushEvent is not None
@@ -665,24 +419,12 @@ class NocturNationApp(app.App):
         ):
             eventbus.on(RequestForegroundPushEvent, self._on_foreground_push, self)
             eventbus.on(RequestForegroundPopEvent, self._on_foreground_pop, self)
-        # Stop the badge OS scheduler tasks that contend with our tick +
-        # radio use (hexpansion probe, back-LEDs, pattern display,
-        # notifications, launcher, power UI, frontboards). We restart
-        # them in _quit so the badge is left as we found it. See the
-        # _KILLABLE_SYSTEM_APP_CLASSES block at module scope for the
-        # kill list + rationale.
         self._stop_other_system_apps()
 
     def _on_foreground_push(self, event) -> None:
-        """Scheduler is bringing this app to the foreground.
-
-        Per Block 6 spec the perimeter ring continued animating in the
-        background, so the renderer state is fresh - we keep it. The
-        LCD renderer's envelope was being dispatched but not drawn;
-        clear it so the wash starts cleanly with the next fire rather
-        than mid-envelope. Re-inhibit patterns defensively in case
-        another app emitted PatternEnable while we were away.
-        """
+        # Perimeter continued animating in the background so renderer
+        # state is fresh; the LCD envelope was dispatched but not drawn -
+        # clear so wash starts cleanly from the next fire.
         if event.app is not self:
             return
         self._is_foreground = True
@@ -692,16 +434,8 @@ class NocturNationApp(app.App):
         print("[nocturnation] foreground push - LCD wash resumed")
 
     def _on_foreground_pop(self, event) -> None:
-        """Scheduler is taking this app out of the foreground.
-
-        Per Block 6 spec the perimeter LEDs continue animating while
-        the app is backgrounded (architecture spec section 7.3). We
-        keep PatternDisable in effect (so the badge's patterndisplay
-        service doesn't fight us for the LED ring) and let the
-        receive + render loop keep running. The LCD goes idle
-        automatically - the OS routes draw() calls to the new
-        foreground app.
-        """
+        # Perimeter LEDs keep animating while backgrounded; the OS
+        # routes draw() to the new foreground app.
         if event.app is not self:
             return
         self._is_foreground = False
@@ -726,12 +460,10 @@ class NocturNationApp(app.App):
             print("[nocturnation] PatternEnable emit failed: %s" % exc)
 
     def update(self, delta: float) -> None:
-        # Settings menu has its own update path - delegate to it.
         if self._settings_open and self._settings_menu is not None:
             self._settings_menu.update(delta)
             return
 
-        # Help screen owns input: any of CONFIRM / CANCEL closes it.
         if self._help_open:
             if (self.button_states.get(BUTTON_TYPES["CANCEL"])
                     or self.button_states.get(BUTTON_TYPES["CONFIRM"])):
@@ -739,17 +471,15 @@ class NocturNationApp(app.App):
                 self._close_help()
             return
 
-        # Idle: the start menu owns input. Lazily open it on the first
-        # idle tick (Menu can't be built in __init__ before the app is
-        # registered with the scheduler).
         if self._mode == "idle":
+            # Menu can't be built in __init__ before the app is
+            # registered with the scheduler; open lazily on first tick.
             if self._idle_menu is None and Menu is not None:
                 self._open_idle_menu()
             if self._idle_menu is not None:
                 self._idle_menu.update(delta)
             return
 
-        # Director mode owns its own foreground input handling.
         if self._mode == "director":
             self._update_director(delta)
             return
@@ -757,34 +487,24 @@ class NocturNationApp(app.App):
         # Lume mode.
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
-            # F = stop the Lume session and return to the idle menu
-            # (which restores WiFi). Switching to another badge app
-            # instead keeps the Lume running in the background (Block 6).
             self._stop_to_idle()
             return
         if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
             self.button_states.clear()
             self._open_settings()
             return
-        # Perimeter LED ticking happens in the background_task receive
-        # loop (Block 6) so it runs whether we're foregrounded or not.
+        # Perimeter ticking happens in background_task so it runs
+        # whether we're foregrounded or not.
 
     def _update_director(self, delta: float) -> None:
         """Foreground input for Director mode.
 
-        Button map (Epic 6B B6b):
-          CONFIRM (C) - manual tap (button-tap fallback); edge-detected
-                        by the ButtonTapSource, so we read held state
-                        without clearing.
-          CANCEL  (F) - exit Director mode back to Lume.
-          UP / DOWN / LEFT / RIGHT - nav -> InputAction (picker /
-                        settings / cycle / cycle-prev), edge-detected by
-                        the DirectorButtonMapper.
-
-        IMU tap-to-beat is polled from background_task so it keeps
-        working when the badge is backgrounded.
+        CONFIRM = manual tap (edge-detected by ButtonTapSource - read
+        held state without clearing so the edge detector still fires).
+        CANCEL = exit Director. UP/DOWN/LEFT/RIGHT -> InputAction via
+        DirectorButtonMapper (short LEFT/RIGHT = palette, long = section).
+        IMU tap-to-beat is polled from background_task.
         """
-        # An open overlay (picker / per-Show settings) owns input.
         if self._director_overlay is not None:
             self._director_overlay.update(delta)
             return
@@ -793,22 +513,16 @@ class NocturNationApp(app.App):
 
         now = time.ticks_ms() if time is not None else 0
 
-        # CONFIRM = manual tap. Read held state; ButtonTapSource finds
-        # the rising edge. Deliberately NOT cleared (clear() would wipe
-        # the held state the edge detector relies on).
+        # Deliberately NOT cleared - clear() would wipe the held state
+        # the edge detector relies on.
         confirm = bool(self.button_states.get(BUTTON_TYPES["CONFIRM"]))
         self._controller.poll_button(confirm, now)
 
-        # CANCEL = stop Director mode, back to the idle menu.
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
             self._stop_to_idle()
             return
 
-        # Nav buttons -> InputActions (mapper does its own edge + hold
-        # detection, so no button_states.clear() that would disturb the
-        # held CONFIRM tap state). now_ms feeds the long-press timer
-        # for LEFT / RIGHT (short = palette, long = section).
         actions = self._dir_buttons.poll(
             up=bool(self.button_states.get(BUTTON_TYPES["UP"])),
             down=bool(self.button_states.get(BUTTON_TYPES["DOWN"])),
@@ -825,9 +539,9 @@ class NocturNationApp(app.App):
                 self._open_director_settings()
                 return
 
-    # =====================================================================
-    # Idle start menu + mode start/stop (Epic 6B B9)
-    # =====================================================================
+    # ---------------------------------------------------------------------
+    # Idle start menu + mode start/stop
+    # ---------------------------------------------------------------------
 
     def _idle_menu_items(self):
         return ["Lume Mode", "Director Mode", "Settings", "Help", "Quit"]
@@ -857,20 +571,20 @@ class NocturNationApp(app.App):
         elif idx == 1:
             self._start_mode("director")
         elif idx == 2:
-            self._open_settings()   # config submenu; returns to idle on Back
+            self._open_settings()
         elif idx == 3:
             self._open_help()
         elif idx == 4:
             self._quit()
 
     def _idle_menu_back(self) -> None:
-        # Back from the top idle menu minimises to the launcher. WiFi
-        # stays up (we never took the radio in idle).
+        # Minimise to the launcher; WiFi stays up (we never took the
+        # radio in idle).
         self.minimise()
 
     def _start_mode(self, mode) -> None:
-        """Leave idle and start an active mode. The background loop sees
-        the mode change and acquires the radio (stopping WiFi)."""
+        # The background loop sees the mode change and acquires the
+        # radio (stopping WiFi).
         self._close_idle_menu()
         self._mode = mode
         self._settings.mode = mode
@@ -881,9 +595,8 @@ class NocturNationApp(app.App):
         print("[nocturnation] starting %s mode" % mode)
 
     def _stop_to_idle(self) -> None:
-        """Stop the active mode and return to the idle menu. The
-        background loop releases the radio + restores WiFi on its next
-        idle iteration."""
+        # Background loop releases the radio + restores WiFi on its next
+        # idle iteration.
         self._mode = "idle"
         self._renderer.clear()
         self._lcd_renderer.clear()
@@ -894,14 +607,13 @@ class NocturNationApp(app.App):
         self._open_idle_menu()
         print("[nocturnation] stopped to idle")
 
-    # =====================================================================
-    # Help screen - QR code to the project URL (Epic 6B B9)
-    # =====================================================================
+    # ---------------------------------------------------------------------
+    # Help screen - QR code to the project URL
+    # ---------------------------------------------------------------------
 
     def _build_qr(self, url):
-        """Generate the QR matrix for `url` via the vendored uQR library.
-        Returns a 2D bool matrix, or None on failure (lazy import so the
-        ~1300-line module only loads when Help is opened)."""
+        # Lazy import so the ~1300-line uQR module only loads when Help
+        # is actually opened.
         try:
             from .uQR import QRCode
             qr = QRCode()
@@ -924,10 +636,8 @@ class NocturNationApp(app.App):
             self._open_idle_menu()
 
     def _restore_wifi(self) -> None:
-        """Re-enable the OS WiFi connection we took down at startup.
-
-        wifi.connect() is non-blocking - it reactivates the STA and kicks
-        off association to the configured SSID without waiting."""
+        # wifi.connect() is non-blocking - reactivates the STA and kicks
+        # off association without waiting.
         if _badge_wifi is None:
             return
         try:
@@ -937,13 +647,8 @@ class NocturNationApp(app.App):
             print("[nocturnation] wifi restore failed: %s" % exc)
 
     def _stop_other_system_apps(self) -> None:
-        """Stop the badge OS scheduler tasks that contend with our
-        tick + radio use. Modelled on Kekb's MusicJam pattern. Every
-        stop is best-effort - if the scheduler isn't available (host
-        pytest / older badge firmware) or a specific class is missing,
-        we skip it. Records which classes were successfully stopped
-        so _restart_other_system_apps can restart the same set on
-        quit."""
+        # Record which classes were successfully stopped so _restart can
+        # restore the same set on quit.
         self._stopped_system_apps = []
         if _sys_scheduler is None:
             return
@@ -961,10 +666,6 @@ class NocturNationApp(app.App):
                   "scheduler contention" % len(self._stopped_system_apps))
 
     def _restart_other_system_apps(self) -> None:
-        """Restart every badge OS app we stopped in
-        _stop_other_system_apps. Called from _quit so a punter's
-        badge is left as we found it. Best-effort; a start_app failure
-        is logged but doesn't block quit."""
         if _sys_scheduler is None:
             return
         stopped = getattr(self, "_stopped_system_apps", None)
@@ -980,14 +681,6 @@ class NocturNationApp(app.App):
         self._stopped_system_apps = []
 
     def _quit(self) -> None:
-        """Cleanly leave the app and hand the radio back to the OS.
-
-        We took the radio with wifi.stop() at startup, so on quit we
-        release ESP-NOW, restore WiFi, return the LED ring to the badge's
-        idle animation, restart the system apps we stopped at start-up,
-        then ask the scheduler to stop us. RequestStopApp cancels our
-        background + update tasks and drops the launcher cache, so a
-        relaunch starts fresh."""
         # Release ESP-NOW before WiFi reclaims the radio.
         try:
             if self._esp is not None:
@@ -995,13 +688,10 @@ class NocturNationApp(app.App):
         except Exception as exc:
             print("[nocturnation] esp deactivate failed: %s" % exc)
         self._restore_wifi()
-        # Hand the LED ring back to the badge's pattern service.
         self._resume_patterns()
         self._dark_perimeter()
-        # Restart the badge OS scheduler tasks we stopped at __init__ so
-        # the launcher / notifications / power UI resume before we
-        # actually exit. Order matters: launcher must be back before
-        # RequestStopAppEvent so there's something to fall through to.
+        # Launcher must be restarted before RequestStopAppEvent so
+        # there's something to fall through to.
         self._restart_other_system_apps()
         print("[nocturnation] quitting")
         if eventbus is not None and RequestStopAppEvent is not None:
@@ -1010,23 +700,16 @@ class NocturNationApp(app.App):
                 return
             except Exception as exc:
                 print("[nocturnation] stop-app emit failed: %s" % exc)
-        # Fallback if the scheduler event is unavailable: just minimise.
         self.minimise()
 
     def _open_settings(self) -> None:
-        """Open the in-app settings menu (Block 5).
-
-        Darkens the perimeter ring and clears any in-flight envelopes
-        so the LEDs don't hold a stale brightness while update() is
-        delegated to the menu and _render_perimeter() stops ticking.
-        """
         if Menu is None:
             print("[nocturnation] Menu component unavailable; cannot open settings")
             return
-        # If we came from the idle menu, close it so it doesn't draw
-        # underneath; _close_settings reopens it on Back when in idle.
         self._close_idle_menu()
         self._settings_open = True
+        # Clear in-flight envelopes so the LEDs don't hold a stale
+        # brightness while _render_perimeter() stops ticking.
         self._renderer.clear()
         self._lcd_renderer.clear()
         self._lume_text_renderer.clear()
@@ -1039,7 +722,6 @@ class NocturNationApp(app.App):
         )
 
     def _dark_perimeter(self) -> None:
-        """Force every perimeter LED to (0, 0, 0) and commit immediately."""
         if tildagonos is None:
             return
         try:
@@ -1058,21 +740,14 @@ class NocturNationApp(app.App):
                 pass
         self._settings_open = False
         self._settings_menu = None
-        # Drop any pending button press. The Menu component doesn't clear
-        # button_states after invoking select_handler / back_handler, so
-        # without this the next update() cycle would re-read the same
-        # CONFIRM press as a fresh menu-open (or CANCEL as a minimise).
+        # Menu doesn't clear button_states after invoking select_handler /
+        # back_handler; without this the next update() cycle re-reads the
+        # same CONFIRM press as a fresh menu-open.
         self.button_states.clear()
-        # If we opened Settings from the idle menu, return to it.
         if self._mode == "idle":
             self._open_idle_menu()
 
     def _settings_menu_items(self):
-        """Compose the menu line labels from current settings values.
-
-        Config only - mode selection (Lume/Director) and Quit live on
-        the idle menu; this submenu is reachable both from idle and
-        in-session (CONFIRM while a Lume runs)."""
         return [
             "Calm Mode: %s" % ("ON" if self._settings.calm_mode else "OFF"),
             "Group: %d" % self._settings.group,
@@ -1084,7 +759,6 @@ class NocturNationApp(app.App):
         ]
 
     def _rebuild_settings_menu(self) -> None:
-        """Rebuild the menu after a value cycle so the labels refresh."""
         if not self._settings_open or Menu is None:
             return
         try:
@@ -1099,7 +773,6 @@ class NocturNationApp(app.App):
         )
 
     def _settings_select(self, item, idx) -> None:
-        """Menu select handler. Cycles the value of the selected line."""
         if idx == 0:
             self._settings.calm_mode = not self._settings.calm_mode
             self._apply_calm_mode()
@@ -1118,26 +791,15 @@ class NocturNationApp(app.App):
                 pos = -1
             self._settings.channel = _CHANNEL_CYCLE[(pos + 1) % len(_CHANNEL_CYCLE)]
         elif idx == 3:
-            # Debug overlay toggle (Epic 15 bench follow-up). When ON,
-            # the Lume LCD shows last-heartbeat freshness, hop count
-            # of the most recent frame, heartbeats-per-10s window, and
-            # the TOFU lock label - used to objectively measure
-            # repeat-mode behaviour at range.
             self._settings.debug_mode = not self._settings.debug_mode
         elif idx == 4:
-            # Repeat toggle (Epic 17). Cycles AUTO ↔ OFF. In AUTO the
-            # badge silently becomes an audience repeater when no peer
-            # covers its vicinity; OFF disables the FSM entirely. Takes
-            # effect on the next Lume-mode session entry - a mid-session
-            # toggle does not tear down an active FSM here (bench-test
-            # for whether that matters).
+            # Repeat toggle. Takes effect on next Lume-mode session entry -
+            # a mid-session toggle does not tear down an active FSM here.
             self._settings.repeat = "OFF" if self._settings.repeat == "AUTO" else "AUTO"
         elif idx == 5:
-            # Rescan (Epic 5.5 B7). Clears the TOFU lock so the next
-            # valid frame on the current channel establishes a fresh
-            # lock. Note: the Tildagon's radio doesn't reliably support
-            # channel re-scanning post-boot (CHANGELOG / Epic 5 Q6), so
-            # this is a TOFU-only reset; the channel stays the same.
+            # Rescan: TOFU-only reset. The Tildagon's radio doesn't
+            # reliably support channel re-scanning post-boot (Q6), so the
+            # channel stays the same.
             self._tofu.clear()
             print("[nocturnation] TOFU lock cleared by operator")
             self._close_settings()
@@ -1145,9 +807,8 @@ class NocturNationApp(app.App):
         elif idx == 6:
             self._close_settings()
             return
-        # Persist after every change. If the save fails we keep the
-        # in-memory change so the UI is consistent; the next save
-        # attempt (next change) tries again.
+        # If save fails we keep the in-memory change so the UI is
+        # consistent; next change retries.
         try:
             self._settings.save()
         except Exception as exc:
@@ -1155,26 +816,20 @@ class NocturNationApp(app.App):
         self._rebuild_settings_menu()
 
     def _settings_back(self) -> None:
-        """Menu back handler - CANCEL while menu is open."""
         self._close_settings()
 
     def _apply_calm_mode(self) -> None:
-        """Push the current Calm Mode setting to both renderers."""
         on = self._settings.calm_mode
         self._renderer.set_calm_mode(on)
         self._lcd_renderer.set_calm_mode(on)
         if not on:
-            # Switching into Full mode - clear the LCD wash so it
-            # starts from black at the next dispatch rather than
-            # holding any stale envelope.
+            # Switching into Full mode - clear the LCD wash so it starts
+            # from black at the next dispatch rather than holding stale.
             self._lcd_renderer.clear()
 
     def _start_repeater(self) -> None:
-        """Epic 17 B2: instantiate the dynamic-repeater FSM if Repeat=AUTO.
-
-        Registers the ESP-NOW broadcast peer for TX. Wires the FSM to
-        _repeater_observer so every admitted frame reaches its FSM.
-        No-op when Repeat=OFF or the radio isn't up.
+        """Instantiate the dynamic-repeater FSM if Repeat=AUTO. No-op
+        when Repeat=OFF or the radio isn't up.
         """
         if self._settings.repeat != "AUTO":
             self._fsm = None
@@ -1185,27 +840,23 @@ class NocturNationApp(app.App):
         try:
             self._esp.add_peer(BROADCAST_MAC)
         except OSError:
-            # Peer already registered from a prior session; add_peer is
-            # not otherwise idempotent on this MicroPython build.
+            # add_peer isn't otherwise idempotent on this MicroPython build.
             pass
         esp_ref = self._esp
 
         def _relay_send(payload):
-            # esp_ref captured at start; if _esp is later cleared we
-            # still send here - but the FSM is torn down at _stop_repeater
-            # before the radio is released, so this closure only fires
-            # while _esp is live.
+            # esp_ref captured at start; the FSM is torn down at
+            # _stop_repeater before the radio is released, so this
+            # closure only fires while _esp is live.
             esp_ref.send(BROADCAST_MAC, payload)
 
         def _relay_random(lo, hi):
             return random.randint(lo, hi)
 
         now = time.ticks_ms() if time is not None else 0
-        # skip_tx=True when the IRQ path is available: the mp_sched
-        # handler already TX'd the relay at ~5 ms latency (vs the
-        # ~85 ms async poll baseline). FSM still runs bookkeeping so
-        # peer detection + cooldown timers stay accurate. Falls back
-        # to async-only TX when irq() wasn't installable.
+        # skip_tx=True when IRQ is installed: the mp_sched handler
+        # already TX'd. FSM still runs bookkeeping so peer detection +
+        # cooldown timers stay accurate.
         self._fsm = DynamicRepeater(
             _relay_send, _relay_random, now_ms=now,
             on_relay_state_change=_relay_state_change_cb,
@@ -1216,8 +867,7 @@ class NocturNationApp(app.App):
               "%s)" % (", IRQ fast relay" if _espnow_irq_installed else ""))
 
     def _stop_repeater(self) -> None:
-        """Epic 17 B2: tear down the FSM. Idempotent - safe to call in
-        any state, including when the FSM was never instantiated."""
+        # Idempotent - safe to call in any state.
         if self._fsm is not None:
             print("[nocturnation] dynamic repeater disarmed "
                   "(relayed=%d peer-seen=%d)" %
@@ -1226,13 +876,7 @@ class NocturNationApp(app.App):
         self._repeater_observer = None
 
     def _render_perimeter(self) -> None:
-        """Advance perimeter LED envelopes and push to hardware.
-
-        Called every UI frame (~20 Hz). The renderer.tick() callback fans
-        out to tildagonos.leds[i] = (r, g, b); we then commit with a
-        single tildagonos.leds.write() rather than after each set, so the
-        ring updates atomically.
-        """
+        # Commit with a single leds.write() so the ring updates atomically.
         if tildagonos is None or time is None:
             return
         now_ms = time.ticks_ms()
@@ -1243,13 +887,10 @@ class NocturNationApp(app.App):
             self._renderer.tick(now_ms, set_led)
             leds.write()
         except Exception as exc:
-            # Don't let a hardware glitch take down the app's update loop.
+            # Don't let a hardware glitch take down the update loop.
             print("[nocturnation] perimeter render failed: %s" % exc)
-        # Phase 1 hop-0 paint-delta bench (_BENCH_HOP0). Emit a PT line
-        # the FIRST render tick after each new LIGHT_PULSE dispatch;
-        # clear the key so subsequent ticks of the same envelope don't
-        # re-log. Delta between the RX ticks and PT ticks (same device
-        # clock) is that frame's paint delay.
+        # Emit a [BENCH-PT] line the first render tick after each
+        # LIGHT_PULSE dispatch, then clear the key.
         if _BENCH_HOP0 and self._bench_dispatched_key is not None:
             key = self._bench_dispatched_key
             print("[BENCH-PT] src=%d seq=%d ticks=%d delay_ms=%d"
@@ -1258,7 +899,6 @@ class NocturNationApp(app.App):
             self._bench_dispatched_key = None
 
     def draw(self, ctx) -> None:
-        # Settings menu owns the entire screen when it is open.
         if self._settings_open and self._settings_menu is not None:
             if clear_background is not None:
                 clear_background(ctx)
@@ -1267,73 +907,40 @@ class NocturNationApp(app.App):
             self._settings_menu.draw(ctx)
             return
 
-        # Help screen (QR code) owns the screen when open.
         if self._help_open:
             self._draw_help(ctx)
             return
 
-        # Idle: the start menu owns the screen.
         if self._mode == "idle":
             self._draw_idle(ctx)
             return
 
-        # Director mode: the active Show owns the screen (or an overlay).
         if self._mode == "director":
             self._draw_director(ctx)
             return
 
-        # Epic 15 bench follow-up. When the operator has toggled debug
-        # ON in Settings, the Lume LCD is taken over by a diagnostic
-        # readout: last-heartbeat freshness, current hop count, hb/10s,
-        # lock label. Bypasses the normal background-image + wash +
-        # text layers because diagnostic clarity beats aesthetics
-        # during a range test. Re-toggle OFF to restore the regular
-        # Lume LCD behaviour.
+        # Debug overlay owns the screen when enabled - bypasses the
+        # background image + wash + text layers.
         if self._mode == "lume" and self._settings.debug_mode:
             self._draw_debug_overlay(ctx)
             return
 
-        # Background: layered, with DirID-keyed image (Epic 13 Phase 2A)
-        # as the lowest layer when available.
-        #
-        # The image layer is keyed off the current TOFU lock. As the
-        # badge re-locks to a different Director, ``bg_images.load_for_dir_id``
-        # caches the next image; an unknown DirID falls back to a
-        # bundled default logo, and missing default means "no image,
-        # paint the solid colour underneath as before".
-        # Epic 13 Phase 2A: DirID-keyed background image (JPG) via
-        # the documented ctx.image() API. The Tildagon Ctx reference
-        # at https://tildagon.badge.emfcamp.org/tildagon-apps/reference/ctx/
-        # documents image(path, x, y, w, h) as the supported path
-        # for displaying JPG/PNG files; Ctx caches the decoded image
-        # internally by path so we can call it every frame without
-        # re-decoding.
-        #
-        # If no image is resolvable (no DirID-specific file, no
-        # default.jpg) we fall through to the pre-Epic-13 solid
-        # wash colour.
+        # DirID-keyed background image (JPG). Ctx caches by path so we
+        # can call it every frame without re-decoding. Unknown DirID
+        # falls back to default.jpg; missing default = paint solid wash
+        # colour underneath.
         bg_path = bg_images.path_for_dir_id(self._tofu.locked_id)
         if bg_path is not None:
             ctx.image(bg_path, -120, -120, 240, 240)
         else:
-            # Pulse wash if Full mode is on and there's an active
-            # envelope; otherwise black (Calm Mode keeps the LCD
-            # quiet so the badge stays comfortable face-distance).
             bg_r, bg_g, bg_b = self._lcd_background_rgb01()
             ctx.rgb(bg_r, bg_g, bg_b).rectangle(-120, -120, 240, 240).fill()
 
-        # Epic 13: once we've locked to a Director, the Lume LCD is
-        # a content surface (mirrors the StickC's "LCD is content in
-        # Lume" role per project memory). Suppress the diagnostic
-        # HUD - brand mark / channel / frame count would be noise
-        # against operator-paced text content, and the gaps between
-        # explicit text cues (e.g. between lyric lines, or before the
-        # @ShowSongInfo card fires) shouldn't surface the HUD either.
-        # The wash background is the only visual during those gaps.
-        # NO SIGNAL still surfaces as a small footer because radio
-        # liveness matters even when a lyric is on the screen.
-        # The HUD remains shown when scanning / unlocked so the
-        # operator can confirm the badge is hunting for a Director.
+        # Once locked, the LCD is a content surface (mirrors StickC's
+        # "LCD is content in Lume" role). Suppress the diagnostic HUD -
+        # would be noise against operator-paced text content. NO SIGNAL
+        # still surfaces as a small footer because radio liveness
+        # matters even when a lyric is on the screen.
         if self._tofu.is_locked():
             now_ms_local = time.ticks_ms() if time is not None else 0
             if self._lume_text_renderer.has_content():
@@ -1356,8 +963,6 @@ class NocturNationApp(app.App):
 
         ctx.font_size = 12
         ctx.move_to(0, -20).text(self._status)
-        # Channel + TOFU lock status. Composed by format_lock_label so
-        # the Director and Lume use the same `C:nn` / `P:nn` convention.
         ctx.move_to(0, 0).text(
             format_lock_label(
                 channel=self._scanner.current_channel,
@@ -1365,16 +970,9 @@ class NocturNationApp(app.App):
                 tofu_locked_id=self._tofu.locked_id,
             )
         )
-        # Frame count + FSM state deliberately not drawn on the
-        # searching / unlocked Lume screen (2026-07-12): punters see
-        # a clean tagline + channel/lock status. Both stay available
-        # on the operator Debug Overlay (_draw_debug_overlay) where
-        # LISTEN / REPEAT / CDOWN belong.
 
-        # NO SIGNAL overlay (Block 6) takes precedence over the RGB
-        # triplet line: it answers the more important "is the Director
-        # alive?" question. Shown in dimmed red so it doesn't compete
-        # with the brand mark at the top.
+        # NO SIGNAL overlay takes precedence over the RGB triplet: it
+        # answers the more important "is the Director alive?" question.
         if time is not None and self._signal_tracker.is_lost(time.ticks_ms()):
             ctx.rgb(0.6, 0.1, 0.1)
             ctx.font_size = 18
@@ -1388,63 +986,25 @@ class NocturNationApp(app.App):
             f = self._last_frame
             ctx.move_to(0, 45).text("rgb %02x%02x%02x" % (f.r, f.g, f.b))
 
-        # Version line, tucked just below the brand title so it reads
-        # as "NocturNation vN.N.N" in a two-line stack. Value read once
-        # at module import from metadata.json (see _APP_VERSION); tracks
-        # whatever the on-badge manifest declares. Placed above the
-        # tagline / channel stack so the round display can't clip it -
-        # earlier position at y=105 sat on the edge of the visible arc.
+        # Version line above the tagline so the round display can't clip
+        # it - earlier position at y=105 sat on the edge of the visible arc.
         ctx.font_size = 12
         ctx.move_to(0, -33).text("v%s" % _APP_VERSION)
 
-        # Button-hint footer. Tildagon convention: C = select (CONFIRM),
-        # F = back (CANCEL). The mapping is fixed by the frontboard and
-        # apps don't override it; printing the hint inline so the
-        # operator doesn't have to remember which physical button does
-        # what.
+        # Tildagon convention: C = select, F = back.
         ctx.font_size = 10
         ctx.move_to(0, 85).text("C: settings   F: exit")
 
     def _draw_debug_overlay(self, ctx) -> None:
-        """Epic 15 bench follow-up: diagnostic readout for repeat-mode
-        + range testing.
+        """Diagnostic readout for repeat-mode + range testing.
 
-        Layout (top to bottom, large fonts for outdoor readability):
-          1. Lock label - format_lock_label returns "ch N P:nn" so
-             channel is encoded here (no separate channel line).
-          2. Last frame age - "Last: 0.4s" prominent; this is the
-             diagnostic the operator watches as they walk away from
-             the Director.
-          3. Frames per 10s - total traffic rate (LIGHT_PULSE + WASH
-             + heartbeats). More useful than just heartbeats since
-             real shows fire 4-8 LIGHT_PULSEs/sec at peak.
-          4. Hop count + live meter of further hops also reaching
-             us. "Hop: N (a b ...)" where N is the most recent
-             admitted frame's hop, and (a b ...) lists each hop
-             level GREATER than N that has been seen in this
-             session. Examples:
-                Hop: 0 ()      direct only - no relay observed
-                Hop: 0 (1 2)   direct latest, but relay-and-relay
-                               -of-relay frames have also arrived
-                Hop: 1 (2)     latest was via one repeater, double-
-                               relay frames are also reaching us
-             Empty parens after a known-relaying repeater has been
-             firing = relay TX isn't reaching us.
-          5. Total frames received this session.
-          6. Footer: how to exit.
-
-        Background tints by signal health (Last-frame-age band):
-
-          age < 1.2 s  -> green tint (healthy)
-          1.2 - 2.0 s  -> amber tint (degraded)
-          age > 2.0 s  -> red tint (lost or about to be)
-
-        Text colour adjusts per band to keep contrast:
-          green/red bg -> white text
-          amber bg     -> black text (yellow + white is unreadable
-                          in bright daylight at arm's length)
+        Layout top-to-bottom (large fonts for outdoor readability):
+        lock label, last frame age (prominent), frames/10s, hop count +
+        live meter of higher hops seen, FSM state (if Repeat=AUTO).
+        Background tints green/amber/red by last-frame-age band; text
+        colour swaps to keep contrast on amber.
+        See docs/tildagon-history.md for the design.
         """
-        # Compute the health band from the last-frame age.
         if time is None or self._last_frame_ms == 0:
             band = "unknown"
             age_ms = -1
@@ -1459,12 +1019,13 @@ class NocturNationApp(app.App):
             else:
                 band = "red"
 
-        # Backgrounds tuned for outdoor visibility; text colour matches.
         if band == "green":
             bg_r, bg_g, bg_b = 0.0, 0.5, 0.0
             fg = (1.0, 1.0, 1.0)
             dim = (0.85, 1.0, 0.85)
         elif band == "amber":
+            # Black text on amber - yellow + white unreadable in bright
+            # daylight at arm's length.
             bg_r, bg_g, bg_b = 0.9, 0.6, 0.0
             fg = (0.0, 0.0, 0.0)
             dim = (0.2, 0.15, 0.0)
@@ -1481,7 +1042,6 @@ class NocturNationApp(app.App):
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
 
-        # Lock label (includes "ch N" prefix).
         ctx.rgb(*fg)
         ctx.font_size = 20
         ctx.move_to(0, -85).text(
@@ -1492,9 +1052,7 @@ class NocturNationApp(app.App):
             )
         )
 
-        # Last frame age - the prominent diagnostic. "0.4s" format
-        # (1/10 s precision is what the operator can perceive while
-        # walking; ms is too noisy).
+        # 1/10 s precision is what the operator can perceive while walking.
         ctx.font_size = 26
         if age_ms < 0:
             ctx.move_to(0, -45).text("Last: --")
@@ -1502,17 +1060,12 @@ class NocturNationApp(app.App):
             ctx.move_to(0, -45).text("Last: %d.%ds" % (age_ms // 1000,
                                                        (age_ms % 1000) // 100))
 
-        # Frames per 10 s.
         ctx.font_size = 22
         fr_per_10s = len(self._frame_window)
         ctx.move_to(0, -10).text("Fr/10s: %d" % fr_per_10s)
 
-        # Hop count + live meter of further relay hops also reaching
-        # us. "Hop: N (a b ...)" where (a b ...) are the hop levels
-        # GREATER than N that have been observed in this session.
-        # Direct + multi-hop relay simultaneously visible reads as
-        # "Hop: 0 (1 2)"; a corner-side Lume hearing only relays
-        # reads as "Hop: 1 (2)" or similar. Empty parens after a
+        # "Hop: N (a b ...)" where (a b ...) are hop levels GREATER than
+        # N observed in this session. Empty parens after a
         # known-relaying repeater has been firing = relay TX isn't
         # reaching us.
         ctx.font_size = 18
@@ -1527,12 +1080,6 @@ class NocturNationApp(app.App):
                 "Hop: %d (%s)" % (self._last_hop_count, higher_seen)
             )
 
-        # Epic 17 B3: dynamic-repeater state, prominent state label
-        # + relayed / peer-seen counters underneath. Absent when
-        # Repeat=OFF (FSM not instantiated). Replaces the pre-Epic-17
-        # "Tot: N" row - total-frames count wasn't materially useful
-        # in the field vs the FSM state which is the primary
-        # diagnostic during a bench walk-out.
         if self._fsm is not None:
             ctx.rgb(*fg)
             ctx.font_size = 20
@@ -1544,20 +1091,15 @@ class NocturNationApp(app.App):
                                   self._fsm.peer_seen_count)
             )
         else:
-            # Repeat=OFF: fall back to the pre-Epic-17 Tot: readout so
-            # the space isn't blank on non-repeater devices.
             ctx.rgb(*dim)
             ctx.font_size = 18
             ctx.move_to(0, 60).text("Tot: %d" % self._frame_count)
 
-        # Footer hint.
         ctx.rgb(*fg)
         ctx.font_size = 14
         ctx.move_to(0, 95).text("C: toggle off")
 
     def _draw_idle(self, ctx) -> None:
-        """Idle screen: the start menu (Lume / Director / Settings /
-        Quit). WiFi is up here; no radio session is running."""
         if clear_background is not None:
             clear_background(ctx)
         else:
@@ -1574,9 +1116,6 @@ class NocturNationApp(app.App):
             ctx.move_to(0, 20).text("starting...")
 
     def _draw_help(self, ctx) -> None:
-        """Render the cached QR matrix as black modules on white, centred
-        in the round LCD, with the URL caption beneath. Pattern from the
-        shkspr.mobi Tildagon QR article."""
         # QR codes need a light background; white the whole screen.
         ctx.rgb(1, 1, 1).rectangle(-120, -120, 240, 240).fill()
         m = self._help_matrix
@@ -1590,11 +1129,8 @@ class NocturNationApp(app.App):
             ctx.move_to(0, 15).text(self._settings.help_url)
             return
         qr_size = len(m)
-        # The round 240 px screen inscribes a ~170 px square (240/sqrt2),
-        # and a QR's corner finder patterns must stay on-screen to scan -
-        # so floor the module size to keep the whole code within 170 px
-        # (the blog's "+1" can overshoot for longer URLs and clip the
-        # corners under the bezel).
+        # Round 240 px screen inscribes a ~170 px square. Floor the
+        # module size so corner finder patterns stay on-screen.
         pixel_size = max(1, int(170 / qr_size))
         code_px = pixel_size * qr_size
         offset = -120 + (240 - code_px) / 2
@@ -1606,10 +1142,8 @@ class NocturNationApp(app.App):
                         (col * pixel_size) + offset,
                         (row * pixel_size) + offset,
                         pixel_size, pixel_size).fill()
-        # URL caption just below the code's bottom edge (the QR carries
-        # its own quiet-zone margin). Sitting it right under the code
-        # keeps it where the round screen is still wide enough to show
-        # the full text, rather than down at the narrow bottom chord.
+        # Caption below the code's bottom edge - keeps it where the round
+        # screen is still wide enough for the full text.
         ctx.rgb(0, 0, 0)
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
@@ -1617,9 +1151,6 @@ class NocturNationApp(app.App):
         ctx.move_to(0, (offset + code_px) + 8).text(self._settings.help_url)
 
     def _draw_director(self, ctx) -> None:
-        """Director mode draw: an open overlay owns the screen; otherwise
-        the active Show paints via on_render()."""
-        # Overlay (picker / per-Show settings) owns the screen.
         if self._director_overlay is not None:
             if clear_background is not None:
                 clear_background(ctx)
@@ -1638,9 +1169,8 @@ class NocturNationApp(app.App):
             ctx.move_to(0, 0).text("No shows")
             return
 
-        # Hand the live ctx to the Show's drawing surface, then let it
-        # paint. A crashing Show must not take the UI down with it - this
-        # is a system boundary (third-party Show code).
+        # Third-party Show code is a system boundary - a crashing Show
+        # must not take the UI down with it.
         self._display.set_ctx(ctx)
         try:
             show.on_render(self._controller.active_context)
@@ -1653,18 +1183,9 @@ class NocturNationApp(app.App):
             ctx.move_to(0, 0).text("show error")
             print("[nocturnation] show on_render failed: %s" % exc)
 
-        # Director TX heartbeat pip. Drawn last so a Show that clears
-        # its own background can't wipe it. Positioned inside the round
-        # 240-diameter display: (60, -85) with 10x10 size keeps all four
-        # corners under radius 105, well inside the 120 visible arc.
-        # Previous position (95, -110) landed at radius 145 - completely
-        # off-screen. Colour by age of the last successful esp.send():
-        #   < 200 ms  bright green   (a frame just went out)
-        #   < 2000 ms dim green      (recent TX; healthy heartbeat cadence)
-        #   >= 2000 ms or never      red (TX stalled - Q6, radio fault,
-        #                                 or Show emits nothing)
-        # 2 s outer threshold matches the 1 Hz heartbeat cadence
-        # (dispatcher.heartbeat_tick) with margin.
+        # TX heartbeat pip. Drawn last so a Show that clears its own
+        # background can't wipe it. (60, -85) keeps it inside the round
+        # 240 display; 2 s outer threshold matches the 1 Hz heartbeat.
         if time is not None:
             now_pip_ms = time.ticks_ms()
             if self._director_last_tx_ms is None:
@@ -1686,26 +1207,21 @@ class NocturNationApp(app.App):
         """ESP-NOW receive loop: auto-scan, lock, then receive forever.
 
         Per protocol manual section 5.3 the Lume tries channel 11 first
-        (suggested show channel) then channel 1 (hobby), each for ~2 s,
-        repeating until a valid frame arrives. After lock, receive runs
-        on the locked channel until the app is killed.
+        then channel 1, each for ~2 s, repeating until a valid frame
+        arrives. After lock, receive runs on the locked channel until
+        the app is killed.
 
         Fallback: if the badge's networking layer rejects channel
-        changes on STA_IF (observed: RuntimeError 0xffffffff), we skip
-        auto-scan and listen on whichever channel the radio is already
-        on. The operator must align Director + Tildagon channels manually
-        in that case.
+        changes on STA_IF, we skip auto-scan and listen on whichever
+        channel the radio is already on.
         """
         if espnow is None or network is None or asyncio is None:
             self._status = "no radio module"
             print("[nocturnation] required modules unavailable; receive disabled")
             return
 
-        # Session loop (Epic 6B). In idle we hold no radio and leave WiFi
-        # up (the operator is in the start menu / connected). On entering
-        # a mode we take the radio (wifi.stop + ESP-NOW); on returning to
-        # idle we release it and restore WiFi. So WiFi is only down while
-        # a Lume / Director session is actively running.
+        # Session loop: idle -> WiFi up, no radio; mode -> take radio
+        # (wifi.stop + ESP-NOW); back to idle -> release and restore.
         while True:
             if self._mode == "idle":
                 self._release_radio()
@@ -1713,7 +1229,6 @@ class NocturNationApp(app.App):
                 continue
             self._acquire_radio()
             if self._wlan is None:
-                # Acquire failed; drop back to idle rather than spin.
                 self._mode = "idle"
                 await asyncio.sleep_ms(200)
                 continue
@@ -1724,10 +1239,9 @@ class NocturNationApp(app.App):
             await asyncio.sleep_ms(20)
 
     def _acquire_radio(self) -> None:
-        """Take the radio for ESP-NOW: stop the badge WiFi manager (so the
-        ESP32 firmware stops channel-sweeping for an AP - the B9 root
-        cause), bring the STA up, and activate ESP-NOW. Idempotent while
-        held. Resets the scanner + TOFU so each session starts fresh."""
+        """Take the radio for ESP-NOW: stop the badge WiFi manager (or
+        the ESP32 firmware keeps channel-sweeping for an AP), bring STA
+        up, activate ESP-NOW. Idempotent while held."""
         if self._radio_held:
             return
         if _badge_wifi is not None:
@@ -1739,66 +1253,44 @@ class NocturNationApp(app.App):
         try:
             self._wlan = network.WLAN(network.STA_IF)
             self._wlan.active(True)
-            # Epic 15: switch the PHY to ESP-NOW Long Range mode.
-            # Halves the bitrate (500 kbps vs 1 Mbps) in exchange for
-            # 2.5-7x open-air range. Fleet-wide commitment - LR-only
-            # peers cannot decode standard 802.11b/g/n peers, so every
-            # Director and Lume must enable this together.
-            # Integer 8 = WIFI_PROTOCOL_LR in ESP-IDF v5.x. We pass it
-            # as a raw int rather than network.WLAN.PROTOCOL_LR because
-            # the badge's MicroPython (5114f2c-dirty, March 2024 base)
-            # has the protocol setter but not the named LR constant;
-            # the setter accepts any int and forwards to esp_wifi_set_
-            # protocol() which knows the value. Bench-confirmed
-            # 2026-06-27: wlan.config(protocol=8) succeeds and
-            # wlan.config("protocol") reads back 8.
+            # protocol=8 = WIFI_PROTOCOL_LR. Fleet-wide commitment - LR
+            # peers can't decode standard 802.11b/g/n peers, so every
+            # Director + Lume must enable this together. Raw int because
+            # this MicroPython build has the setter but not the named
+            # LR constant. See docs/tildagon-history.md.
             try:
                 self._wlan.config(protocol=8)
             except Exception as exc:
                 print("[nocturnation] wlan.config(protocol=8/LR) failed: %s" % exc)
-            # Disable Wi-Fi modem power-save. Per the MicroPython espnow
-            # docs ("ESPNow and Wifi Operation"), the STA defaults to a
-            # duty-cycled PM mode that sleeps through short ESP-NOW
-            # bursts (the Director sends 2x retransmits within ~2 ms;
-            # was 3x pre-Epic-15), so receivers must set PM_NONE for
-            # reliable receive. This raises idle current; any future
-            # light-sleep work must keep the radio awake for heartbeat
-            # windows or this bug returns. Older firmware may not
-            # expose `pm`; swallow the error so acquisition still
-            # proceeds.
+            # PM_NONE needed or the STA sleeps through short ESP-NOW
+            # bursts (Director sends 2x retransmits within ~2 ms).
+            # Raises idle current; any future light-sleep work must keep
+            # the radio awake for heartbeat windows or this bug returns.
             try:
                 self._wlan.config(pm=network.WLAN.PM_NONE)
             except Exception as exc:
                 print("[nocturnation] wlan.config(pm=PM_NONE) failed: %s" % exc)
             if self._esp is None:
                 self._esp = espnow.ESPNow()
-            # Bump the receive buffer up from the default (~526 bytes,
-            # ~13 messages) before activation. High-rate effects (Rainbow
-            # at 10 Hz + 2x StickC redundant TX = 20 msg/s; per-beat
-            # sparkles at 8+ Hz likewise) can outrun our ~12 Hz poll
-            # baseline. When the queue fills, some MicroPython builds
-            # stop delivering entirely - symptom is a burst of correct
-            # renders followed by a hard cut. 8 KB gives ~200 messages
-            # of headroom, comfortable for any traffic pattern we'd send.
+            # Default rxbuf ~526 B (~13 msg) is too small: high-rate
+            # effects (Rainbow at 10 Hz * 2x TX = 20 msg/s) fill it and
+            # some MicroPython builds then stop delivering entirely.
+            # 8 KB gives ~200 msg headroom.
             try:
                 self._esp.config(rxbuf=8192)
             except Exception as exc:
                 print("[nocturnation] espnow.config(rxbuf) failed: %s" % exc)
             self._esp.active(True)
-            # Pre-allocate the IRQ fast-path buffers before installing
-            # the handler. Once irq() is set, the callback can fire on
-            # the next message arrival, so these must exist first.
+            # Pre-allocate IRQ fast-path buffers before installing the
+            # handler - once irq() is set the callback can fire on the
+            # next message arrival.
             global _pending_msgs, _relay_send_buffer
             if _pending_msgs is None:
                 _pending_msgs = []
             if _relay_send_buffer is None:
                 _relay_send_buffer = bytearray(32)   # protocol max frame
-            # Install IRQ-context handler. Handles arrival timestamping
-            # (PR #31), drain-into-_pending_msgs (PR #35), and fast-
-            # relay TX when the FSM is elected (this PR). Older
-            # MicroPython builds without irq() degrade to the async
-            # poll path - _try_recv falls back to esp.recv() when the
-            # pending list is empty.
+            # Older MicroPython builds without irq() degrade to the
+            # async poll path - _try_recv falls back to esp.recv().
             global _espnow_irq_installed
             if not _espnow_irq_installed:
                 try:
@@ -1812,10 +1304,8 @@ class NocturNationApp(app.App):
             print("[nocturnation] radio acquire failed: %s" % exc)
             self._wlan = None
             return
-        # Fresh scan / lock / signal state for this session. Resetting
-        # the signal tracker means a re-entered session starts in the
-        # truthful NO SIGNAL state rather than carrying a stale
-        # last-frame timestamp from before the previous _release_radio.
+        # Reset per-session state so re-entry starts in truthful NO
+        # SIGNAL rather than carrying a stale last-frame timestamp.
         self._scanner = self._make_scanner()
         self._tofu.clear()
         self._signal_tracker.reset()
@@ -1823,21 +1313,14 @@ class NocturNationApp(app.App):
         self._dbg_radio("acquire")
 
     def _bounce_radio(self) -> bool:
-        """Cycle STA_IF active state so the next wlan.config(channel=N)
-        call becomes a fresh first-config-after-active (Q6 workaround).
+        """Cycle STA_IF active so the next wlan.config(channel=N) call
+        becomes a fresh first-config-after-active (Q6 workaround).
 
-        Cheaper than _release_radio + _acquire_radio because it skips the
-        badge_wifi restore/stop cycle and does NOT reset the scanner /
-        TOFU / signal-tracker state - those must survive across an
-        auto-scan's channel rotations. Long-range PHY + PM_NONE need
-        to be re-applied because active(False) throws them away; the
-        ESP-NOW peer table survives the wlan cycle in practice (bench-
-        verified 2026-07-12) but we bounce esp.active around it for
-        safety in case a future MicroPython build tightens the coupling.
-
-        Returns True on success. False on hard exception - the caller
-        should bail out of the scan rather than spin forever on a broken
-        radio.
+        Cheaper than _release_radio + _acquire_radio because it skips
+        the badge_wifi restore/stop and does NOT reset scanner / TOFU /
+        signal-tracker (which must survive across scan rotations). LR
+        PHY + PM_NONE need re-applying because active(False) throws
+        them away. See docs/tildagon-history.md.
         """
         if self._wlan is None:
             return False
@@ -1865,7 +1348,6 @@ class NocturNationApp(app.App):
             return False
 
     def _release_radio(self) -> None:
-        """Release ESP-NOW and hand WiFi back to the OS. Idempotent."""
         if not self._radio_held:
             return
         try:
@@ -1879,24 +1361,16 @@ class NocturNationApp(app.App):
         print("[nocturnation] radio released; WiFi restored")
 
     def _make_scanner(self):
-        """Build the ChannelScanner from the persisted Channel setting.
-
-        "1" / "11" pin a single channel - no scan cycling, so the radio
-        stays put and can't mis-lock onto a neighbour that bleeds a
-        stray frame in (the B9 channel-6 bug). "auto" uses the full
-        11 -> 1 -> 6 scan order.
-        """
+        # A pinned channel keeps the radio put so it can't mis-lock onto
+        # a neighbour that bleeds a stray frame in.
         ch = self._settings.channel
         if ch == "1":
             return ChannelScanner(order=(1,))
         if ch == "11":
             return ChannelScanner(order=(11,))
-        return ChannelScanner()  # "auto" -> default SCAN_ORDER (11, 1, 6)
+        return ChannelScanner()
 
     async def _lume_session(self, wlan) -> None:
-        """Receive session. A pinned channel ("1"/"11") sets the radio
-        once and locks immediately; "auto" runs the scan state machine.
-        Returns when the mode leaves 'lume'."""
         pinned = self._settings.channel in ("1", "11")
         if pinned:
             ch = int(self._settings.channel)
@@ -1910,9 +1384,8 @@ class NocturNationApp(app.App):
             print("[nocturnation] channel pinned to %d (no auto-scan)" % ch)
             self._dbg_radio("pin-%d" % ch)
         elif not await self._scan_until_locked(wlan):
-            # Auto-scan bailed because channel-set failed mid-scan. The
-            # radio is on whichever channel was last successfully set,
-            # or on the platform default if none succeeded.
+            # Auto-scan bailed because channel-set failed. The radio is
+            # on whichever channel was last successfully set.
             if self._receive_channel is not None:
                 self._status = "ch %d (no-scan)" % self._receive_channel
                 print(
@@ -1923,28 +1396,18 @@ class NocturNationApp(app.App):
                 self._status = "no-scan"
                 print("[nocturnation] auto-scan unavailable; listening on default channel")
 
-        # Epic 17 B2: instantiate the dynamic-repeater FSM if Repeat=AUTO.
-        # Register the ESP-NOW broadcast peer once so the FSM's send_fn
-        # can TX relay frames. add_peer is idempotent-with-OSError; we
-        # swallow the error the same way the Director-side make_sender
-        # does.
         self._start_repeater()
 
         await self._receive_loop()
 
-        # Tear down the FSM on Lume-session exit so a subsequent Director
-        # session doesn't inherit stale state and the observer hook goes
-        # back to None (no-op path).
+        # Tear down so a subsequent Director session doesn't inherit
+        # stale state.
         self._stop_repeater()
 
     async def _director_session(self, wlan) -> None:
         """Director transmit session: build the runtime, claim the
-        hobby channel, then poll the IMU + tick the active Show +
-        render the perimeter until the mode changes.
-
-        Note (bench): this is exercised end-to-end only on hardware
-        (Epic 6B B9). The orchestration it drives - DirectorController,
-        RenderDispatcher, ImuAdapter - is host-tested.
+        hobby channel, then poll IMU + tick the active Show + render the
+        perimeter until the mode changes.
         """
         self._ensure_director()
         if self._controller is None or not self._controller.show_ids():
@@ -1952,15 +1415,9 @@ class NocturNationApp(app.App):
             self._stop_to_idle()
             return
 
-        # Hard guard: a Tildagon must never broadcast as Director on a
-        # forbidden channel (channel 11 is the commercial / show band,
-        # reserved for Performance-range Directors with random-per-boot
-        # source IDs - a Tildagon swarm transmitting there at EMF would
-        # compete with the orchestrator's StickC Director). Today
-        # DIRECTOR_CHANNEL is hardcoded to 1 so this gate is belt-and-
-        # braces; if the constant ever drifts to 11 (settings injection,
-        # fork divergence, future bug), we refuse to acquire the radio
-        # and return to idle. Logged so it's visible at the console.
+        # Hard guard against Director TX on forbidden channels. Today
+        # DIRECTOR_CHANNEL is 1 so this is belt-and-braces; catches
+        # accidental drift (settings injection, fork divergence).
         if DIRECTOR_CHANNEL in DIRECTOR_FORBIDDEN_TX_CHANNELS:
             print(
                 "[nocturnation] director TX refused on forbidden channel %d "
@@ -1971,20 +1428,12 @@ class NocturNationApp(app.App):
             self._stop_to_idle()
             return
 
-        # Q6 workaround: the badge's STA_IF layer only honours the FIRST
-        # wlan.config(channel=N) call after each active(True) - subsequent
-        # channel-sets raise RuntimeError 0xffffffff. If we arrived here
-        # via a prior Lume session, that first-config slot was already
-        # spent on the auto-scan's channel 11, so the config(channel=1)
-        # below would silently fail: the try/except catches the exception,
-        # the log line prints, and the Director then broadcasts on ch 11
-        # (invisible to Lumes: StickC's tofu_lock filters community-range
-        # source_ids on ch 11, Tildagon's DIRECTOR_FORBIDDEN check already
-        # rules out ch 11 as a design channel). Bounce STA_IF active state
+        # Q6 workaround: if we arrived via a prior Lume session, that
+        # first-config slot was already spent on the scan's channel 11,
+        # so config(channel=1) below would silently fail and the
+        # Director would broadcast on ch 11. Bounce STA_IF active state
         # so ch 1 becomes the fresh first-config after active(True).
-        # Matches the Lume-scan bounce mechanism - lighter than
-        # _release_radio + _acquire_radio and preserves _esp identity so
-        # the dispatcher's send_fn closure stays valid.
+        # See docs/tildagon-history.md.
         if not self._bounce_radio():
             print("[nocturnation] director: radio bounce failed; back to idle")
             self._status = "no radio"
@@ -1992,22 +1441,18 @@ class NocturNationApp(app.App):
             return
 
         # ESP-NOW peer table is wiped by esp.active(False) inside the
-        # bounce. make_sender only registers the broadcast peer ONCE
-        # (during _ensure_director at first Director entry), so heartbeat
-        # sends after the bounce would raise "peer not found" and the
-        # exception would silently drop the frame. Re-add the peer here.
-        # Idempotent-with-OSError, matching make_sender's pattern.
+        # bounce. make_sender registered the broadcast peer ONCE during
+        # _ensure_director, so heartbeat sends after the bounce would
+        # raise "peer not found" and the exception would silently drop
+        # the frame. Re-add here; idempotent-with-OSError.
         if self._esp is not None:
             try:
                 self._esp.add_peer(BROADCAST_MAC)
             except OSError:
-                # Peer already registered (some MicroPython builds
-                # preserve peers across active-cycle). No-op path.
                 pass
             except Exception as exc:
                 print("[nocturnation] director: peer re-add failed: %s" % exc)
 
-        # Director transmits on the hobby channel only (Epic 5.5).
         try:
             wlan.config(channel=DIRECTOR_CHANNEL)
             self._receive_channel = DIRECTOR_CHANNEL
@@ -2018,11 +1463,9 @@ class NocturNationApp(app.App):
             self._stop_to_idle()
             return
 
-        # Readback verify: if the actual radio channel doesn't match
-        # DIRECTOR_CHANNEL, refuse to broadcast rather than silently TX
-        # on the wrong channel. Best-effort - some MicroPython builds
-        # don't support config("channel") with a positional arg; a
-        # readback exception is logged but doesn't block the session.
+        # Readback verify: refuse to broadcast rather than silently TX
+        # on the wrong channel. Best-effort; some MicroPython builds
+        # don't support config("channel") readback.
         try:
             actual_ch = wlan.config("channel")
             if actual_ch != DIRECTOR_CHANNEL:
@@ -2036,8 +1479,8 @@ class NocturNationApp(app.App):
         except Exception as exc:
             print("[nocturnation] director channel readback unsupported: %s" % exc)
 
-        # Reset the heartbeat pip so a stale timestamp from a prior
-        # Director session doesn't paint green before the first TX.
+        # Reset the pip so a stale timestamp from a prior Director
+        # session doesn't paint green before the first TX.
         self._director_last_tx_ms = None
 
         self._controller.enter()
@@ -2045,27 +1488,21 @@ class NocturNationApp(app.App):
         self._status = "director"
 
         poll_ms = 5
-        imu_interval_ms = 20     # ~50 Hz IMU poll - matches how the
-                                 # tap/motion detector was tuned (a
-                                 # faster poll lets the gravity EMA
-                                 # erode tap transients).
+        # ~50 Hz IMU poll matches how the tap/motion detector was tuned
+        # (faster lets the gravity EMA erode tap transients).
+        imu_interval_ms = 20
         render_interval_ms = 50  # ~20 Hz perimeter tick
         now0 = time.ticks_ms() if time is not None else 0
         last_imu = now0
         last_render = now0
         while self._mode == "director":
             now = time.ticks_ms() if time is not None else 0
-            # Beacon a 1 Hz HEARTBEAT (skip-if-recent) so Lumes can
-            # discover the channel and keep their TOFU lock between
-            # taps. Runs even while an overlay is open - the Director
-            # stays discoverable while the operator navigates menus.
+            # 1 Hz HEARTBEAT (skip-if-recent) so Lumes discover the
+            # channel and keep TOFU lock between taps. Runs even while
+            # an overlay is open.
             if time is not None:
                 self._dispatcher.heartbeat_tick(now)
-            # When an overlay (picker / per-Show settings) is open it
-            # owns the screen and input; the Show pauses.
             if self._director_overlay is None:
-                # IMU tap-to-beat at ~50 Hz (button tap is polled in
-                # update()).
                 if time is not None and ticks_diff(now, last_imu) >= imu_interval_ms:
                     self._controller.poll_inputs(now, button_pressed=None)
                     last_imu = now
@@ -2077,14 +1514,12 @@ class NocturNationApp(app.App):
 
         self._controller.exit()
 
-    # =====================================================================
-    # Director runtime + overlays (Epic 6B B6b)
-    # =====================================================================
+    # ---------------------------------------------------------------------
+    # Director runtime + overlays
+    # ---------------------------------------------------------------------
 
     def _ensure_director(self) -> None:
-        """Build the Director runtime once: discover Shows, wire the
-        render dispatcher (broadcast + local loopback), the IMU + button
-        input adapters, and the controller. Idempotent."""
+        """Build the Director runtime once. Idempotent."""
         if self._controller is not None:
             return
         try:
@@ -2097,11 +1532,8 @@ class NocturNationApp(app.App):
         if self._esp is not None:
             try:
                 raw_send_fn = make_sender(self._esp)
-                # Wrap the sender so we can stamp _director_last_tx_ms
-                # on every successful send. The stamp drives the LCD
-                # heartbeat pip in _draw_director. Failure to send
-                # doesn't advance the stamp - pip stays cold if the
-                # radio's silently failing.
+                # Wrap the sender to stamp _director_last_tx_ms on every
+                # successful send - drives the LCD heartbeat pip.
                 def _pip_send(payload):
                     raw_send_fn(payload)
                     if time is not None:
@@ -2116,7 +1548,7 @@ class NocturNationApp(app.App):
             perimeter=self._renderer,
             lcd=self._lcd_renderer,
             source_id=DIRECTOR_SOURCE_ID,
-            redundancy=3,  # ESP-NOW is lossy; match the M5 master's 3x TX
+            redundancy=3,   # ESP-NOW is lossy; match M5 master's 3x TX
         )
         clock = time.ticks_ms if time is not None else (lambda: 0)
         self._director_host = DirectorHost(
@@ -2147,9 +1579,6 @@ class NocturNationApp(app.App):
             print("[nocturnation] settings save failed: %s" % exc)
 
     def _bind_display(self) -> None:
-        """Point the active Show's ShowContext at the shared CtxDisplay
-        so on_render() can draw. Called after entry and after a Show
-        change."""
         if self._controller is None:
             return
         ctx = self._controller.active_context
@@ -2229,9 +1658,8 @@ class NocturNationApp(app.App):
         pd = self._dir_settings_defs[idx]
         ctx = self._controller.active_context
         cur = ctx.get_property(pd.key)
-        # set_property clamps + persists + notifies the Show.
         ctx.set_property(pd.key, self._cycle_prop(pd, cur))
-        self._build_dir_settings_menu()  # refresh labels
+        self._build_dir_settings_menu()
 
     def _close_dir_settings(self) -> None:
         # A sensitivity edit only takes effect once re-pushed to the IMU
@@ -2272,7 +1700,7 @@ class NocturNationApp(app.App):
             step = span // 8 if span >= 8 else 1
             nxt = cur + step
             return lo if nxt > hi else nxt
-        # COLOUR isn't cyclable from a single-button menu; leave as-is.
+        # COLOUR isn't cyclable from a single-button menu.
         return cur
 
     def _close_overlay(self) -> None:
@@ -2283,15 +1711,13 @@ class NocturNationApp(app.App):
                 pass
         self._director_overlay = None
         self.button_states.clear()
-        # Drop any edge state so a button still held when the overlay
-        # closes doesn't immediately re-trigger.
+        # Drop edge state so a button still held when the overlay closes
+        # doesn't immediately re-trigger.
         self._dir_buttons.reset()
 
     def _dbg_radio(self, where) -> None:
-        """Log the actual radio channel + WiFi association vs the app's
-        belief. The crux of the B9 channel mystery: if wlan reports a
-        different channel than the scanner thinks, the channel-set is
-        being silently overridden (WiFi association pins it)."""
+        # If wlan reports a different channel than the scanner thinks,
+        # the channel-set is being silently overridden.
         if not _DEBUG or self._wlan is None:
             return
         try:
@@ -2314,7 +1740,6 @@ class NocturNationApp(app.App):
                  self._tofu.locked_id))
 
     def _dbg_frame(self, where, buf, frame, admitted) -> None:
-        """Log one received frame: raw head, magic check, parse + admit."""
         if not _DEBUG:
             return
         n = len(buf)
@@ -2334,26 +1759,16 @@ class NocturNationApp(app.App):
 
         Returns True if a channel was locked normally (a valid frame
         arrived). Returns False if channel-set is rejected by the
-        platform - the caller should then drop into receive without
-        having locked a specific channel.
+        platform - the caller drops into receive without a locked channel.
         """
         listen_ms = self._scanner.listen_ms
         poll_ms = 50
-        # Tagline shown on the searching / unlocked Lume screen. Users
-        # who launched the app straight into Lume mode without a
-        # Director in earshot see this until a frame arrives.
         self._status = "Open-source crowd lighting"
 
-        # Q6 workaround: the badge's STA_IF only honours the FIRST
-        # wlan.config(channel=N) call after each wlan.active(True), so
-        # subsequent scan targets in a single session used to fail with
-        # RuntimeError 0xffffffff and the scanner froze on the first
-        # channel (usually 11). Bouncing STA_IF active(False)/active(True)
-        # around every non-first channel-set resets that counter, letting
-        # the SCAN_ORDER (11 -> 1 -> 6) actually rotate. Skip the bounce
-        # on the first iteration because _acquire_radio just brought the
-        # STA up - the first config call is already a fresh
-        # first-config-after-active.
+        # Q6 workaround: bounce STA_IF around every non-first channel-set
+        # so SCAN_ORDER actually rotates (11 -> 1 -> 6). Skip on first
+        # iteration - _acquire_radio just brought the STA up so the
+        # first config call is a fresh first-config-after-active.
         first_iter = True
         while not self._scanner.is_locked and self._mode == "lume":
             ch = self._scanner.current_channel
@@ -2366,33 +1781,22 @@ class NocturNationApp(app.App):
             try:
                 wlan.config(channel=ch)
             except Exception as exc:
-                # STA_IF still rejects the config even after a bounce -
-                # something deeper is wrong. Fall back to receive on
-                # whichever channel was last successfully set (often
-                # the first scan target). This preserves the pre-Q6-
-                # workaround behaviour as the ultimate fallback.
+                # STA_IF still rejects even after a bounce - fall back
+                # to receive on whichever channel was last successfully
+                # set.
                 self._status = "ch %d err" % ch
                 print("[nocturnation] wlan.config(channel=%d) failed: %s" % (ch, exc))
                 return False
 
-            # Channel set succeeded - remember it so the fallback path
-            # can tell the operator which channel to align to.
             self._receive_channel = ch
 
             print("[nocturnation] scanning channel %d for %d ms" % (ch, listen_ms))
-            # Read back the ACTUAL radio channel: if it differs from `ch`,
-            # the channel-set was silently overridden (WiFi association).
             self._dbg_radio("scan-set-%d" % ch)
             elapsed = 0
             while elapsed < listen_ms:
                 buf, arrival_ms = self._try_recv()
                 if buf is not None:
                     frame = parse_admittable(buf)
-                    # TOFU + cross-range gate (Epic 5.5 B6). A frame
-                    # that fails the gate (e.g. community-range id
-                    # on ch 11) is dropped silently; the channel
-                    # remains in scan because no eligible Director
-                    # was found on it.
                     now_ms = time.ticks_ms() if time is not None else 0
                     admitted = (frame is not None
                                 and self._tofu.admit(frame, ch, now_ms))
@@ -2400,8 +1804,7 @@ class NocturNationApp(app.App):
                     if admitted:
                         # Dedup check post-admit so the debug overlay
                         # sees relayed dups (hop_count visible) while
-                        # rendering still skips them. See _observe_frame
-                        # for the is_duplicate contract.
+                        # rendering still skips them.
                         is_dup = self._dedup.seen(frame.source_id,
                                                   frame.sequence_number)
                         self._observe_frame(frame, is_duplicate=is_dup,
@@ -2419,19 +1822,16 @@ class NocturNationApp(app.App):
         return True
 
     async def _receive_loop(self) -> None:
-        # Block 6: perimeter LEDs continue animating when the app is
-        # backgrounded (architecture spec section 7.3). We tick the
-        # renderer from this loop rather than from update() so the
-        # cadence is the same in both states. update() is foreground-
-        # only by Tildagon contract; this loop runs always.
+        # Tick renderer from this loop, not update() (update is
+        # foreground-only by Tildagon contract), so perimeter LEDs
+        # continue animating when the app is backgrounded.
         poll_ms = 5
         render_interval_ms = 50  # ~20 Hz perimeter tick
         last_render_ms = 0 if time is None else time.ticks_ms()
         last_dbg_ms = last_render_ms
-        # Bench: watch for asyncio-scheduler stalls (MicroPython GC pause,
-        # radio state churn, etc.) that could slip envelope start times
-        # between two badges by tens or hundreds of ms. Poll cadence is
-        # 5 ms; anything >= 25 ms is a stall worth noting.
+        # Watch for asyncio-scheduler stalls (GC pause etc.) that could
+        # slip envelope start times between two badges. Poll cadence is
+        # 5 ms; anything >= 25 ms is a stall worth logging.
         last_poll_ms = last_render_ms
         while self._mode == "lume":
             if _BENCH_HOP0 and time is not None:
@@ -2441,30 +1841,20 @@ class NocturNationApp(app.App):
                     print("[BENCH-GAP] ticks=%d gap_ms=%d"
                           % (now_poll, gap))
                 last_poll_ms = now_poll
-            # Drain up to N frames per iteration (was: 1). At the ~85 ms
-            # poll baseline we were only reading one message per poll,
-            # so any pattern above ~12 msg/s (e.g. Rainbow at 10 Hz *
-            # 2x redundant TX = 20 msg/s) would back the espnow rxbuf
-            # up and eventually stop delivering. Draining until empty
-            # (capped at 16 per iteration so a broken sender can't
-            # starve the render/asyncio path) keeps the queue flowing.
+            # Drain up to N frames per iteration - a single-drain path
+            # backs the rxbuf up under high-rate effects. Cap at 16 so a
+            # broken sender can't starve the render/asyncio path.
             drain_limit = 16
             for _ in range(drain_limit):
                 buf, arrival_ms = self._try_recv()
                 if buf is None:
                     break
                 frame = parse_admittable(buf)
-                # TOFU + cross-range gate (Epic 5.5 B6). Drops frames
-                # from non-locked source_ids and community-range ids
-                # on channel 11.
                 now_ms = time.ticks_ms() if time is not None else 0
                 admitted = (frame is not None
                             and self._tofu.admit(frame, self._receive_channel, now_ms))
                 self._dbg_frame("rx", buf, frame, admitted)
                 if admitted:
-                    # Dedup check post-admit so the debug overlay
-                    # sees relayed dups (hop_count visible) while
-                    # rendering still skips them. See _observe_frame.
                     is_dup = self._dedup.seen(frame.source_id,
                                               frame.sequence_number)
                     self._observe_frame(frame, is_duplicate=is_dup,
@@ -2481,56 +1871,39 @@ class NocturNationApp(app.App):
                                 frame.target_group,
                             )
                         )
-            # Periodic radio-state log: reveals whether the actual radio
-            # channel drifts from what the app believes (B9 debug).
             if _DEBUG and time is not None:
                 now = time.ticks_ms()
                 if ticks_diff(now, last_dbg_ms) >= 2000:
                     self._dbg_radio("rx-loop")
                     last_dbg_ms = now
-            # Expire the TOFU lock on extended silence. The signal_tracker
-            # already shows NO SIGNAL on a 3 s gap; the TOFU timeout is
-            # the longer 10 s threshold that decides "give up on this
-            # Director and treat the next frame as a fresh lock".
+            # TOFU lock expiry (10 s silence) - longer than the 3 s
+            # NO SIGNAL threshold.
             if time is not None and self._tofu.tick(time.ticks_ms()):
                 print("[nocturnation] TOFU lock expired; ready to relock")
-            # Signal-loss fallback transitions. Evaluated every poll
-            # tick so the 10 s / 40 s edges fire promptly without
-            # waiting for an inbound frame (which is the whole point -
-            # they fire BECAUSE no frames are coming).
+            # Fallback state machine evaluated every poll so the
+            # 10 s / 40 s edges fire promptly without waiting for an
+            # inbound frame (which is the whole point - they fire
+            # BECAUSE no frames are coming).
             if time is not None:
                 self._evaluate_fallback(time.ticks_ms())
-            # Epic 17: dynamic-repeater FSM peer-watch expiry. Runs at
-            # every poll tick so the LISTENING → CANDIDATE trigger fires
-            # on the 100 ms deadline even when no new frame arrives.
+            # FSM peer-watch expiry every poll so LISTENING -> CANDIDATE
+            # fires on the 100 ms deadline even when no new frame
+            # arrives.
             if self._fsm is not None and time is not None:
                 self._fsm.tick(time.ticks_ms())
-            # Tick the perimeter. Two triggers:
-            #   1. Fresh pulse-family dispatch this iteration (any of
-            #      LIGHT_PULSE / LIGHT_WASH_PULSE _observe_frame paths
-            #      set self._render_force_paint). Bypasses the 20 Hz
-            #      gate so colour transitions become visible within one
-            #      poll cadence of dispatch on every device - critical
-            #      for cross-Lume sync under high-cadence show traffic
-            #      (Rainbow, DMX bridge, per-beat sparkles at DnB
-            #      tempos).
-            #   2. 20 Hz idle cadence for envelope decay smoothing
-            #      between arrivals (attack/release ramps on
-            #      Test Pulse / Fade / sparkles).
-            # The settings menu, if open, skips both (menu owns the
-            # screen visually and our LEDs stay dark).
+            # Perimeter tick: fires on either force-paint (fresh
+            # pulse-family dispatch this iteration) or 20 Hz idle
+            # cadence for envelope decay smoothing. Settings menu owns
+            # the screen when open.
             if time is not None and not self._settings_open:
                 now = time.ticks_ms()
                 if (self._render_force_paint
                         or ticks_diff(now, last_render_ms) >= render_interval_ms):
                     self._render_perimeter()
                     self._render_force_paint = False
-                    # Fleet render-tick anchor. If an arrival stamped
-                    # _render_snap_ms during this iteration, anchor
-                    # future ticks to that shared physical instant
-                    # rather than to now (which drifts per device).
-                    # Falls back to now when nothing arrived, so ticks
-                    # keep firing at 20 Hz on pure-local schedule.
+                    # Snap the tick anchor to arrival_ms if a frame
+                    # landed this iteration - keeps subsequent renders
+                    # on a shared reference across the fleet.
                     if self._render_snap_ms is not None:
                         last_render_ms = self._render_snap_ms
                         self._render_snap_ms = None
@@ -2542,25 +1915,16 @@ class NocturNationApp(app.App):
         """Non-blocking ESP-NOW recv. Returns (msg_bytes, arrival_ms) or
         (None, None).
 
-        Two drain paths in preference order:
-          1. _pending_msgs list, filled by _espnow_irq_handler at
-             mp_sched latency (~5 ms after physical arrival). This is
-             the hot path when irq() is installed - the IRQ handler
-             has already stamped the arrival time AND (if the FSM
-             is in a relay-eligible state) TX'd the relay frame.
-          2. Direct self._esp.recv(0). Fallback for MicroPython
-             builds where irq() couldn't be installed, or the rare
-             case where the IRQ handler missed a message.
-
-        arrival_ms comes from peers_table[host][1] (raw ESP-IDF C
-        callback stamp) preferentially, then _espnow_last_arrival_ms
-        (mp_sched stamp), then poll-time.
+        Preferred drain path is _pending_msgs (filled by
+        _espnow_irq_handler at mp_sched latency ~5 ms after physical
+        arrival); fallback to esp.recv(0) for MicroPython builds where
+        irq() couldn't be installed. arrival_ms comes from
+        peers_table[host][1] (raw ESP-IDF C-callback stamp)
+        preferentially, then _espnow_last_arrival_ms (mp_sched stamp),
+        then poll-time.
         """
-        # IRQ-drained path first.
         if _pending_msgs is not None and len(_pending_msgs) > 0:
             host, msg, irq_arrival = _pending_msgs.pop(0)
-            # Prefer peers_table's C-callback stamp if we can get it;
-            # else use the mp_sched stamp captured at IRQ time.
             arrival = irq_arrival
             try:
                 entry = self._esp.peers_table.get(host)
@@ -2571,24 +1935,12 @@ class NocturNationApp(app.App):
             return bytes(msg), arrival
         if self._esp is None:
             return None, None
-        # Tildagon espnow.recv(timeout_ms) returns (mac, msg). A zero
-        # timeout returns immediately if no frame is pending.
         try:
             host, msg = self._esp.recv(0)
         except OSError:
             return None, None
         if msg is None:
             return None, None
-        # Arrival-time source, in preferred order:
-        #   1. self._esp.peers_table[host][1] -- updated in the ESP-IDF
-        #      receive callback (raw C context, earliest possible stamp).
-        #      This is what emfcamp/badge-2024-software's EspNowService
-        #      uses; see modules/system/espnow/service.py background_task.
-        #   2. _espnow_last_arrival_ms -- stamped in our mp_sched IRQ
-        #      handler; slightly later than #1 because it's scheduled
-        #      from the main loop rather than the raw callback.
-        #   3. time.ticks_ms() poll-time stamp -- worst case, matches
-        #      pre-PR#31 behaviour.
         arrival = None
         try:
             entry = self._esp.peers_table.get(host)
@@ -2606,9 +1958,7 @@ class NocturNationApp(app.App):
     # -- Signal-loss fallback wash ----------------------------------
 
     def _emit_fallback_wash_start(self, now_ms):
-        """Synthesise the calm blue/purple cycle wash + push it to
-        both perimeter and LCD renderers as if it had arrived from the
-        Director. Local dispatch only - never broadcast."""
+        # Local dispatch only - never broadcast.
         f = make_light_wash_frame(
             target_class=0, target_group=0,
             r1=FALLBACK_COLOUR_A[0], g1=FALLBACK_COLOUR_A[1], b1=FALLBACK_COLOUR_A[2],
@@ -2623,10 +1973,6 @@ class NocturNationApp(app.App):
         print("[nocturnation] FALLBACK wash start (blue/purple cycle)")
 
     def _emit_fallback_wash_fade(self, now_ms):
-        """Begin the ~25.5 s fade-to-black phase of the fallback. u8
-        release_time caps the fade duration at the wash state machine's
-        ceiling; functionally equivalent to the 30 s the operator
-        asked for to the eye."""
         f = make_light_wash_end_frame(
             target_class=0, target_group=0,
             release_time=FALLBACK_FADE_TICKS,
@@ -2636,9 +1982,8 @@ class NocturNationApp(app.App):
         print("[nocturnation] FALLBACK fade-to-black begin")
 
     def _emit_fallback_wash_recovery(self, now_ms):
-        """Short, sharp fade-out when the Director comes back so the
-        returning wash/pulse traffic isn't competing with the
-        synthetic baseline."""
+        # Short fade-out when Director returns so its wash/pulse traffic
+        # isn't competing with the synthetic baseline.
         f = make_light_wash_end_frame(
             target_class=0, target_group=0,
             release_time=FALLBACK_RECOVERY_TICKS,
@@ -2648,10 +1993,6 @@ class NocturNationApp(app.App):
         print("[nocturnation] FALLBACK wash recovery (signal returned)")
 
     def _evaluate_fallback(self, now_ms):
-        """Drive the fallback state machine off the SignalTracker's
-        elapsed-since-last-frame value. Called once per receive-loop
-        iteration so the transitions are bench-deterministic regardless
-        of inbound traffic cadence."""
         if self._signal_tracker._last_frame_ms is None:
             return   # cold boot, never seen a Director
         age = ticks_diff(now_ms, self._signal_tracker._last_frame_ms)
@@ -2665,51 +2006,28 @@ class NocturNationApp(app.App):
 
     def _observe_frame(self, frame, is_duplicate=False, raw_buf=None,
                        arrival_ms=None) -> None:
-        # Epic 15 bench follow-up: diagnostic state updates on EVERY
-        # admitted frame, including duplicates. This is what lets the
-        # debug overlay show Hop:1 when a relayed frame arrives even
-        # if it's a dup of a direct hop:0 we already rendered. Without
-        # this, the operator couldn't tell whether the relay path was
-        # alive (dup-filtered relays + healthy direct path looked the
-        # same as no-relay).
-        #
-        # is_duplicate=True skips the render dispatch (LIGHT_PULSE /
-        # WASH / TEXT_DISPLAY) so duplicates don't double-fire on the
-        # output surfaces - that's still the dedup contract.
+        # Runs for EVERY admitted frame, including dedup-duplicates, so
+        # the debug overlay can see relayed dups (Hop:1 when a relayed
+        # frame arrives even if it's a dup of a direct hop:0 we already
+        # rendered). Render dispatch is gated below by is_duplicate.
         self._frame_count += 1
         self._last_frame = frame
-        # Render-tick fleet alignment. Every admitted frame (including
-        # duplicates, LIGHT_WASH, and HEARTBEAT) is a shared physical
-        # event both this device and every other Lume saw at the same
-        # wall-clock instant (within ~1 ms via peers_table). Snapping
-        # the perimeter tick anchor to arrival_ms keeps subsequent
-        # renders on a shared reference across the fleet - so envelope
-        # progression frames land at approximately the same moments on
-        # every Tildagon, not each device's independent "local
-        # ticks_ms() paint phase". HEARTBEAT arrivals cover quiet
-        # stretches when no LIGHT_PULSE would otherwise re-anchor.
+        # Snap the render anchor to arrival_ms - every admitted frame
+        # is a shared physical event across the fleet. HEARTBEAT
+        # arrivals cover quiet stretches when no LIGHT_PULSE would
+        # otherwise re-anchor.
         if arrival_ms is not None:
             self._render_snap_ms = arrival_ms
-        # Epic 17 B1: notify the repeater FSM (if wired). Fires for
-        # BOTH first-seen and duplicate admitted frames - the FSM needs
-        # duplicates because a peer's relay of (src, seq) arriving after
-        # ours is a dedup-duplicate but the load-bearing peer signal.
+        # Notify the FSM (if wired). Fires for both first-seen AND
+        # duplicate admitted frames - the FSM needs duplicates because
+        # a peer's relay of (src, seq) arriving after ours is a
+        # dedup-duplicate but the load-bearing peer signal.
         if self._repeater_observer is not None:
             obs_now = time.ticks_ms() if time is not None else None
             self._repeater_observer(frame, is_duplicate, obs_now, raw_buf)
-        # Epic 15 bench follow-up: capture per-frame diagnostics for
-        # the debug overlay. hop_count from every admitted frame
-        # (0 = direct from Director, 1+ = via one or more repeaters).
-        # _last_frame_ms drives the prominent "Last: N.Ns" readout +
-        # the green/amber/red signal-health background band. The 10 s
-        # window tracks every frame (LIGHT_PULSE + LIGHT_WASH +
-        # heartbeats) so frames/10s reflects total traffic rather
-        # than just the 1 Hz heartbeat baseline.
         self._last_hop_count = frame.hop_count
-        # Live-meter per-hop tally - any True at hop>=1 is cast-iron
-        # proof a relay path reached us during this session. Clamp
-        # defensively (hop>3 is dropped by parse_admittable already,
-        # but better robust than crash on a garbage frame).
+        # Clamp defensively (hop>3 is dropped by parse_admittable
+        # already, but better robust than crash on a garbage frame).
         if 0 <= frame.hop_count <= 3:
             self._hops_seen[frame.hop_count] = True
         if time is not None:
@@ -2724,22 +2042,19 @@ class NocturNationApp(app.App):
             now_hb = time.ticks_ms()
             self._last_heartbeat_ms = now_hb
             self._heartbeat_window.append(now_hb)
-            # Prune to the last 10 s. ticks_diff handles wrap-around;
-            # cheap linear walk because the window is at most ~12
-            # entries (heartbeat is 1 Hz, capped at 1 Hz nominal).
+            # ticks_diff handles wrap-around; cheap linear walk because
+            # the window is at most ~12 entries (heartbeat is 1 Hz).
             cutoff = 10_000
             while (self._heartbeat_window
                    and ticks_diff(now_hb, self._heartbeat_window[0]) > cutoff):
                 self._heartbeat_window.pop(0)
         # Every accepted frame counts as Director-alive proof for the
-        # NO SIGNAL detector, regardless of message type. Heartbeats
-        # are just as good as LIGHT_PULSEs here.
+        # NO SIGNAL detector, regardless of message type.
         if time is not None:
             now_ms_record = time.ticks_ms()
             self._signal_tracker.record_frame(now_ms_record)
-            # Cancel any fallback wash that was running. Short-release
-            # END fades the synthetic baseline out before the Director's
-            # returning traffic starts to compete with it.
+            # Short-release END fades the synthetic baseline out before
+            # the Director's returning traffic starts to compete.
             if self._fallback_active:
                 self._fallback_active = False
                 self._fallback_faded  = False
@@ -2748,30 +2063,24 @@ class NocturNationApp(app.App):
         if time is None:
             return
 
-        # Dedup gate (Epic 15 bench follow-up). Diagnostics above ran
-        # for every admitted frame; rendering only runs for non-dup
-        # frames so duplicates don't double-pulse the output surfaces.
-        # This is the same contract the old in-process_frame dedup
-        # provided, just moved one layer up so the debug overlay can
-        # see relayed dups.
+        # Dedup gate: rendering only runs for non-dup frames so
+        # duplicates don't double-pulse the output surfaces. Diagnostics
+        # above ran for every admitted frame so overlay sees relayed dups.
         if is_duplicate:
             return
 
         # Envelope start_ms comes from arrival_ms when the IRQ handler
-        # stamped it (PR #31 sync fix). Falls back to time.ticks_ms()
-        # here if the IRQ path isn't wired (older firmware) or the
-        # caller didn't pass one. Using the IRQ stamp decouples the
-        # visible pulse instant from the async-scheduler stalls that
-        # otherwise slip envelope start by 80-100 ms between two badges.
+        # stamped it. Using the IRQ stamp decouples the visible pulse
+        # instant from async-scheduler stalls that otherwise slip
+        # envelope start by 80-100 ms between two badges.
         if arrival_ms is not None and _espnow_irq_installed:
             now_ms = arrival_ms
         else:
             now_ms = time.ticks_ms()
 
         # HEARTBEAT and unknown / reserved-id frames just bump the frame
-        # counter without further per-surface dispatch. LIGHT_PULSE plus
-        # the LIGHT_WASH family (Epic 6C Phase G) are the routed types;
-        # Epic 13 adds TEXT_DISPLAY + CLEAR_SCREEN for display content.
+        # counter. LIGHT_PULSE + LIGHT_WASH family + TEXT_DISPLAY /
+        # CLEAR_SCREEN are the routed types.
         mt = frame.message_type
         if mt not in (MessageType.LIGHT_PULSE,
                        MessageType.LIGHT_WASH,
@@ -2781,13 +2090,10 @@ class NocturNationApp(app.App):
                        MessageType.CLEAR_SCREEN):
             return
 
-        # Epic 13 display family carries its own target_group on the
-        # payload rather than reusing the wash-family field. Apply the
-        # group filter against the right attribute and dispatch directly
-        # to the text renderer - no target_class routing (the message
-        # type IS the class signal). Done here before the wash-family
-        # target_class lookup so we don't accidentally fall through
-        # to a missing-class branch.
+        # Display family carries its own target_group (not the wash-
+        # family field). Apply the group filter against the right
+        # attribute; message type IS the class signal, so no
+        # target_class routing.
         if mt == MessageType.TEXT_DISPLAY:
             if frame.text_target_group != 0 \
                and frame.text_target_group != self._settings.group:
@@ -2801,24 +2107,20 @@ class NocturNationApp(app.App):
             self._lume_text_renderer.on_clear_screen(frame, now_ms)
             return
 
-        # Group filter per protocol manual section 4.2: target_group == 0
-        # is broadcast (every receiver fires); otherwise must match the
-        # operator-configured group exactly. A device whose own group is
-        # 0 only accepts broadcasts, which is what the default settings
-        # produce.
+        # Group filter per protocol manual section 4.2: target_group=0
+        # is broadcast; otherwise must match the operator-configured
+        # group exactly.
         if frame.target_group != 0 and frame.target_group != self._settings.group:
             return
-        # Per-surface class routing per Epic 5 Q1. Light-class commands
-        # arm the perimeter (wristband analogue); Screen-class arm the
-        # LCD; MultiLedScreen arms both; All targets both. Other
-        # classes (reserved) are silently dropped.
+        # Per-surface class routing: Light-class -> perimeter,
+        # Screen-class -> LCD, MultiLedScreen -> both, All -> both.
         cls = frame.target_class
 
         if mt == MessageType.LIGHT_PULSE:
             if _BENCH_HOP0 and cls in PERIMETER_CLASSES:
-                # Log receive-and-dispatch instant; the matching PT
-                # line arrives on the next _render_perimeter tick.
-                # Format is grepped by tools/bench_hop0_paint_delta.py.
+                # Log RX instant; matching PT line on next
+                # _render_perimeter tick. Format grepped by
+                # tools/bench_hop0_paint_delta.py.
                 print("[BENCH-RX] src=%d seq=%d hop=%d ticks=%d"
                       % (frame.source_id, frame.sequence_number,
                          frame.hop_count, now_ms))
@@ -2831,9 +2133,6 @@ class NocturNationApp(app.App):
             if cls in LCD_CLASSES:
                 self._lcd_renderer.dispatch(frame, now_ms)
         elif mt == MessageType.LIGHT_WASH:
-            # Tildagon is wash-capable on both surfaces (can_pulse +
-            # can_wash + can_overlay). Hand the wash to whichever
-            # surface(s) match the target class.
             if cls in PERIMETER_CLASSES:
                 self._renderer.on_light_wash(frame, now_ms)
             if cls in LCD_CLASSES:
@@ -2844,9 +2143,8 @@ class NocturNationApp(app.App):
             if cls in LCD_CLASSES:
                 self._lcd_renderer.on_light_wash_end(frame, now_ms)
         elif mt == MessageType.LIGHT_WASH_PULSE:
-            # The renderer's on_light_wash_pulse handler internally
-            # drops the frame if it has no active wash (per design),
-            # so the receive-side dispatch routes unconditionally.
+            # on_light_wash_pulse internally drops the frame if there's
+            # no active wash (per design), so route unconditionally.
             if cls in PERIMETER_CLASSES:
                 self._renderer.on_light_wash_pulse(frame, now_ms)
                 self._render_force_paint = True
@@ -2854,10 +2152,8 @@ class NocturNationApp(app.App):
                 self._lcd_renderer.on_light_wash_pulse(frame, now_ms)
 
     def _lcd_background_rgb01(self):
-        """Return (r, g, b) in 0..1 floats for ctx.rgb() to paint as the
-        screen background. Falls back to black if no wash is active or
-        the runtime time module isn't available (host tests).
-        """
+        # Falls back to black if no wash is active or the runtime time
+        # module isn't available (host tests).
         if time is None:
             return (0.0, 0.0, 0.0)
         wash = self._lcd_renderer.current_colour(time.ticks_ms())
