@@ -251,6 +251,7 @@ def _relay_state_change_cb(enabled, output_hop):
 
 _boot_mark("before nocturnation imports")
 
+# --- Lume-critical imports (always loaded at boot) --------------------
 from .nocturnation.channel_scan import ChannelScanner
 from .nocturnation.clock import ticks_diff
 from .nocturnation import images as bg_images
@@ -270,23 +271,39 @@ from .nocturnation.render import (
 from .nocturnation.settings import Settings
 from .nocturnation.signal_tracker import SignalTracker
 from .nocturnation.tofu import TofuLock, format_lock_label
-from .nocturnation.plugins import PropertyType
-from .nocturnation.shows import discover_shows, show_registry, InputAction
-from .nocturnation.director import (
-    DirectorController,
-    DirectorHost,
-    RenderDispatcher,
-    ImuAdapter,
-    ButtonTapSource,
-    DirectorButtonMapper,
-    IMU_ADAPTER_CAPS,
-    RESULT_OPEN_PICKER,
-    RESULT_OPEN_SETTINGS,
-)
-from .nocturnation.director.espnow_sender import make_sender, BROADCAST_MAC
 from .nocturnation.repeater import DynamicRepeater
 
 _boot_mark("nocturnation imports done")
+
+# --- Director/Shows/plugins: lazy-loaded on first Director-mode entry -
+# These names are bound at module scope by _load_director_symbols() the
+# first time a Director path runs. Every code path that references them
+# is gated behind _ensure_director (or downstream of it), which calls
+# the loader before use, so a boot straight into Lume never pays their
+# parse cost. Not a memory optimisation - a boot-time one.
+_LAZY_DIRECTOR_LOADED = False
+
+def _load_director_symbols():
+    global _LAZY_DIRECTOR_LOADED
+    global DirectorController, DirectorHost, RenderDispatcher, ImuAdapter
+    global ButtonTapSource, DirectorButtonMapper, IMU_ADAPTER_CAPS
+    global RESULT_OPEN_PICKER, RESULT_OPEN_SETTINGS
+    global make_sender
+    global discover_shows, show_registry
+    global PropertyType
+    if _LAZY_DIRECTOR_LOADED:
+        return
+    _boot_mark("lazy director imports start")
+    from .nocturnation.director import (
+        DirectorController, DirectorHost, RenderDispatcher, ImuAdapter,
+        ButtonTapSource, DirectorButtonMapper, IMU_ADAPTER_CAPS,
+        RESULT_OPEN_PICKER, RESULT_OPEN_SETTINGS,
+    )
+    from .nocturnation.director.espnow_sender import make_sender
+    from .nocturnation.shows import discover_shows, show_registry
+    from .nocturnation.plugins import PropertyType
+    _LAZY_DIRECTOR_LOADED = True
+    _boot_mark("lazy director imports done")
 
 
 # App version, read once from metadata.json. Fallback path list because
@@ -420,7 +437,8 @@ class NocturNationApp(app.App):
         self._dispatcher = None
         self._imu_adapter = None
         self._button_tap = None
-        self._dir_buttons = DirectorButtonMapper()
+        # Built lazily by _ensure_director; Director module isn't imported yet.
+        self._dir_buttons = None
         self._display = CtxDisplay()
         # TX heartbeat pip timestamp. Bumped on every successful
         # esp.send(); _draw_director paints a pip whose colour is
@@ -884,7 +902,7 @@ class NocturNationApp(app.App):
         if self._esp is None or espnow is None:
             return
         try:
-            self._esp.add_peer(BROADCAST_MAC)
+            self._esp.add_peer(_broadcast_mac_bytes)
         except OSError:
             # add_peer isn't otherwise idempotent on this MicroPython build.
             pass
@@ -894,7 +912,7 @@ class NocturNationApp(app.App):
             # esp_ref captured at start; the FSM is torn down at
             # _stop_repeater before the radio is released, so this
             # closure only fires while _esp is live.
-            esp_ref.send(BROADCAST_MAC, payload)
+            esp_ref.send(_broadcast_mac_bytes, payload)
 
         def _relay_random(lo, hi):
             return random.randint(lo, hi)
@@ -1493,7 +1511,7 @@ class NocturNationApp(app.App):
         # the frame. Re-add here; idempotent-with-OSError.
         if self._esp is not None:
             try:
-                self._esp.add_peer(BROADCAST_MAC)
+                self._esp.add_peer(_broadcast_mac_bytes)
             except OSError:
                 pass
             except Exception as exc:
@@ -1565,9 +1583,17 @@ class NocturNationApp(app.App):
     # ---------------------------------------------------------------------
 
     def _ensure_director(self) -> None:
-        """Build the Director runtime once. Idempotent."""
+        """Build the Director runtime once. Idempotent.
+
+        Also triggers the lazy Director/Shows import — see
+        _load_director_symbols. Boots that never touch Director never
+        pay the parse cost.
+        """
         if self._controller is not None:
             return
+        _load_director_symbols()
+        if self._dir_buttons is None:
+            self._dir_buttons = DirectorButtonMapper()
         try:
             discover_shows()
         except Exception as exc:
