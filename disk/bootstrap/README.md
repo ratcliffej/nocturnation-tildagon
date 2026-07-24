@@ -17,8 +17,9 @@ The V1 Flopagon EEPROM is **2 KB total**, holding:
 
 Realistic ceiling for `app.mpy` on V1: ~1.6 KB.
 
-**Current build:** 1304 bytes. Nathan's original Flopagon `app.mpy`
-(the mount/format helper) is 1528 bytes for reference.
+**Current build:** 1512 bytes (with `-O3`; 1633 without, which
+overflows). Nathan's original Flopagon `app.mpy` (the mount/format
+helper) is 1528 bytes for reference.
 
 The V2 Flopagon has an 8 KB EEPROM (identifiable by black PCB); more
 headroom but the same file must fit either variant, so we design to
@@ -40,10 +41,13 @@ badge inserts Flopagon
             2. init FLASH on config.pin[0] as CS (2-attempt retry on ValueError)
             3. vfs.mount(flash, "/disk")
             4. sys.path.append("/disk")
-            5. from installer.app import InstallerApp
+            5. from installer.app import __app_export__ as InstallerCls
             6. Bootstrap forwards draw/update/background_update to installer
-        <- InstallerApp.__init__ discovers DISK_MOUNT from __file__
+        <- DiskManagerApp.__init__ discovers its mount from __file__
            = "/disk", reads /disk/apps/*/disk.json, etc.
+
+The `__app_export__` indirection lets the installer class be renamed
+without touching the byte-budgeted bootstrap.
 ```
 
 On Flopagon removal, `Bootstrap.deinit()` propagates to the installer
@@ -129,8 +133,10 @@ this order:
 2. This bootstrap's `.mpy` overwrites Nathan's `app.mpy` on the EEPROM
    (steps above).
 3. Installer + at least one app copied onto the 16 MB flash:
-   - `/installer/{app.py, _fsutil.py, _manifest.py, __init__.py}`
+   - `/installer/{app.py, _jobs.py, _badge_apps.py, _fsutil.py,
+     _manifest.py, __init__.py}`
    - `/apps/<slug>/{app.py, disk.json, metadata.json, ...}`
 
-Phase 4 (provisioning script + docs) turns this into a repeatable
-one-command flow.
+**Prefer the one-shot script** — `disk/dev/provision_flopagon.sh`
+does steps 1-3 in one mpremote session (see the script header for
+details). The manual steps above are for recovery / debugging.
