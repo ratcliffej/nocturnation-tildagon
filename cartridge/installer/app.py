@@ -1,9 +1,9 @@
 """Flopagon cartridge installer app.
 
 Runs on the Tildagon after the EEPROM bootstrap (Phase 3) mounts the
-16 MB flash at CARTRIDGE_MOUNT and hands off to us. Enumerates the
-apps/ folders on the cartridge, shows a picker, and copies the chosen
-app(s) into /apps/ on the badge's internal filesystem.
+16 MB flash and hands off to us. Enumerates the apps/ folders on the
+cartridge, shows a picker, and copies the chosen app(s) into /apps/
+on the badge's internal filesystem.
 
 Flow:
     picker  ->  confirm  ->  installing  ->  done
@@ -12,8 +12,12 @@ Copy progress runs on background_update() so draw() keeps rendering
 one file at a time (a 51-file NocturNation install completes in ~2.5 s
 at the 20 Hz tick rate).
 
-Mount-path contract with Phase 3 bootstrap: both hardcode
-CARTRIDGE_MOUNT = "/cartridge". If either changes, both must.
+Mount path is discovered at import time from __file__ so we work
+wherever the bootstrap drops us:
+    installed as /X/installer/app.py -> we read /X/apps/*/
+This means Phase 3 can choose any mount path without a code change
+here, and the Phase 2 smoke test can stage under /apps/ (persistent
+across badge OS updates) instead of the root, which gets wiped.
 """
 
 import os
@@ -31,7 +35,19 @@ from system.scheduler.events import (
 from . import _fsutil as fsutil
 from . import _manifest as manifest
 
-CARTRIDGE_MOUNT = "/cartridge"
+
+def _discover_cartridge_mount():
+    # __file__ points at .../installer/app.py; the cartridge root is
+    # its grandparent. Falls back if __file__ is unavailable (some
+    # MicroPython frozen-module builds).
+    try:
+        installer_dir = __file__.rsplit("/", 1)[0]
+        return installer_dir.rsplit("/", 1)[0]
+    except (NameError, AttributeError):
+        return "/cartridge"
+
+
+CARTRIDGE_MOUNT = _discover_cartridge_mount()
 CARTRIDGE_APPS_DIR = CARTRIDGE_MOUNT + "/apps"
 BADGE_APPS_DIR = "/apps"
 

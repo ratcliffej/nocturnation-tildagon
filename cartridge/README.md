@@ -32,11 +32,16 @@ cartridge/
 
 ## Contract with the bootstrap
 
-Phase 3 mounts the Flopagon's 16 MB flash at `/cartridge` and adds it
-to `sys.path`. The installer expects that mount point to hold:
+Phase 3 mounts the Flopagon's 16 MB flash at whatever path it likes
+and adds it to `sys.path`. The installer discovers its own mount
+point at import time from `__file__` — installed as
+`<mount>/installer/app.py`, it reads `<mount>/apps/*/`. So the
+bootstrap can pick any mount path without a code change here.
+
+The mount is expected to hold:
 
 ```
-/cartridge/
+<mount>/
 ├── installer/       # this app
 └── apps/
     ├── nocturnation/
