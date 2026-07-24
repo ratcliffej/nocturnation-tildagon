@@ -431,9 +431,7 @@ class NocturNationApp(app.App):
         # LCD so the operator can align the Director Stick when
         # auto-scan is off.
         self._receive_channel = None
-        # Deferred to _load_lume_stack (Settings, PerimeterRenderer,
-        # LcdRenderer, LumeTextRenderer all require nocturnation.* imports
-        # that haven't run yet).
+        # Deferred to _load_lume_stack.
         self._settings = None
         self._scanner = None
         self._renderer = None
@@ -2151,17 +2149,13 @@ class NocturNationApp(app.App):
                     self._observe_frame(frame, is_duplicate=is_dup,
                                         raw_buf=buf,
                                         arrival_ms=arrival_ms)
-                    if frame.message_type == MessageType.LIGHT_PULSE:
-                        print(
-                            "[nocturnation] LIGHT r=%d g=%d b=%d cls=%d grp=%d"
-                            % (
-                                frame.r,
-                                frame.g,
-                                frame.b,
-                                frame.target_class,
-                                frame.target_group,
-                            )
-                        )
+                    # LIGHT trace fires per pulse (2-10 Hz at Director
+                    # rates). Gated behind _DEBUG so operator serial
+                    # console isn't flooded during a show.
+                    if _DEBUG and frame.message_type == MessageType.LIGHT_PULSE:
+                        print("[nocturnation] LIGHT r=%d g=%d b=%d cls=%d grp=%d"
+                              % (frame.r, frame.g, frame.b,
+                                 frame.target_class, frame.target_group))
             if _DEBUG and time is not None:
                 now = time.ticks_ms()
                 if ticks_diff(now, last_dbg_ms) >= 2000:
