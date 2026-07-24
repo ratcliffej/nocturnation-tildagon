@@ -2,54 +2,57 @@
 # cartridge/dev/smoke_deploy.sh
 #
 # Stage the Phase 2 installer + a synthetic "testapp" under
-# /apps/nocturnation_cartridge_smoke/ on the badge's internal
-# filesystem, so the installer can be validated in isolation before the
-# Phase 3 EEPROM bootstrap + Flopagon SPI mount get involved.
+# /apps/nocturnation_cartridge_smoke/ on the badge and register it as
+# a first-class badge app so the badge launcher can start it the
+# normal way. Avoids the REPL-based launch path, which hits a circular
+# import in system.eventbus / system.scheduler when the scheduler
+# hasn't gone through its normal boot init.
 #
-# Why under /apps/: badge OS updates wipe root-level user-created
-# directories. /apps/ persists across updates, so the smoke test
-# survives a reflash without a redeploy.
-#
-# What lands on the badge:
+# Layout on the badge:
 #   /apps/nocturnation_cartridge_smoke/
-#       metadata.json                 <- hidden:true keeps it out of launcher
+#       app.py           # thin wrapper: __app_export__ = InstallerApp
+#       __init__.py
+#       metadata.json    # visible in launcher as "Cartridge smoke test"
 #       installer/
 #           app.py, _fsutil.py, _manifest.py, __init__.py
 #       apps/
 #           testapp/
 #               app.py, cartridge.json, metadata.json
 #
-# The installer's CARTRIDGE_MOUNT is auto-discovered from __file__ at
-# import time, so instantiating InstallerApp() when installer.app is
-# imported from this path will look for apps at
-# /apps/nocturnation_cartridge_smoke/apps/*/.
+# CARTRIDGE_MOUNT in installer/app.py is discovered from __file__ at
+# import time, so it correctly reads
+# /apps/nocturnation_cartridge_smoke/apps/*/ without any config.
 #
-# From the badge REPL:
-#   >>> import sys
-#   >>> sys.path.append("/apps/nocturnation_cartridge_smoke")
-#   >>> from installer.app import InstallerApp
-#   >>> from system.scheduler.events import RequestStartAppEvent
-#   >>> from system.eventbus import eventbus
-#   >>> eventbus.emit(RequestStartAppEvent(InstallerApp()))
+# Workflow:
+#   1. Run this script (deploys + resets the badge).
+#   2. On the badge launcher, tap "Cartridge smoke test".
+#   3. Picker should list "Cartridge test app v1.0.0" -> confirm.
+#   4. Progress bar + done screen.
+#   5. Cancel back to launcher; verify "Cartridge test app" now shows.
+#   6. Optional: soft-reboot and confirm it survives.
+#   7. ./cartridge/dev/smoke_deploy.sh --cleanup when done.
 #
 # Usage:
-#   ./cartridge/dev/smoke_deploy.sh              # stage + print launch instructions
+#   ./cartridge/dev/smoke_deploy.sh              # deploy + reset
+#   ./cartridge/dev/smoke_deploy.sh --no-reset   # deploy, skip reset
 #   ./cartridge/dev/smoke_deploy.sh --cleanup    # wipe smoke folders + old /cartridge
 #   ./cartridge/dev/smoke_deploy.sh --help
 
 set -euo pipefail
 
 MODE=deploy
+RESET=1
 for arg in "$@"; do
     case "$arg" in
         --cleanup) MODE=cleanup ;;
+        --no-reset) RESET=0 ;;
         --help|-h) MODE=help ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
 
 if [[ "$MODE" == help ]]; then
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 fi
 
@@ -58,11 +61,9 @@ cd "$REPO_ROOT"
 
 SMOKE_ROOT="/apps/nocturnation_cartridge_smoke"
 INSTALLED_TARGET="/apps/testapp"
-OLD_ROOT="/cartridge"   # left over from the pre-persistence smoke layout
+OLD_ROOT="/cartridge"   # left over from the pre-persistence layout
 
-if [[ "$MODE" == cleanup ]]; then
-    echo "[smoke] wiping ${SMOKE_ROOT}, ${INSTALLED_TARGET}, and ${OLD_ROOT}"
-    mpremote exec "
+RMTREE_PY="
 import os
 def rmtree(p):
     try:
@@ -75,10 +76,19 @@ def rmtree(p):
         os.rmdir(p)
     except OSError:
         pass
+"
+
+if [[ "$MODE" == cleanup ]]; then
+    echo "[smoke] wiping ${SMOKE_ROOT}, ${INSTALLED_TARGET}, and ${OLD_ROOT}"
+    mpremote exec "${RMTREE_PY}
 rmtree('${SMOKE_ROOT}')
 rmtree('${INSTALLED_TARGET}')
 rmtree('${OLD_ROOT}')
 "
+    if [[ "$RESET" -eq 1 ]]; then
+        echo "[smoke] resetting badge"
+        mpremote reset
+    fi
     echo "[smoke] done"
     exit 0
 fi
@@ -86,19 +96,7 @@ fi
 # ------------------------------------------------------------------ deploy
 
 echo "[smoke] wiping any previous ${SMOKE_ROOT} + ${OLD_ROOT}"
-mpremote exec "
-import os
-def rmtree(p):
-    try:
-        for e in os.ilistdir(p):
-            path = p + '/' + e[0]
-            if e[1] & 0x4000:
-                rmtree(path)
-            else:
-                os.remove(path)
-        os.rmdir(p)
-    except OSError:
-        pass
+mpremote exec "${RMTREE_PY}
 rmtree('${SMOKE_ROOT}')
 rmtree('${OLD_ROOT}')
 "
@@ -119,18 +117,37 @@ for p in ('${SMOKE_ROOT}',
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-# metadata.json for the wrapper folder itself: hidden:true so it
-# doesn't appear in the badge launcher between smoke runs.
+# Wrapper app.py: makes the smoke folder a normal launcher-visible
+# badge app. Delegates to InstallerApp via __app_export__.
+cat > "$TMPDIR/wrapper_app.py" <<'PY_EOF'
+"""Smoke-test wrapper for the cartridge installer.
+
+Presents the installer as a normal badge app the launcher can start
+directly. Only used for Phase 2 dev; Phase 3 launches the installer
+through the EEPROM bootstrap instead.
+"""
+
+from .installer.app import InstallerApp
+
+__app_export__ = InstallerApp
+PY_EOF
+
+cat > "$TMPDIR/wrapper_init.py" <<'PY_EOF'
+# Wrapper package for the cartridge installer smoke test.
+PY_EOF
+
 cat > "$TMPDIR/wrapper_metadata.json" <<'JSON_EOF'
 {
     "name": "Cartridge smoke test",
-    "hidden": true,
+    "hidden": false,
     "version": "0.0.0"
 }
 JSON_EOF
 
-echo "[smoke] copying installer sources"
-mpremote cp "$TMPDIR/wrapper_metadata.json"  ":${SMOKE_ROOT}/metadata.json"
+echo "[smoke] copying wrapper + installer sources"
+mpremote cp "$TMPDIR/wrapper_app.py"          ":${SMOKE_ROOT}/app.py"
+mpremote cp "$TMPDIR/wrapper_init.py"         ":${SMOKE_ROOT}/__init__.py"
+mpremote cp "$TMPDIR/wrapper_metadata.json"   ":${SMOKE_ROOT}/metadata.json"
 mpremote cp cartridge/installer/app.py        ":${SMOKE_ROOT}/installer/app.py"
 mpremote cp cartridge/installer/_fsutil.py    ":${SMOKE_ROOT}/installer/_fsutil.py"
 mpremote cp cartridge/installer/_manifest.py  ":${SMOKE_ROOT}/installer/_manifest.py"
@@ -199,25 +216,26 @@ print('${SMOKE_ROOT}/')
 show('${SMOKE_ROOT}', 1)
 "
 
+if [[ "$RESET" -eq 1 ]]; then
+    echo "[smoke] resetting badge (launcher rescan)"
+    mpremote reset
+fi
+
 cat <<EOF
 
 [smoke] deploy complete.
 
-Drive the installer from the badge REPL:
+Next steps on the badge:
+  1. Wait for the badge to finish rebooting.
+  2. On the launcher, scroll to "Cartridge smoke test" and tap CONFIRM (C).
+  3. Picker should show "Install Cartridge test app v1.0.0" -> tap CONFIRM.
+  4. Progress bar animates, done screen shows "OK Cartridge test app".
+  5. Tap CANCEL (F) to exit; the launcher should now include a
+     "Cartridge test app" entry.
 
-    import sys
-    sys.path.append("${SMOKE_ROOT}")
-    from installer.app import InstallerApp
-    from system.scheduler.events import RequestStartAppEvent
-    from system.eventbus import eventbus
-    eventbus.emit(RequestStartAppEvent(InstallerApp()))
+Verify install landed on disk:
+  mpremote exec 'import os; print(os.listdir("${INSTALLED_TARGET}"))'
 
-The picker should list "Cartridge test app v1.0.0". Confirming should
-copy ${SMOKE_ROOT}/apps/testapp/ -> /apps/testapp/ on the badge and
-emit InstallNotificationEvent, at which point the launcher should
-show a "Cartridge test app" entry.
-
-Cleanup (wipes smoke folders + /apps/testapp):
-
-    ./cartridge/dev/smoke_deploy.sh --cleanup
+Cleanup:
+  ./cartridge/dev/smoke_deploy.sh --cleanup
 EOF
