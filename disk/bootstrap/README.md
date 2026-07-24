@@ -52,11 +52,17 @@ On Flopagon removal, `Bootstrap.deinit()` propagates to the installer
 ## Compile
 
 ```
-.venv/bin/mpy-cross disk/bootstrap/app.py
+.venv/bin/mpy-cross -O3 disk/bootstrap/app.py
 ```
 
 Output: `disk/bootstrap/app.mpy`. Check the byte count against
 the ~1.6 KB V1 budget above before writing.
+
+**`-O3` is load-bearing.** It strips source line info from tracebacks
+(saves ~100 bytes on this file). All our exception paths swallow to
+`self._error` and never print tracebacks, so no diagnostics are lost.
+Without `-O3` the .mpy is ~1630 bytes and hits ENOSPC on the V1
+EEPROM's LFS2 during the `mpremote cp`.
 
 The mpy version is determined by whatever mpy-cross is installed;
 Tildagon firmware must be at least that version to load it. Nathan's
