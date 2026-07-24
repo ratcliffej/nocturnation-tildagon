@@ -1058,21 +1058,18 @@ class NocturNationApp(app.App):
             if self._splash_paint_start_ms is None:
                 self._splash_paint_start_ms = now_ms
             paint_elapsed = _ticks_diff(now_ms, self._splash_paint_start_ms)
-            # Minimum visible time after first paint so the splash is
-            # legible even when a Director is already broadcasting.
-            min_visible_met = paint_elapsed >= 1500
-            trigger = (
-                self._last_frame is not None
-                or self._idle_menu is not None
-                or self._settings_open
-            )
             # Splash MUST stay up while the Lume stack is still importing:
             # every non-splash path below touches renderers that are None
             # until _load_lume_stack finishes.
             if not self._lume_stack_loaded:
                 self._draw_splash(ctx)
                 return
-            if min_visible_met and trigger:
+            # Once loaded, clear after a minimum visible window. Earlier
+            # logic gated on "first admitted frame OR menu opened",
+            # which stranded standalone Lumes that never see a Director:
+            # no frame arrived, no menu opened, so splash never cleared
+            # and the app was stuck on the loading screen.
+            if paint_elapsed >= 1500:
                 self._splash_active = False
             else:
                 self._draw_splash(ctx)
