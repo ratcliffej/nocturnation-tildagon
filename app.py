@@ -328,6 +328,18 @@ _DEBUG = False
 # both devices for the measurement window then flip back.
 _BENCH_HOP0 = False
 
+# Independent bench flag: prints a [BENCH-PD] line per LIGHT_PULSE that
+# breaks arrival -> app-dispatch -> paint into two separate deltas.
+#   async_ms = dispatch_ms - arrival_ms   (async-loop poll cost)
+#   paint_ms = paint_ms    - dispatch_ms  (render tick + I2C write cost)
+#   total_ms = paint_ms    - arrival_ms   (end-to-end)
+#
+# The existing [BENCH-PT] delay_ms is arrival->paint (since _observe_frame
+# substitutes now_ms = arrival_ms when IRQ is installed). This split lets
+# us decide whether moving paint into the mp_sched IRQ callback would
+# meaningfully cut sync lag vs the StickC. Off by default.
+_BENCH_PAINT_DELTA = True
+
 # The perimeter module's _BENCH_DISPATCH_LOG mirror moves into
 # _load_lume_stack, alongside the rest of the nocturnation.* imports.
 
@@ -375,6 +387,10 @@ class NocturNationApp(app.App):
         # Phase 1 hop-0 paint-delta bench (_BENCH_HOP0) state.
         self._bench_dispatched_key = None
         self._bench_dispatched_ms = 0
+        # Scratch bench (_BENCH_PAINT_DELTA) - arrival vs async-dispatch state.
+        self._bench_pd_key = None
+        self._bench_pd_arrival_ms = 0
+        self._bench_pd_dispatch_ms = 0
         # Render-tick fleet alignment: perimeter tick anchor snaps to the
         # arrival_ms of each admitted frame so subsequent renders fire
         # relative to a shared physical event, not each device's local
@@ -1047,6 +1063,16 @@ class NocturNationApp(app.App):
                   % (key[0], key[1], now_ms,
                      ticks_diff(now_ms, self._bench_dispatched_ms)))
             self._bench_dispatched_key = None
+        # Independent split: async-loop vs render-tick cost.
+        if _BENCH_PAINT_DELTA and self._bench_pd_key is not None:
+            key = self._bench_pd_key
+            async_ms = ticks_diff(self._bench_pd_dispatch_ms,
+                                  self._bench_pd_arrival_ms)
+            paint_ms = ticks_diff(now_ms, self._bench_pd_dispatch_ms)
+            total_ms = ticks_diff(now_ms, self._bench_pd_arrival_ms)
+            print("[BENCH-PD] src=%d seq=%d async_ms=%d paint_ms=%d total_ms=%d"
+                  % (key[0], key[1], async_ms, paint_ms, total_ms))
+            self._bench_pd_key = None
 
     def draw(self, ctx) -> None:
         if not self._first_draw_traced:
@@ -2330,6 +2356,17 @@ class NocturNationApp(app.App):
                 self._bench_dispatched_key = (frame.source_id,
                                                frame.sequence_number)
                 self._bench_dispatched_ms = now_ms
+            if _BENCH_PAINT_DELTA and cls in PERIMETER_CLASSES \
+                    and time is not None:
+                # Stamp arrival (peers_table / IRQ) AND actual dispatch
+                # instant (time.ticks_ms() at the observe call). Paint
+                # site emits the split on the next render_perimeter.
+                self._bench_pd_key = (frame.source_id,
+                                     frame.sequence_number)
+                self._bench_pd_arrival_ms = (arrival_ms
+                                             if arrival_ms is not None
+                                             else now_ms)
+                self._bench_pd_dispatch_ms = time.ticks_ms()
             if cls in PERIMETER_CLASSES:
                 self._renderer.dispatch(frame, now_ms)
                 self._render_force_paint = True
