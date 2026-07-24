@@ -413,6 +413,11 @@ class NocturNationApp(app.App):
         self._lume_text_renderer = None
         self._settings_open = False
         self._settings_menu = None
+        # Copy-to-Flopagon overlay state.
+        # _copy_state: None (inactive) | "confirm" | "copying" | "done"
+        self._copy_state = None
+        self._copy_job = None
+        self._copy_message = None
         # App role: "idle" (no radio, WiFi up), "lume" (receive), or
         # "director" (Show + IMU + TX). Launch straight into Lume; F
         # (CANCEL) in Lume calls _stop_to_idle.
@@ -621,6 +626,30 @@ class NocturNationApp(app.App):
                 self._close_help()
             return
 
+        if self._copy_state == "confirm":
+            if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+                self.button_states.clear()
+                self._start_copy()
+            elif self.button_states.get(BUTTON_TYPES["CANCEL"]):
+                self.button_states.clear()
+                self._close_copy()
+            return
+
+        if self._copy_state == "copying":
+            job = self._copy_job
+            if job is None or job.done:
+                self._finish_copy()
+            else:
+                job.tick()
+            return
+
+        if self._copy_state == "done":
+            if (self.button_states.get(BUTTON_TYPES["CONFIRM"])
+                    or self.button_states.get(BUTTON_TYPES["CANCEL"])):
+                self.button_states.clear()
+                self._close_copy()
+            return
+
         if self._mode == "idle":
             # Menu can't be built in __init__ before the app is
             # registered with the scheduler; open lazily on first tick.
@@ -694,7 +723,17 @@ class NocturNationApp(app.App):
     # ---------------------------------------------------------------------
 
     def _idle_menu_items(self):
-        return ["Lume Mode", "Director Mode", "Settings", "Help", "Quit"]
+        items = ["Lume Mode", "Director Mode", "Settings"]
+        # "Copy to Flopagon" appears only when a cartridge-writable
+        # hexpansion mount is currently reachable (dynamic per-open).
+        try:
+            from .cartridge.self_copy import detect_mount
+            if detect_mount() is not None:
+                items.append("Copy to Flopagon")
+        except Exception as exc:
+            print("[nocturnation] cartridge detect failed: %s" % exc)
+        items.extend(["Help", "Quit"])
+        return items
 
     def _open_idle_menu(self) -> None:
         if Menu is None or self._idle_menu is not None:
@@ -716,15 +755,19 @@ class NocturNationApp(app.App):
         self.button_states.clear()
 
     def _idle_menu_select(self, item, idx) -> None:
-        if idx == 0:
+        # Dispatch by item text so the dynamic "Copy to Flopagon" entry
+        # doesn't shift indices for everything below it.
+        if item == "Lume Mode":
             self._start_mode("lume")
-        elif idx == 1:
+        elif item == "Director Mode":
             self._start_mode("director")
-        elif idx == 2:
+        elif item == "Settings":
             self._open_settings()
-        elif idx == 3:
+        elif item == "Copy to Flopagon":
+            self._open_copy_confirm()
+        elif item == "Help":
             self._open_help()
-        elif idx == 4:
+        elif item == "Quit":
             self._quit()
 
     def _idle_menu_back(self) -> None:
@@ -756,6 +799,136 @@ class NocturNationApp(app.App):
         self._dark_perimeter()
         self._open_idle_menu()
         print("[nocturnation] stopped to idle")
+
+    # ---------------------------------------------------------------------
+    # Copy to Flopagon - self-copy of the running app onto a cartridge
+    # ---------------------------------------------------------------------
+
+    def _open_copy_confirm(self) -> None:
+        self._close_idle_menu()
+        self._copy_state = "confirm"
+        self._copy_job = None
+        self._copy_message = None
+
+    def _start_copy(self) -> None:
+        try:
+            from .cartridge.self_copy import (
+                detect_mount, source_dir_from_file, slug_from_source,
+                SelfCopyJob,
+            )
+        except Exception as exc:
+            self._copy_message = "Import failed: %s" % exc
+            self._copy_state = "done"
+            return
+
+        mount = detect_mount()
+        if mount is None:
+            self._copy_message = "No cartridge mounted"
+            self._copy_state = "done"
+            return
+
+        try:
+            src = source_dir_from_file(__file__)
+        except NameError:
+            # __file__ can be missing on frozen builds; unlikely on badge.
+            src = "/apps/nocturnation"
+        slug = slug_from_source(src)
+
+        now_ms = time.ticks_ms() if time is not None else 0
+        job = SelfCopyJob(
+            src_dir=src,
+            mount_dir=mount,
+            slug=slug,
+            name="NocturNation",
+            version=_APP_VERSION,
+            copied_at=now_ms,
+        )
+        try:
+            job.prepare()
+        except Exception as exc:
+            self._copy_message = "Prepare crash: %s" % exc
+            self._copy_state = "done"
+            return
+
+        if job.error is not None:
+            self._copy_message = job.error
+            self._copy_state = "done"
+            return
+
+        self._copy_job = job
+        self._copy_state = "copying"
+
+    def _finish_copy(self) -> None:
+        job = self._copy_job
+        if job is None:
+            self._copy_message = "Copy job vanished"
+        elif job.error is not None:
+            self._copy_message = job.error
+        else:
+            self._copy_message = "Copied %d files" % job.total
+        self._copy_state = "done"
+        self._copy_job = None
+
+    def _close_copy(self) -> None:
+        self._copy_state = None
+        self._copy_job = None
+        self._copy_message = None
+        self.button_states.clear()
+        if self._mode == "idle":
+            self._open_idle_menu()
+
+    def _draw_copy_confirm(self, ctx) -> None:
+        ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
+        ctx.rgb(1, 1, 1)
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+        ctx.font_size = 20
+        ctx.move_to(0, -50).text("Copy to Flopagon")
+        ctx.font_size = 14
+        ctx.move_to(0, -15).text("NocturNation v%s" % _APP_VERSION)
+        ctx.font_size = 12
+        ctx.rgb(0.7, 0.7, 0.7)
+        ctx.move_to(0, 45).text("C: confirm")
+        ctx.move_to(0, 65).text("F: cancel")
+
+    def _draw_copy_progress(self, ctx) -> None:
+        ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
+        ctx.rgb(1, 1, 1)
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+        ctx.font_size = 20
+        ctx.move_to(0, -30).text("Copying")
+        job = self._copy_job
+        if job is not None:
+            ctx.font_size = 14
+            ctx.move_to(0, 0).text("%d / %d files" % (job.cursor, job.total))
+            if job.total > 0:
+                bar_w = 160
+                bar_h = 6
+                filled = int(bar_w * job.cursor / job.total)
+                ctx.rgb(0.25, 0.25, 0.25).rectangle(-bar_w // 2, 25, bar_w, bar_h).fill()
+                ctx.rgb(0.2, 0.8, 0.4).rectangle(-bar_w // 2, 25, filled, bar_h).fill()
+
+    def _draw_copy_done(self, ctx) -> None:
+        job_error = (self._copy_message is not None
+                     and self._copy_message not in (None, "")
+                     and not self._copy_message.startswith("Copied"))
+        ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+        if job_error:
+            ctx.rgb(0.9, 0.3, 0.3)
+            ctx.font_size = 18
+            ctx.move_to(0, -20).text("Copy failed")
+        else:
+            ctx.rgb(0.2, 0.8, 0.4)
+            ctx.font_size = 18
+            ctx.move_to(0, -20).text("Copy complete")
+        ctx.rgb(1, 1, 1)
+        ctx.font_size = 12
+        ctx.move_to(0, 10).text(self._copy_message or "unknown")
+        ctx.rgb(0.7, 0.7, 0.7)
+        ctx.move_to(0, 70).text("C / F: back")
 
     # ---------------------------------------------------------------------
     # Help screen - QR code to the project URL
@@ -1085,6 +1258,16 @@ class NocturNationApp(app.App):
 
         if self._help_open:
             self._draw_help(ctx)
+            return
+
+        if self._copy_state == "confirm":
+            self._draw_copy_confirm(ctx)
+            return
+        if self._copy_state == "copying":
+            self._draw_copy_progress(ctx)
+            return
+        if self._copy_state == "done":
+            self._draw_copy_done(ctx)
             return
 
         if self._mode == "idle":

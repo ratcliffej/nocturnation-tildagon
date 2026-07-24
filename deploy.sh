@@ -60,14 +60,29 @@ os.mkdir("/apps/nocturnation")
 # (one __pycache__ per package dir) that MicroPython can't use - copying them
 # just wastes badge flash and slows the wipe. Only .py source should land.
 echo "[deploy] stripping local __pycache__"
-find nocturnation shows -name __pycache__ -type d -prune -exec rm -rf {} +
+find nocturnation shows cartridge -name __pycache__ -type d -prune -exec rm -rf {} +
 
+# The cartridge/ tree ships alongside nocturnation/ so the Lume app's
+# "Copy to Flopagon" menu item can `from .cartridge.self_copy import ...`
+# at runtime. Only the installer + self_copy sources need to land - the
+# EEPROM bootstrap (.mpy) and dev helpers (dev/, README, tests) stay
+# host-side.
 echo "[deploy] copying the app payload to :apps/nocturnation/"
 mpremote cp app.py :apps/nocturnation/app.py
 mpremote cp metadata.json :apps/nocturnation/metadata.json
 mpremote cp uQR.py :apps/nocturnation/uQR.py
-mpremote cp -r nocturnation :apps/nocturnation/   # -> :apps/nocturnation/nocturnation/
-mpremote cp -r shows :apps/nocturnation/           # -> :apps/nocturnation/shows/
+mpremote cp -r nocturnation :apps/nocturnation/    # -> :apps/nocturnation/nocturnation/
+mpremote cp -r shows :apps/nocturnation/            # -> :apps/nocturnation/shows/
+mpremote exec 'import os
+try: os.mkdir("/apps/nocturnation/cartridge")
+except OSError: pass
+try: os.mkdir("/apps/nocturnation/cartridge/installer")
+except OSError: pass'
+mpremote cp cartridge/__init__.py           :apps/nocturnation/cartridge/__init__.py
+mpremote cp cartridge/self_copy.py          :apps/nocturnation/cartridge/self_copy.py
+mpremote cp cartridge/installer/__init__.py :apps/nocturnation/cartridge/installer/__init__.py
+mpremote cp cartridge/installer/_fsutil.py  :apps/nocturnation/cartridge/installer/_fsutil.py
+mpremote cp cartridge/installer/_manifest.py :apps/nocturnation/cartridge/installer/_manifest.py
 
 # Verify the copy landed BEFORE resetting: `mpremote reset` drops and
 # re-enumerates the USB serial device, so any mpremote command issued
