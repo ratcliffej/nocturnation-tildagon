@@ -67,6 +67,34 @@ allocation). `_relay_send_buffer` is 32 B to match protocol
 `kMaxFrameSize`; reused for every relay TX so the hot path stays
 heap-free.
 
+### LIGHT_PULSE fast-paint hot path (IRQ-side)
+**File**: `app.py` (`_fast_paint_cb`, `_espnow_irq_handler` invocation,
+`_fast_paint_pulse` method, `_fast_paint_last_key`, `_observe_frame`
+LIGHT_PULSE `fp_handled` gate)
+**Context**: Bench (post-EMF, docs in bench branches `bench-paint-delta`
++ `bench-irq-paint`) showed the async recv loop cost ~35 ms mean between
+`arrival_ms` (peers_table / ESP-IDF stamp) and LEDs actually going on -
+against the StickC's ~2 ms. paint_ms itself (I²C write + renderer tick)
+was ~3 ms, so 32 ms of the delta was pure async-scheduler overhead:
+`asyncio.sleep_ms(5)` between loop iterations, plus badge OS coroutines
+(display refresh etc.) grabbing time between our yields. Reducing
+`poll_ms` and adding yields made it *worse* (more preemption
+opportunities for competing coroutines).
+**Rationale**: mp_sched runs between Python bytecodes at ~1 ms latency,
+regardless of what the async scheduler is doing. Moving the
+sync-critical LIGHT_PULSE → perimeter LEDs path into the IRQ callback
+brings Tildagon end-to-end to ~7 ms mean, closing the visual sync gap
+with the StickC. Everything the fast path can't safely do (TOFU, full
+dedup ring, LCD rendering, bookkeeping) stays on the async path. The
+async path's perimeter render is skipped for pulses the fast path
+handled via `_fast_paint_last_key` matching. Single-slot dedup in the
+fast path drops the Director's 2× redundant TX (same key twice ~1 ms
+apart). Exceptions inside the mp_sched callback are swallowed - a raise
+in that context kills all scheduled callbacks, and the async path is
+the fallback anyway. If a future badge OS release breaks mp_sched
+compatibility, the fallback path continues to work with the (larger)
+async delay.
+
 ### `_APP_VERSION` load
 **File**: `app.py` (near `_APP_VERSION = "?"`)
 **Context**: Read once from `metadata.json` (the on-badge runtime
