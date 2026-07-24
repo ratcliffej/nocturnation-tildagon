@@ -24,6 +24,7 @@ from machine import SPI
 import vfs
 import sys
 import app
+from events.input import Buttons, BUTTON_TYPES
 from system.eventbus import eventbus
 from system.scheduler.events import RequestForegroundPushEvent, RequestStartAppEvent
 
@@ -34,6 +35,11 @@ MOUNT = "/cartridge"
 class Bootstrap(app.App):
     def __init__(self, config=None):
         super().__init__()
+        # button_states owned by us for the error-state exit path -
+        # if we get stuck showing a mount/flash-init error, F lets the
+        # operator escape back to the launcher without physically
+        # yanking the Flopagon.
+        self.button_states = Buttons(self)
         self._foregrounded = False
         self._installer = None
         self._error = None
@@ -114,12 +120,17 @@ class Bootstrap(app.App):
 
     def update(self, delta):
         # Only take foreground in the error state - success case has
-        # the installer taking it via its own push. Us pushing first
-        # would race the installer's first tick and briefly flash the
-        # error rendering with self._error = None.
-        if self._error is not None and not self._foregrounded:
+        # the installer taking it via its own push, which would race
+        # our push and briefly flash the error rendering.
+        if self._error is None:
+            return True
+        if not self._foregrounded:
             eventbus.emit(RequestForegroundPushEvent(self))
             self._foregrounded = True
+        # F escape: without this, mount/flash failures could only be
+        # cleared by physically yanking the Flopagon.
+        if self.button_states.get(BUTTON_TYPES["CANCEL"]):
+            self.minimise()
         return True
 
     def deinit(self):
