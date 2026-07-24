@@ -1,4 +1,4 @@
-# Synthetic testapp for the cartridge installer E2E. Overrides
+# Synthetic testapp for the disk installer E2E. Overrides
 # update() to return True so draw() fires (base App.update returns
 # False and would suppress render). Handles CANCEL for clean exit.
 import app
@@ -28,7 +28,7 @@ class TestApp(app.App):
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
         ctx.font_size = 22
-        ctx.move_to(0, -10).text("Cartridge")
+        ctx.move_to(0, -10).text("Disk")
         ctx.move_to(0, 15).text("test app")
         ctx.font_size = 12
         ctx.rgb(0.6, 0.6, 0.6)

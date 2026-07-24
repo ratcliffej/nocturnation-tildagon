@@ -1,4 +1,4 @@
-"""Host-side coverage of cartridge/installer/_manifest.py."""
+"""Host-side coverage of disk/installer/_manifest.py."""
 
 import json
 import os
@@ -8,11 +8,11 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from cartridge.installer import _manifest as manifest
+from disk.installer import _manifest as manifest
 
 
 def test_read_returns_dict_for_valid_manifest(tmp_path):
-    p = tmp_path / "cartridge.json"
+    p = tmp_path / "disk.json"
     p.write_text(json.dumps({
         "name": "NocturNation",
         "slug": "nocturnation",
@@ -30,13 +30,13 @@ def test_read_returns_empty_on_missing_file(tmp_path):
 
 
 def test_read_returns_empty_on_invalid_json(tmp_path):
-    p = tmp_path / "cartridge.json"
+    p = tmp_path / "disk.json"
     p.write_text("{not json at all")
     assert manifest.read(str(p)) == {}
 
 
 def test_read_returns_empty_on_non_dict_json(tmp_path):
-    p = tmp_path / "cartridge.json"
+    p = tmp_path / "disk.json"
     p.write_text("[1, 2, 3]")
     assert manifest.read(str(p)) == {}
 

@@ -1,4 +1,4 @@
-"""Filesystem helpers for the cartridge installer.
+"""Filesystem helpers for the disk installer.
 
 Kept in a MicroPython + CPython dual-runtime shape:
 - Uses only `os` (no `shutil`, no `pathlib` - both missing on Tildagon).

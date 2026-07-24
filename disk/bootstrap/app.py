@@ -1,9 +1,9 @@
-"""NocturNation cartridge autoboot bootstrap.
+"""NocturNation disk autoboot bootstrap.
 
 Runs from the Flopagon's 2 KB EEPROM when the badge inserts a
-NocturNation cartridge. Only responsibility: init the 16 MB flash,
+NocturNation disk. Only responsibility: init the 16 MB flash,
 mount it at MOUNT, hand off to the flash-resident installer
-(cartridge/installer/).
+(disk/installer/).
 
 SIZE BUDGET: ~2 KB total on the V1 EEPROM = 32-byte hexpansion header
 + LittleFS2 metadata + this file's compiled .mpy. Nathan's original
@@ -29,7 +29,7 @@ from system.eventbus import eventbus
 from system.scheduler.events import RequestForegroundPushEvent, RequestStartAppEvent
 
 
-MOUNT = "/cartridge"
+MOUNT = "/disk"
 
 
 class Bootstrap(app.App):
@@ -114,7 +114,7 @@ class Bootstrap(app.App):
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
         ctx.font_size = 18
-        ctx.move_to(0, -10).text("Cartridge error")
+        ctx.move_to(0, -10).text("Disk error")
         ctx.font_size = 14
         ctx.move_to(0, 15).text(self._error or "unknown")
 
@@ -137,7 +137,7 @@ class Bootstrap(app.App):
         # Installer was registered separately with the scheduler
         # (RequestStartAppEvent above), so it must be explicitly
         # terminated on Flopagon removal - otherwise its update() +
-        # background_task keep firing against a torn-down /cartridge
+        # background_task keep firing against a torn-down /disk
         # mount. terminate() reuses the base App class's already-
         # imported RequestStopAppEvent, saving us the import bytes.
         if self._installer is not None:

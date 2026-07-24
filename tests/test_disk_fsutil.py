@@ -1,4 +1,4 @@
-"""Host-side coverage of cartridge/installer/_fsutil.py.
+"""Host-side coverage of disk/installer/_fsutil.py.
 
 The installer runs on MicroPython on a Tildagon; these tests exercise
 the copy / mkdir / rmtree helpers against CPython's os module in tmp
@@ -13,7 +13,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from cartridge.installer import _fsutil as fsutil
+from disk.installer import _fsutil as fsutil
 
 
 def _write(path, content=b""):

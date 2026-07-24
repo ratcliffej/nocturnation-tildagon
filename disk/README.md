@@ -1,4 +1,4 @@
-# Flopagon cartridge
+# Flopagon disk
 
 Deploy NocturNation onto Tildagon badges without WiFi — plug in a
 pre-provisioned Flopagon, and the badge auto-launches an installer
@@ -19,13 +19,13 @@ Full workflow docs land with Phase 4. This README is the placeholder.
 ## Layout
 
 ```
-cartridge/
+disk/
 ├── installer/       # Phase 2 — lives on the Flopagon flash at
-│   │                # /cartridge/installer/, auto-launched by the
+│   │                # /disk/installer/, auto-launched by the
 │   │                # Phase 3 EEPROM bootstrap on hexpansion insert.
 │   ├── app.py       # InstallerApp — Menu + picker + copier
 │   ├── _fsutil.py   # host-testable filesystem helpers
-│   └── _manifest.py # cartridge.json read/write helpers
+│   └── _manifest.py # disk.json read/write helpers
 ├── bootstrap/       # Phase 3 — pending
 └── provision/       # Phase 4 — pending
 ```
@@ -45,7 +45,7 @@ The mount is expected to hold:
 ├── installer/       # this app
 └── apps/
     ├── nocturnation/
-    │   ├── cartridge.json
+    │   ├── disk.json
     │   ├── app.py
     │   ├── metadata.json
     │   └── ...
@@ -53,7 +53,7 @@ The mount is expected to hold:
         └── ...
 ```
 
-`cartridge.json` schema (v1):
+`disk.json` schema (v1):
 
 ```json
 {
@@ -72,9 +72,9 @@ install into `/apps/nocturnation/` on the badge.
 
 ## Installer behaviour
 
-1. On launch, enumerate `/cartridge/apps/*/cartridge.json`.
+1. On launch, enumerate `/disk/apps/*/disk.json`.
 2. Show a picker:
-   - 0 apps → "No apps on this cartridge" + Exit
+   - 0 apps → "No apps on this disk" + Exit
    - 1 app → "Install &lt;name&gt; v&lt;version&gt;" + Cancel
    - N apps → one row per app + "Install all" + Cancel
 3. On confirm, wipe existing `/apps/&lt;slug&gt;/` on the badge, then copy
@@ -93,7 +93,7 @@ install into `/apps/nocturnation/` on the badge.
 Host pytest covers the filesystem + manifest helpers:
 
 ```
-.venv/bin/pytest tests/test_cartridge_fsutil.py tests/test_cartridge_manifest.py
+.venv/bin/pytest tests/test_disk_fsutil.py tests/test_disk_manifest.py
 ```
 
 The `InstallerApp` class itself is Tildagon-runtime only (badge OS

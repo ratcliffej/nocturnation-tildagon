@@ -1,4 +1,4 @@
-"""cartridge.json manifest helpers.
+"""disk.json manifest helpers.
 
 Schema (v1):
     {
@@ -16,12 +16,12 @@ to build its selection menu and validate the payload before copying.
 
 import json
 
-MANIFEST_NAME = "cartridge.json"
+MANIFEST_NAME = "disk.json"
 MANIFEST_VERSION = 1
 
 
 def read(path):
-    """Read a cartridge.json at `path`. Returns dict, or {} on any error."""
+    """Read a disk.json at `path`. Returns dict, or {} on any error."""
     try:
         with open(path) as f:
             data = json.load(f)
@@ -48,7 +48,7 @@ def display_entry(manifest, fallback_slug):
     """Normalise a manifest into the fields the installer menu needs.
 
     Missing fields fall back to reasonable defaults so a badly-authored
-    cartridge still shows up as installable rather than crashing.
+    disk still shows up as installable rather than crashing.
     """
     slug = manifest.get("slug") or fallback_slug
     return {
