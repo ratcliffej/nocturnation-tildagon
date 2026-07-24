@@ -155,14 +155,33 @@ mpremote cp cartridge/installer/__init__.py   ":${SMOKE_ROOT}/installer/__init__
 
 # Synthetic testapp payload: a real Tildagon App that renders a
 # label + a cartridge.json manifest for the installer's picker.
+# NOTE: base App.update() returns False, which suppresses draw() -
+# the app MUST override update() to return non-False, or the screen
+# never repaints and the app "hangs" from the operator's view.
 cat > "$TMPDIR/app.py" <<'PY_EOF'
 # Synthetic testapp for the cartridge installer smoke test. Renders a
-# single centred label so a post-install reboot visibly confirms the
-# copy landed and the launcher picked the app up.
+# label + handles CANCEL so the operator can exit back to the launcher.
 import app
+from events.input import Buttons, BUTTON_TYPES
+from system.eventbus import eventbus
+from system.scheduler.events import RequestForegroundPushEvent
 
 
 class TestApp(app.App):
+    def __init__(self):
+        super().__init__()
+        self.button_states = Buttons(self)
+        self._foregrounded = False
+
+    def update(self, delta):
+        if not self._foregrounded:
+            eventbus.emit(RequestForegroundPushEvent(self))
+            self._foregrounded = True
+        if self.button_states.get(BUTTON_TYPES["CANCEL"]):
+            self.button_states.clear()
+            self.minimise()
+        return True  # return non-False so the scheduler calls draw()
+
     def draw(self, ctx):
         ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
         ctx.rgb(1, 1, 1)
@@ -171,6 +190,9 @@ class TestApp(app.App):
         ctx.font_size = 22
         ctx.move_to(0, -10).text("Cartridge")
         ctx.move_to(0, 15).text("test app")
+        ctx.font_size = 12
+        ctx.rgb(0.6, 0.6, 0.6)
+        ctx.move_to(0, 70).text("F to exit")
 
 
 __app_export__ = TestApp

@@ -74,6 +74,11 @@ class InstallerApp(app.App):
         self._error_message = None
 
         self._menu = self._build_picker_menu()
+        # Menu subscribes to ButtonDownEvent inside its __init__.
+        # Removing that subscription from within the same handler
+        # chain crashes some MicroPython eventbus builds - so cleanup
+        # is deferred to the next update() tick via this flag.
+        self._pending_menu_cleanup = False
 
     def _build_picker_menu(self):
         if not self._catalog:
@@ -93,6 +98,11 @@ class InstallerApp(app.App):
         )
 
     def _on_picker_select(self, item, item_idx):
+        # Guard against stale button events firing after we've left
+        # the picker state (e.g. queued events processed during the
+        # state transition).
+        if self._state != _STATE_PICKER:
+            return
         if not self._catalog:
             self._exit()
             return
@@ -111,6 +121,8 @@ class InstallerApp(app.App):
             self._exit()
 
     def _on_picker_back(self):
+        if self._state != _STATE_PICKER:
+            return
         self._exit()
 
     def _begin_install(self, targets):
@@ -141,19 +153,32 @@ class InstallerApp(app.App):
         except OSError as exc:
             self._error_message = "Wipe failed: " + str(exc)
             self._state = _STATE_DONE
+            self._pending_menu_cleanup = True
             return
 
-        # Menu subscribes to ButtonDownEvent; drop that subscription
-        # before we leave the picker so the buttons don't retarget the
-        # completed-menu on a stale reference.
-        self._menu._cleanup()
-        self._menu = None
-
+        # Defer the menu's eventbus.remove() to the next update() tick
+        # - we're currently INSIDE the menu's own ButtonDownEvent
+        # handler, and removing that handler from within its own
+        # iteration crashes some MicroPython eventbus builds.
+        self._pending_menu_cleanup = True
         self._state = _STATE_INSTALLING
 
     def background_update(self, delta):
         if self._state != _STATE_INSTALLING:
             return
+        try:
+            self._tick_install()
+        except Exception as exc:
+            # Anything unexpected during the copy loop or the finish
+            # transition surfaces here rather than crashing the whole
+            # app. Prints the type + message to the serial console so
+            # we can diagnose later.
+            print("[cartridge] install tick crashed: %s: %s"
+                  % (type(exc).__name__, exc))
+            self._error_message = "%s: %s" % (type(exc).__name__, exc)
+            self._state = _STATE_DONE
+
+    def _tick_install(self):
         if self._install_cursor >= len(self._install_queue):
             self._finish_install()
             return
@@ -196,7 +221,10 @@ class InstallerApp(app.App):
 
     def _finish_install(self):
         # Any app that didn't record a failure was fully copied.
-        failed_slugs = {r["slug"] for r in self._install_results}
+        # Plain list membership test - MicroPython set builds are
+        # inconsistent across firmware versions, and the result count
+        # here is always tiny.
+        failed_slugs = [r["slug"] for r in self._install_results]
         for entry in self._install_targets:
             if entry["slug"] in failed_slugs:
                 continue
@@ -211,6 +239,9 @@ class InstallerApp(app.App):
             eventbus.emit(InstallNotificationEvent())
         except Exception as exc:
             print("[cartridge] launcher notify failed: %s" % exc)
+        print("[cartridge] install complete: %d ok, %d failed"
+              % (sum(1 for r in self._install_results if r["ok"]),
+                 sum(1 for r in self._install_results if not r["ok"])))
         self._state = _STATE_DONE
 
     def _exit(self):
@@ -242,6 +273,15 @@ class InstallerApp(app.App):
         if not self._foregrounded:
             eventbus.emit(RequestForegroundPushEvent(self))
             self._foregrounded = True
+        # Deferred menu cleanup: safe here because we're no longer
+        # inside the menu's own event handler.
+        if self._pending_menu_cleanup and self._menu is not None:
+            try:
+                self._menu._cleanup()
+            except Exception as exc:
+                print("[cartridge] menu cleanup failed: %s" % exc)
+            self._menu = None
+            self._pending_menu_cleanup = False
         if self._state == _STATE_PICKER and self._menu is not None:
             self._menu.update(delta)
         elif self._state == _STATE_DONE:
@@ -249,6 +289,7 @@ class InstallerApp(app.App):
                     or self.button_states.get(BUTTON_TYPES["CANCEL"]):
                 self.button_states.clear()
                 self._exit()
+        return True
 
     def _draw_progress(self, ctx):
         total = len(self._install_queue)
