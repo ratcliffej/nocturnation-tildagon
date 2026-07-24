@@ -185,6 +185,13 @@ _relay_send_enabled = False
 _relay_send_output_hop = 0
 _relay_send_buffer = None
 _broadcast_mac_bytes = b'\xff\xff\xff\xff\xff\xff'
+# SCRATCH (bench-irq-paint): fast-paint callback invoked from
+# _espnow_irq_handler in mp_sched context. Set by the app instance
+# via _install_fast_paint_cb once the Lume stack + renderer exist.
+# Bypasses the async recv loop for LIGHT_PULSE + perimeter frames -
+# packet -> parse -> render -> LEDs in one mp_sched callback,
+# ~2 ms target vs the async loop's 25 ms baseline.
+_fast_paint_cb = None
 
 # Wire-spec byte offsets duplicated as module constants so the IRQ
 # fast-path doesn't have to import them from the protocol package.
@@ -212,6 +219,18 @@ def _espnow_irq_handler(esp):
 
     arrival = _espnow_last_arrival_ms
     _pending_msgs.append((host, msg, arrival))
+
+    # SCRATCH (bench-irq-paint): fast-paint callback for LIGHT_PULSE
+    # + perimeter frames. Runs in mp_sched context - must return
+    # promptly. Async loop STILL processes the same packet from
+    # _pending_msgs above (bookkeeping, dedup, TOFU, LCD) so we
+    # accept a redundant second paint; the IRQ path just gets the
+    # perimeter LEDs lit sooner.
+    if _fast_paint_cb is not None:
+        try:
+            _fast_paint_cb(msg, arrival)
+        except Exception:
+            pass  # swallow - mp_sched context, can't afford a raise
 
     # Fast-relay path: when the FSM is ACTIVE/COOLDOWN and this frame's
     # hop+1 matches our elected output_hop, mutate the pre-allocated
@@ -1041,6 +1060,58 @@ class NocturNationApp(app.App):
         self._fsm = None
         self._repeater_observer = None
 
+    def _fast_paint_pulse(self, msg, arrival):
+        # SCRATCH (bench-irq-paint): runs in mp_sched context from
+        # _espnow_irq_handler. Filters to LIGHT_PULSE + perimeter
+        # frames, dispatches to the renderer, and writes the LED
+        # ring - skipping the async loop entirely for this one hot
+        # code path. TOFU + dedup + LCD stay on the async path (they
+        # can tolerate the async loop's latency and can't be run
+        # safely twice); if a dup arrives via a repeater we accept a
+        # visually-identical redundant paint.
+        if tildagonos is None or time is None:
+            return
+        if self._renderer is None or self._settings is None:
+            return  # Lume stack not fully loaded
+        # Minimum viable size check to keep parse_admittable safe.
+        if msg is None or len(msg) < _MIN_FRAME_LEN_FOR_RELAY:
+            return
+        frame = parse_admittable(msg)
+        if frame is None:
+            return
+        if frame.message_type != MessageType.LIGHT_PULSE:
+            return
+        if frame.target_class not in PERIMETER_CLASSES:
+            return
+        if frame.target_group != 0 \
+                and frame.target_group != self._settings.group:
+            return
+        dispatch_ms = time.ticks_ms()
+        try:
+            self._renderer.dispatch(frame, arrival if arrival is not None else dispatch_ms)
+            leds = tildagonos.leds
+
+            def set_led(i, r, g, b):
+                leds[i] = (r, g, b)
+            self._renderer.tick(dispatch_ms, set_led)
+            leds.write()
+        except Exception as exc:
+            print("[nocturnation] fast paint failed: %s" % exc)
+            return
+        # Signal the async render loop to skip its next paint - our
+        # state is already reflected on the LEDs. The async path still
+        # runs observe_frame (dedup + LCD + bookkeeping) but doesn't
+        # need to re-render.
+        self._render_force_paint = False
+        paint_done_ms = time.ticks_ms()
+        if _BENCH_PAINT_DELTA and arrival is not None:
+            async_ms = ticks_diff(dispatch_ms, arrival)
+            paint_ms_ = ticks_diff(paint_done_ms, dispatch_ms)
+            total_ms = ticks_diff(paint_done_ms, arrival)
+            print("[BENCH-PD-IRQ] src=%d seq=%d async_ms=%d paint_ms=%d total_ms=%d"
+                  % (frame.source_id, frame.sequence_number,
+                     async_ms, paint_ms_, total_ms))
+
     def _render_perimeter(self) -> None:
         # Commit with a single leds.write() so the ring updates atomically.
         if tildagonos is None or time is None:
@@ -1512,7 +1583,7 @@ class NocturNationApp(app.App):
                 _relay_send_buffer = bytearray(32)   # protocol max frame
             # Older MicroPython builds without irq() degrade to the
             # async poll path - _try_recv falls back to esp.recv().
-            global _espnow_irq_installed
+            global _espnow_irq_installed, _fast_paint_cb
             if not _espnow_irq_installed:
                 try:
                     self._esp.irq(_espnow_irq_handler)
@@ -1521,6 +1592,10 @@ class NocturNationApp(app.App):
                 except Exception as exc:
                     print("[nocturnation] espnow.irq unavailable, "
                           "using poll-time stamp + async relay: %s" % exc)
+            # SCRATCH (bench-irq-paint): register the fast-paint hook
+            # AFTER the Lume stack is loaded (renderer etc. exist).
+            # Runs on the same mp_sched callback as the fast relay.
+            _fast_paint_cb = self._fast_paint_pulse
         except Exception as exc:
             print("[nocturnation] radio acquire failed: %s" % exc)
             self._wlan = None
