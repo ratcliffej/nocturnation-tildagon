@@ -56,11 +56,21 @@ class Bootstrap(app.App):
             self._error = "Flash init"
             return
 
+        # Defensive umount - the badge OS may fire two insertion
+        # events in quick succession (contact bounce / rescan) with
+        # no matching removal, leaving a stale mount from a previous
+        # Bootstrap instance. Same pattern the badge OS itself uses
+        # for the EEPROM auto-mount.
+        try:
+            vfs.umount(MOUNT)
+        except OSError:
+            pass
         try:
             vfs.mount(flash, MOUNT)
             self._mounted = True
-        except OSError:
-            self._error = "Mount"
+        except OSError as exc:
+            e = exc.args[0] if exc.args else 0
+            self._error = "Mount %d" % e
             return
 
         if MOUNT not in sys.path:
