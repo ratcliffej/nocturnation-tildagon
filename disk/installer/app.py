@@ -1,26 +1,21 @@
-"""Flopagon disk installer app.
+"""Flopagon disk manager app.
 
-Runs on the Tildagon after the EEPROM bootstrap (Phase 3) mounts the
-16 MB flash and hands off to us. Enumerates the apps/ folders on the
-disk, shows a picker, and copies the chosen app(s) into /apps/
-on the badge's internal filesystem.
+Runs on the Tildagon after the EEPROM bootstrap mounts the 16 MB
+flash and hands off to us. Four operations from one hub menu:
 
-Flow:
-    picker  ->  confirm  ->  installing  ->  done
+    Install app        - copy from disk to badge
+    Backup app         - copy from badge to disk (+ manifest write)
+    Delete from disk   - rmtree a disk-side app
+    Delete from badge  - rmtree a badge-side app
 
-Copy progress runs on background_update() so draw() keeps rendering
-one file at a time (a 51-file NocturNation install completes in ~2.5 s
-at the 20 Hz tick rate).
-
-Mount path is discovered at import time from __file__ so we work
-wherever the bootstrap drops us:
-    installed as /X/installer/app.py -> we read /X/apps/*/
-This means Phase 3 can choose any mount path without a code change
-here, and the Phase 2 smoke test can stage under /apps/ (persistent
-across badge OS updates) instead of the root, which gets wiped.
+Job progress runs on background_update() so draw() keeps rendering
+one file at a time. Mount path is discovered from __file__ so the
+Phase 3 bootstrap can pick any path (this file happens to sit at
+/disk/installer/app.py in production).
 """
 
 import os
+import time
 
 import app
 from app_components import Menu, clear_background
@@ -32,14 +27,14 @@ from system.scheduler.events import (
     RequestForegroundPopEvent,
 )
 
+from . import _badge_apps
 from . import _fsutil as fsutil
+from . import _jobs
 from . import _manifest as manifest
 
 
 def _discover_disk_mount():
-    # __file__ points at .../installer/app.py; the disk root is
-    # its grandparent. Falls back if __file__ is unavailable (some
-    # MicroPython frozen-module builds).
+    # __file__ -> .../installer/app.py; disk root is the grandparent.
     try:
         installer_dir = __file__.rsplit("/", 1)[0]
         return installer_dir.rsplit("/", 1)[0]
@@ -51,306 +46,53 @@ DISK_MOUNT = _discover_disk_mount()
 DISK_APPS_DIR = DISK_MOUNT + "/apps"
 BADGE_APPS_DIR = "/apps"
 
+_STATE_HUB = "hub"
 _STATE_PICKER = "picker"
 _STATE_CONFIRM = "confirm"
-_STATE_INSTALLING = "installing"
+_STATE_WORKING = "working"
 _STATE_DONE = "done"
 
+# Operation kinds carried through picker + confirm + working states.
+_KIND_INSTALL = "install"          # disk -> badge
+_KIND_BACKUP = "backup"            # badge -> disk (+ manifest)
+_KIND_DEL_DISK = "del_disk"        # rmtree on disk
+_KIND_DEL_BADGE = "del_badge"      # rmtree on badge
 
-class InstallerApp(app.App):
-    def __init__(self, config=None):
-        super().__init__()
-        self.config = config
-        # Owns its own Buttons subscription because the done-screen
-        # exit path uses self.button_states.get() directly. The picker
-        # phase gets its buttons via Menu, but Menu goes away when we
-        # transition to installing, so we need our own for the tail.
-        self.button_states = Buttons(self)
+_HUB_INSTALL = "Install app"
+_HUB_BACKUP = "Backup app"
+_HUB_DEL_DISK = "Delete from disk"
+_HUB_DEL_BADGE = "Delete from badge"
+_HUB_EXIT = "Exit"
 
-        self._foregrounded = False
-        self._state = _STATE_PICKER
+_HUB_ITEMS = (_HUB_INSTALL, _HUB_BACKUP, _HUB_DEL_DISK, _HUB_DEL_BADGE,
+              _HUB_EXIT)
 
-        self._catalog = _enumerate_disk_apps()
-        self._install_targets = []
-        self._install_queue = []
-        self._install_cursor = 0
-        self._install_current_name = ""
-        self._install_results = []
-        self._error_message = None
+_PICKER_BACK = "Back"
 
-        self._menu = self._build_picker_menu()
-        # Menu subscribes to ButtonDownEvent inside its __init__.
-        # Removing that subscription from within the same handler
-        # chain crashes some MicroPython eventbus builds - so cleanup
-        # is deferred to the next update() tick via this flag.
-        self._pending_menu_cleanup = False
 
-    def _build_picker_menu(self):
-        if not self._catalog:
-            items = ["Exit"]
-        elif len(self._catalog) == 1:
-            entry = self._catalog[0]
-            items = ["Install %s v%s" % (entry["name"], entry["version"]), "Cancel"]
-        else:
-            items = ["Install %s v%s" % (e["name"], e["version"]) for e in self._catalog]
-            items.append("Install all")
-            items.append("Cancel")
-        return Menu(
-            self,
-            items,
-            select_handler=self._on_picker_select,
-            back_handler=self._on_picker_back,
-        )
+def _verb(kind):
+    return {
+        _KIND_INSTALL:   "Install",
+        _KIND_BACKUP:    "Backup",
+        _KIND_DEL_DISK:  "Delete",
+        _KIND_DEL_BADGE: "Delete",
+    }[kind]
 
-    def _on_picker_select(self, item, item_idx):
-        # Guard against stale button events firing after we've left
-        # the picker state (e.g. queued events processed during the
-        # state transition).
-        if self._state != _STATE_PICKER:
-            return
-        if not self._catalog:
-            self._exit()
-            return
-        if len(self._catalog) == 1:
-            if item_idx == 0:
-                self._begin_install([self._catalog[0]])
-            else:
-                self._exit()
-            return
-        # Multi-app menu: N app rows + Install all + Cancel
-        if item_idx < len(self._catalog):
-            self._begin_install([self._catalog[item_idx]])
-        elif item_idx == len(self._catalog):
-            self._begin_install(list(self._catalog))
-        else:
-            self._exit()
 
-    def _on_picker_back(self):
-        if self._state != _STATE_PICKER:
-            return
-        self._exit()
-
-    def _begin_install(self, targets):
-        # Enumerate every file to be copied so background_update can
-        # tick through them one at a time and draw() has a total for
-        # the progress display.
-        queue = []
-        for entry in targets:
-            src_root = entry["path"]
-            dst_root = BADGE_APPS_DIR + "/" + entry["slug"]
-            entry["_dst_root"] = dst_root
-            for src, dst in fsutil.copytree_plan(src_root, dst_root):
-                queue.append((src, dst, entry))
-
-        self._install_targets = targets
-        self._install_queue = queue
-        self._install_cursor = 0
-        self._install_current_name = targets[0]["name"] if targets else ""
-        self._install_results = []
-        self._error_message = None
-
-        # Wipe existing installs before starting so a partial old copy
-        # can't shadow the new one. Done up front (not per-tick) because
-        # if this fails we want to bail before writing any new bytes.
-        try:
-            for entry in targets:
-                fsutil.rmtree(entry["_dst_root"])
-        except OSError as exc:
-            self._error_message = "Wipe failed: " + str(exc)
-            self._state = _STATE_DONE
-            self._pending_menu_cleanup = True
-            return
-
-        # Defer the menu's eventbus.remove() to the next update() tick
-        # - we're currently INSIDE the menu's own ButtonDownEvent
-        # handler, and removing that handler from within its own
-        # iteration crashes some MicroPython eventbus builds.
-        self._pending_menu_cleanup = True
-        self._state = _STATE_INSTALLING
-
-    def background_update(self, delta):
-        if self._state != _STATE_INSTALLING:
-            return
-        try:
-            self._tick_install()
-        except Exception as exc:
-            # Anything unexpected during the copy loop or the finish
-            # transition surfaces here rather than crashing the whole
-            # app. Prints the type + message to the serial console so
-            # we can diagnose later.
-            print("[disk] install tick crashed: %s: %s"
-                  % (type(exc).__name__, exc))
-            self._error_message = "%s: %s" % (type(exc).__name__, exc)
-            self._state = _STATE_DONE
-
-    def _tick_install(self):
-        if self._install_cursor >= len(self._install_queue):
-            self._finish_install()
-            return
-
-        src, dst, entry = self._install_queue[self._install_cursor]
-        self._install_current_name = entry["name"]
-        try:
-            fsutil.ensure_parent_dir(dst)
-            fsutil.copyfile(src, dst)
-        except OSError as exc:
-            # File-level failure -> mark the app failed but keep going so
-            # a batch install is atomic per-app, not per-file. A yanked
-            # Flopagon surfaces here as OSError on read.
-            self._mark_current_failed(entry, str(exc))
-            self._skip_to_next_app()
-            return
-
-        self._install_cursor += 1
-
-    def _mark_current_failed(self, entry, msg):
-        for r in self._install_results:
-            if r["slug"] == entry["slug"]:
-                r["ok"] = False
-                r["error"] = msg
-                return
-        self._install_results.append({
-            "slug": entry["slug"],
-            "name": entry["name"],
-            "ok": False,
-            "error": msg,
-        })
-
-    def _skip_to_next_app(self):
-        # Advance cursor past every remaining file for the currently-
-        # failing app so we start the next app cleanly.
-        _, _, current = self._install_queue[self._install_cursor]
-        while (self._install_cursor < len(self._install_queue)
-               and self._install_queue[self._install_cursor][2] is current):
-            self._install_cursor += 1
-
-    def _finish_install(self):
-        # Any app that didn't record a failure was fully copied.
-        # Plain list membership test - MicroPython set builds are
-        # inconsistent across firmware versions, and the result count
-        # here is always tiny.
-        failed_slugs = [r["slug"] for r in self._install_results]
-        for entry in self._install_targets:
-            if entry["slug"] in failed_slugs:
-                continue
-            self._install_results.append({
-                "slug": entry["slug"],
-                "name": entry["name"],
-                "ok": True,
-                "error": None,
-            })
-        # Tell the launcher to re-scan /apps.
-        try:
-            eventbus.emit(InstallNotificationEvent())
-        except Exception as exc:
-            print("[disk] launcher notify failed: %s" % exc)
-        print("[disk] install complete: %d ok, %d failed"
-              % (sum(1 for r in self._install_results if r["ok"]),
-                 sum(1 for r in self._install_results if not r["ok"])))
-        self._state = _STATE_DONE
-
-    def _exit(self):
-        eventbus.emit(RequestForegroundPopEvent(self))
-
-    def deinit(self):
-        # Called by HexpansionManagerApp when the Flopagon is pulled.
-        # Mid-install: the copy loop's next tick will hit OSError on
-        # read and gracefully record the failure. Nothing to release
-        # here (SPI + mount are owned by the Phase 3 bootstrap).
-        if self._menu is not None:
-            try:
-                self._menu._cleanup()
-            except Exception:
-                pass
-
-    def draw(self, ctx):
-        clear_background(ctx)
-        if self._state == _STATE_PICKER:
-            self._menu.draw(ctx)
-            if not self._catalog:
-                _draw_message(ctx, "No apps on this", "disk")
-        elif self._state == _STATE_INSTALLING:
-            self._draw_progress(ctx)
-        elif self._state == _STATE_DONE:
-            self._draw_done(ctx)
-
-    def update(self, delta):
-        if not self._foregrounded:
-            eventbus.emit(RequestForegroundPushEvent(self))
-            self._foregrounded = True
-        # Deferred menu cleanup: safe here because we're no longer
-        # inside the menu's own event handler.
-        if self._pending_menu_cleanup and self._menu is not None:
-            try:
-                self._menu._cleanup()
-            except Exception as exc:
-                print("[disk] menu cleanup failed: %s" % exc)
-            self._menu = None
-            self._pending_menu_cleanup = False
-        if self._state == _STATE_PICKER and self._menu is not None:
-            self._menu.update(delta)
-        elif self._state == _STATE_DONE:
-            if self.button_states.get(BUTTON_TYPES["CONFIRM"]) \
-                    or self.button_states.get(BUTTON_TYPES["CANCEL"]):
-                self.button_states.clear()
-                self._exit()
-        return True
-
-    def _draw_progress(self, ctx):
-        total = len(self._install_queue)
-        done = self._install_cursor
-        ctx.rgb(1, 1, 1)
-        ctx.text_align = ctx.CENTER
-        ctx.text_baseline = ctx.MIDDLE
-        ctx.font_size = 22
-        ctx.move_to(0, -30).text("Installing")
-        ctx.font_size = 16
-        ctx.move_to(0, 0).text(self._install_current_name or "")
-        ctx.font_size = 14
-        ctx.move_to(0, 30).text("%d / %d files" % (done, total))
-        # Slim horizontal progress bar
-        if total > 0:
-            bar_w = 160
-            bar_h = 6
-            filled = int(bar_w * done / total)
-            ctx.rgb(0.25, 0.25, 0.25).rectangle(-bar_w // 2, 55, bar_w, bar_h).fill()
-            ctx.rgb(0.2, 0.8, 0.4).rectangle(-bar_w // 2, 55, filled, bar_h).fill()
-
-    def _draw_done(self, ctx):
-        ctx.rgb(1, 1, 1)
-        ctx.text_align = ctx.CENTER
-        ctx.text_baseline = ctx.MIDDLE
-        ctx.font_size = 20
-        ctx.move_to(0, -80).text("Installed")
-        y = -50
-        for r in self._install_results:
-            if r["ok"]:
-                ctx.rgb(0.2, 0.8, 0.4)
-                label = "OK  " + r["name"]
-            else:
-                ctx.rgb(0.9, 0.3, 0.3)
-                label = "FAIL " + r["name"]
-            ctx.font_size = 16
-            ctx.move_to(0, y).text(label)
-            y += 22
-        if self._error_message is not None:
-            ctx.rgb(0.9, 0.3, 0.3)
-            ctx.font_size = 14
-            ctx.move_to(0, y).text(self._error_message)
-        ctx.rgb(0.75, 0.75, 0.75)
-        ctx.font_size = 12
-        ctx.move_to(0, 85).text("Reboot to see new apps")
-        ctx.move_to(0, 100).text("C / F: exit")
+def _source_apps(kind):
+    """Which side lists apps for this operation."""
+    if kind in (_KIND_INSTALL, _KIND_DEL_DISK):
+        return _enumerate_disk_apps()
+    return _badge_apps.list_installed(BADGE_APPS_DIR)
 
 
 def _enumerate_disk_apps():
-    """Scan /disk/apps/*/disk.json into a menu-ready list."""
+    """Scan <mount>/apps/*/disk.json into a menu-ready list."""
     entries = []
     try:
-        names = os.listdir(DISK_APPS_DIR)
+        names = sorted(os.listdir(DISK_APPS_DIR))
     except OSError:
         return entries
-    names.sort()
     for name in names:
         folder = DISK_APPS_DIR + "/" + name
         if not fsutil.path_isdir(folder):
@@ -362,13 +104,368 @@ def _enumerate_disk_apps():
     return entries
 
 
-def _draw_message(ctx, line1, line2):
-    ctx.rgb(1, 1, 1)
+class DiskManagerApp(app.App):
+    def __init__(self, config=None):
+        super().__init__()
+        self.config = config
+        self.button_states = Buttons(self)
+
+        self._foregrounded = False
+        self._menu = None
+        # Deferred cleanup: Menu removes its ButtonDownEvent subscription
+        # inside _cleanup(), and doing that from within a menu callback
+        # (which is what happens on select) crashes some MicroPython
+        # eventbus builds. Set a flag; update() drops the menu on the
+        # next tick, safely outside the callback.
+        self._pending_menu_cleanup = False
+
+        # Operation state: what kind + what target + job progress.
+        self._kind = None
+        self._target = None      # dict: {slug, name, version, path}
+        self._job = None
+        self._result_message = None
+        self._result_ok = False
+
+        self._state = _STATE_HUB
+        self._menu = self._build_hub_menu()
+
+    # ---------------------------------------------------------------------
+    # Menu builders
+    # ---------------------------------------------------------------------
+
+    def _build_hub_menu(self):
+        return Menu(self, list(_HUB_ITEMS),
+                    select_handler=self._on_hub_select,
+                    back_handler=self._on_hub_back)
+
+    def _build_picker_menu(self, apps):
+        if not apps:
+            items = [_PICKER_BACK]
+        else:
+            items = ["%s v%s" % (a["name"], a["version"]) for a in apps]
+            items.append(_PICKER_BACK)
+        return Menu(self, items,
+                    select_handler=self._on_picker_select,
+                    back_handler=self._on_picker_back)
+
+    # ---------------------------------------------------------------------
+    # Hub state
+    # ---------------------------------------------------------------------
+
+    def _on_hub_select(self, item, item_idx):
+        if self._state != _STATE_HUB:
+            return
+        if item == _HUB_EXIT:
+            self._exit_app()
+            return
+        kind = {
+            _HUB_INSTALL:   _KIND_INSTALL,
+            _HUB_BACKUP:    _KIND_BACKUP,
+            _HUB_DEL_DISK:  _KIND_DEL_DISK,
+            _HUB_DEL_BADGE: _KIND_DEL_BADGE,
+        }.get(item)
+        if kind is None:
+            return
+        self._enter_picker(kind)
+
+    def _on_hub_back(self):
+        if self._state == _STATE_HUB:
+            self._exit_app()
+
+    def _return_to_hub(self):
+        # Called from any state's exit path. Menu cleanup deferred so
+        # we don't rip out the subscription that might still be firing
+        # this callback.
+        self._pending_menu_cleanup = True
+        self._state = _STATE_HUB
+        self._kind = None
+        self._target = None
+        self._job = None
+        self._result_message = None
+        self._result_ok = False
+        self.button_states.clear()
+
+    # ---------------------------------------------------------------------
+    # Picker state
+    # ---------------------------------------------------------------------
+
+    def _enter_picker(self, kind):
+        self._kind = kind
+        self._picker_apps = _source_apps(kind)
+        self._pending_menu_cleanup = True
+        self._state = _STATE_PICKER
+
+    def _on_picker_select(self, item, item_idx):
+        if self._state != _STATE_PICKER:
+            return
+        if item == _PICKER_BACK or item_idx >= len(self._picker_apps):
+            self._return_to_hub()
+            return
+        self._target = self._picker_apps[item_idx]
+        self._pending_menu_cleanup = True
+        self._state = _STATE_CONFIRM
+
+    def _on_picker_back(self):
+        if self._state == _STATE_PICKER:
+            self._return_to_hub()
+
+    # ---------------------------------------------------------------------
+    # Confirm + working states
+    # ---------------------------------------------------------------------
+
+    def _begin_job(self):
+        # Set up the right job for the current kind + target, then
+        # transition to WORKING.
+        kind = self._kind
+        target = self._target
+        if kind == _KIND_INSTALL:
+            self._job = _jobs.CopyJob(
+                src_dir=target["path"],
+                dst_dir=BADGE_APPS_DIR + "/" + target["slug"],
+            )
+        elif kind == _KIND_BACKUP:
+            now_ms = time.ticks_ms() if hasattr(time, "ticks_ms") else 0
+            self._job = _jobs.CopyJob(
+                src_dir=target["path"],
+                dst_dir=DISK_APPS_DIR + "/" + target["slug"],
+                manifest_data=manifest.build(
+                    name=target["name"],
+                    slug=target["slug"],
+                    version=target["version"],
+                    file_count=0,   # will be visibly wrong in the manifest;
+                                    # accepted for now, installer doesn't use it
+                    copied_at=now_ms,
+                ),
+            )
+        elif kind == _KIND_DEL_DISK:
+            self._job = _jobs.DeleteJob(
+                path=DISK_APPS_DIR + "/" + target["slug"],
+            )
+        elif kind == _KIND_DEL_BADGE:
+            self._job = _jobs.DeleteJob(
+                path=BADGE_APPS_DIR + "/" + target["slug"],
+            )
+        self._state = _STATE_WORKING
+
+    def background_update(self, delta):
+        if self._state != _STATE_WORKING or self._job is None:
+            return
+        try:
+            self._job.tick()
+        except Exception as exc:
+            print("[disk] job tick crashed: %s: %s"
+                  % (type(exc).__name__, exc))
+            self._job.error = "%s: %s" % (type(exc).__name__, exc)
+            self._job.done = True
+        if self._job.done:
+            self._finish_job()
+
+    def _finish_job(self):
+        job = self._job
+        if job.error:
+            self._result_ok = False
+            self._result_message = job.error
+        else:
+            self._result_ok = True
+            self._result_message = self._success_message()
+        # Install / delete on the badge changes the launcher's app list;
+        # ping it so the operator can see the change without a reboot.
+        if self._kind in (_KIND_INSTALL, _KIND_DEL_BADGE) and self._result_ok:
+            try:
+                eventbus.emit(InstallNotificationEvent())
+            except Exception as exc:
+                print("[disk] launcher notify failed: %s" % exc)
+        print("[disk] %s %s: %s"
+              % (self._kind, self._target.get("slug"),
+                 "OK" if self._result_ok else "FAIL"))
+        self._state = _STATE_DONE
+
+    def _success_message(self):
+        target = self._target
+        kind = self._kind
+        if kind == _KIND_INSTALL:
+            return "Installed %s" % target["name"]
+        if kind == _KIND_BACKUP:
+            return "Backed up %s" % target["name"]
+        if kind == _KIND_DEL_DISK:
+            return "Removed from disk"
+        return "Removed from badge"
+
+    # ---------------------------------------------------------------------
+    # App-level lifecycle
+    # ---------------------------------------------------------------------
+
+    def _exit_app(self):
+        eventbus.emit(RequestForegroundPopEvent(self))
+
+    def deinit(self):
+        # Fired by HexpansionManagerApp on Flopagon removal. Nothing
+        # to release here (SPI + mount live on the bootstrap). Just
+        # clean up the menu subscription so a subsequent instance
+        # gets a clean event bus.
+        if self._menu is not None:
+            try:
+                self._menu._cleanup()
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------------------
+    # Scheduler surface
+    # ---------------------------------------------------------------------
+
+    def update(self, delta):
+        if not self._foregrounded:
+            eventbus.emit(RequestForegroundPushEvent(self))
+            self._foregrounded = True
+
+        if self._pending_menu_cleanup:
+            self._flush_pending_state()
+
+        if self._menu is not None:
+            self._menu.update(delta)
+
+        # Post-state input: WORKING has no menu, DONE has no menu.
+        if self._state == _STATE_CONFIRM:
+            self._handle_confirm_input()
+        elif self._state == _STATE_DONE:
+            self._handle_done_input()
+        return True
+
+    def _flush_pending_state(self):
+        # Runs on the next update() tick after a state transition
+        # from within a menu callback. Rebuilds the menu appropriate
+        # for the new state.
+        self._pending_menu_cleanup = False
+        if self._state == _STATE_HUB:
+            self._replace_menu(self._build_hub_menu())
+        elif self._state == _STATE_PICKER:
+            self._replace_menu(self._build_picker_menu(self._picker_apps))
+        elif self._state in (_STATE_CONFIRM, _STATE_WORKING, _STATE_DONE):
+            # These states don't use a Menu widget.
+            self._replace_menu(None)
+
+    def _replace_menu(self, new_menu):
+        if self._menu is not None:
+            try:
+                self._menu._cleanup()
+            except Exception:
+                pass
+        self._menu = new_menu
+
+    def _handle_confirm_input(self):
+        if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+            self.button_states.clear()
+            self._begin_job()
+        elif self.button_states.get(BUTTON_TYPES["CANCEL"]):
+            self.button_states.clear()
+            self._pending_menu_cleanup = True
+            self._state = _STATE_PICKER   # back to same picker
+
+    def _handle_done_input(self):
+        if (self.button_states.get(BUTTON_TYPES["CONFIRM"])
+                or self.button_states.get(BUTTON_TYPES["CANCEL"])):
+            self.button_states.clear()
+            self._return_to_hub()
+
+    def draw(self, ctx):
+        clear_background(ctx)
+        if self._state in (_STATE_HUB, _STATE_PICKER) and self._menu is not None:
+            self._menu.draw(ctx)
+            if self._state == _STATE_PICKER and not self._picker_apps:
+                _draw_lines(ctx, "No apps to", _kind_source_label(self._kind))
+        elif self._state == _STATE_CONFIRM:
+            self._draw_confirm(ctx)
+        elif self._state == _STATE_WORKING:
+            self._draw_progress(ctx)
+        elif self._state == _STATE_DONE:
+            self._draw_done(ctx)
+
+    # ---------------------------------------------------------------------
+    # Draw helpers
+    # ---------------------------------------------------------------------
+
+    def _draw_confirm(self, ctx):
+        kind = self._kind
+        target = self._target
+        destructive = kind in (_KIND_DEL_DISK, _KIND_DEL_BADGE)
+        _center_setup(ctx)
+        ctx.rgb(1, 1, 1)
+        ctx.font_size = 18
+        ctx.move_to(0, -60).text("%s %s?" % (_verb(kind), target["name"]))
+        ctx.font_size = 14
+        ctx.move_to(0, -35).text("v%s" % target["version"])
+        ctx.font_size = 12
+        ctx.rgb(0.7, 0.7, 0.7)
+        ctx.move_to(0, 20).text(_kind_from_to(kind))
+        if destructive:
+            ctx.rgb(0.9, 0.35, 0.35)
+            ctx.font_size = 14
+            ctx.move_to(0, 45).text("This deletes files")
+        ctx.rgb(0.7, 0.7, 0.7)
+        ctx.font_size = 12
+        ctx.move_to(0, 75).text("C: confirm")
+        ctx.move_to(0, 92).text("F: cancel")
+
+    def _draw_progress(self, ctx):
+        job = self._job
+        _center_setup(ctx)
+        ctx.rgb(1, 1, 1)
+        ctx.font_size = 22
+        label = "Deleting" if isinstance(job, _jobs.DeleteJob) else "Copying"
+        ctx.move_to(0, -30).text(label)
+        ctx.font_size = 14
+        ctx.move_to(0, 0).text(self._target["name"] if self._target else "")
+        if isinstance(job, _jobs.CopyJob) and job.total > 0:
+            ctx.font_size = 14
+            ctx.move_to(0, 25).text("%d / %d files" % (job.cursor, job.total))
+            bar_w = 160
+            bar_h = 6
+            filled = int(bar_w * job.cursor / job.total)
+            ctx.rgb(0.25, 0.25, 0.25).rectangle(-bar_w // 2, 50, bar_w, bar_h).fill()
+            ctx.rgb(0.2, 0.8, 0.4).rectangle(-bar_w // 2, 50, filled, bar_h).fill()
+
+    def _draw_done(self, ctx):
+        _center_setup(ctx)
+        if self._result_ok:
+            ctx.rgb(0.2, 0.8, 0.4)
+            ctx.font_size = 20
+            ctx.move_to(0, -30).text("Done")
+        else:
+            ctx.rgb(0.9, 0.35, 0.35)
+            ctx.font_size = 18
+            ctx.move_to(0, -30).text("Failed")
+        ctx.rgb(1, 1, 1)
+        ctx.font_size = 14
+        ctx.move_to(0, 5).text(self._result_message or "")
+        ctx.rgb(0.7, 0.7, 0.7)
+        ctx.font_size = 12
+        ctx.move_to(0, 80).text("C / F: back")
+
+
+def _kind_from_to(kind):
+    return {
+        _KIND_INSTALL:   "disk -> badge",
+        _KIND_BACKUP:    "badge -> disk",
+        _KIND_DEL_DISK:  "on disk",
+        _KIND_DEL_BADGE: "on badge",
+    }[kind]
+
+
+def _kind_source_label(kind):
+    return "backup" if kind in (_KIND_BACKUP, _KIND_DEL_BADGE) else "install"
+
+
+def _center_setup(ctx):
     ctx.text_align = ctx.CENTER
     ctx.text_baseline = ctx.MIDDLE
+
+
+def _draw_lines(ctx, line1, line2):
+    _center_setup(ctx)
+    ctx.rgb(1, 1, 1)
     ctx.font_size = 18
     ctx.move_to(0, -10).text(line1)
     ctx.move_to(0, 15).text(line2)
 
 
-__app_export__ = InstallerApp
+__app_export__ = DiskManagerApp
