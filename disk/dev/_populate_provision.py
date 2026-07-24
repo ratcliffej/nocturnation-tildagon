@@ -78,12 +78,25 @@ mkdir_p(APPS_DIR)
 mkdir_p(TESTAPP_DIR)
 
 print("[populate] copying installer sources")
-for f in ("app.py", "_fsutil.py", "_manifest.py", "__init__.py"):
-    copy_file(REPO_INSTALLER + "/" + f, INSTALLER_DIR + "/" + f)
+# Enumerate whatever's actually in the source dir so new modules
+# (v2 added _jobs.py and _badge_apps.py) don't need a script edit
+# to ship. Skip anything that isn't a .py source file (compiled
+# .mpy, __pycache__, editor swap files, etc).
+for e in sorted(os.ilistdir(REPO_INSTALLER)):
+    name, kind = e[0], e[1]
+    if kind & 0x4000:
+        continue  # skip dirs (__pycache__ etc)
+    if not name.endswith(".py"):
+        continue
+    copy_file(REPO_INSTALLER + "/" + name, INSTALLER_DIR + "/" + name)
+    print("  %s" % name)
 
 print("[populate] copying synthetic testapp")
-for f in ("app.py", "disk.json", "metadata.json"):
-    copy_file(REPO_TESTAPP + "/" + f, TESTAPP_DIR + "/" + f)
+for e in sorted(os.ilistdir(REPO_TESTAPP)):
+    name, kind = e[0], e[1]
+    if kind & 0x4000:
+        continue
+    copy_file(REPO_TESTAPP + "/" + name, TESTAPP_DIR + "/" + name)
 
 print("[populate] verifying layout")
 print(DISK_ROOT + "/")
