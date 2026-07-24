@@ -25,7 +25,7 @@ import vfs
 import sys
 import app
 from system.eventbus import eventbus
-from system.scheduler.events import RequestForegroundPushEvent
+from system.scheduler.events import RequestForegroundPushEvent, RequestStartAppEvent
 
 
 MOUNT = "/cartridge"
@@ -76,10 +76,22 @@ class Bootstrap(app.App):
             self._installer = InstallerApp(config=config)
         except Exception:
             self._error = "Installer init"
+            return
+
+        # Register the installer with the scheduler so its own
+        # RequestForegroundPushEvent is honoured. Without this, the
+        # scheduler drops the push with
+        # "Foreground request ignored for app that's not running" and
+        # the installer never becomes visible. The scheduler also
+        # doesn't tick background_task for un-registered apps, so the
+        # copy loop wouldn't run either.
+        eventbus.emit(RequestStartAppEvent(self._installer))
 
     def draw(self, ctx):
-        if self._installer is not None:
-            self._installer.draw(ctx)
+        # Only fires when we're foregrounded. In the success case that
+        # never happens - the installer becomes foreground app and
+        # draws itself. Only reached in an error state.
+        if self._error is None:
             return
         ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
         ctx.rgb(1, 0.4, 0.4)
@@ -91,26 +103,32 @@ class Bootstrap(app.App):
         ctx.move_to(0, 15).text(self._error or "unknown")
 
     def update(self, delta):
-        if not self._foregrounded:
+        # Only take foreground in the error state - success case has
+        # the installer taking it via its own push. Us pushing first
+        # would race the installer's first tick and briefly flash the
+        # error rendering with self._error = None.
+        if self._error is not None and not self._foregrounded:
             eventbus.emit(RequestForegroundPushEvent(self))
             self._foregrounded = True
-        if self._installer is not None:
-            return self._installer.update(delta)
-        # No button handling in the error state: removing the Flopagon
-        # terminates us cleanly via HexpansionRemovalEvent. Byte-budget
-        # trade-off - a Buttons subscription costs ~65 bytes of .mpy.
         return True
 
-    def background_update(self, delta):
-        if self._installer is not None:
-            self._installer.background_update(delta)
-
     def deinit(self):
-        if self._installer is not None and hasattr(self._installer, "deinit"):
+        # Installer was registered separately with the scheduler
+        # (RequestStartAppEvent above), so it must be explicitly
+        # terminated on Flopagon removal - otherwise its update() +
+        # background_task keep firing against a torn-down /cartridge
+        # mount. terminate() reuses the base App class's already-
+        # imported RequestStopAppEvent, saving us the import bytes.
+        if self._installer is not None:
             try:
-                self._installer.deinit()
+                self._installer.terminate()
             except Exception:
                 pass
+            if hasattr(self._installer, "deinit"):
+                try:
+                    self._installer.deinit()
+                except Exception:
+                    pass
         if self._mounted:
             try:
                 vfs.umount(MOUNT)
