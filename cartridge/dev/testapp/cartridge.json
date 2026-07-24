@@ -1,0 +1,8 @@
+{
+    "manifest_version": 1,
+    "name": "Cartridge test app",
+    "slug": "testapp",
+    "version": "1.0.0",
+    "files": 3,
+    "copied_at": 0
+}
