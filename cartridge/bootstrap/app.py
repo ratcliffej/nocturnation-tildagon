@@ -24,6 +24,8 @@ from machine import SPI
 import vfs
 import sys
 import app
+from system.eventbus import eventbus
+from system.scheduler.events import RequestForegroundPushEvent
 
 
 MOUNT = "/cartridge"
@@ -32,6 +34,7 @@ MOUNT = "/cartridge"
 class Bootstrap(app.App):
     def __init__(self, config=None):
         super().__init__()
+        self._foregrounded = False
         self._installer = None
         self._error = None
         self._mounted = False
@@ -88,8 +91,14 @@ class Bootstrap(app.App):
         ctx.move_to(0, 15).text(self._error or "unknown")
 
     def update(self, delta):
+        if not self._foregrounded:
+            eventbus.emit(RequestForegroundPushEvent(self))
+            self._foregrounded = True
         if self._installer is not None:
             return self._installer.update(delta)
+        # No button handling in the error state: removing the Flopagon
+        # terminates us cleanly via HexpansionRemovalEvent. Byte-budget
+        # trade-off - a Buttons subscription costs ~65 bytes of .mpy.
         return True
 
     def background_update(self, delta):
