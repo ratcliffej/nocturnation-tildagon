@@ -8,6 +8,15 @@ valid across edits, but the file names and the neighbouring identifiers
 The code keeps a one-line WHY hint at each site; this file carries the
 fuller reasoning for future me.
 
+**Naming note**: what this file, older commit messages, and closed PRs
+call the "cartridge" is now called the "disk" (the Flopagon PCB is
+shaped like a 3.5" floppy disk, and "disk" reads more intuitively in the
+menu UI). The rename touched: `cartridge/` → `disk/`, `cartridge.json`
+manifest → `disk.json`, `/cartridge` mount path → `/disk`, all
+`CARTRIDGE_*` constants → `DISK_*`, class names, README, and tests. The
+Flopagon PCB name (Nathan's product) stays. Pre-rename references in
+older commit messages are left as-is.
+
 ## app.py
 
 ### sys.path shim for the Tildagon launcher

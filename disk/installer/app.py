@@ -1,8 +1,8 @@
-"""Flopagon cartridge installer app.
+"""Flopagon disk installer app.
 
 Runs on the Tildagon after the EEPROM bootstrap (Phase 3) mounts the
 16 MB flash and hands off to us. Enumerates the apps/ folders on the
-cartridge, shows a picker, and copies the chosen app(s) into /apps/
+disk, shows a picker, and copies the chosen app(s) into /apps/
 on the badge's internal filesystem.
 
 Flow:
@@ -36,19 +36,19 @@ from . import _fsutil as fsutil
 from . import _manifest as manifest
 
 
-def _discover_cartridge_mount():
-    # __file__ points at .../installer/app.py; the cartridge root is
+def _discover_disk_mount():
+    # __file__ points at .../installer/app.py; the disk root is
     # its grandparent. Falls back if __file__ is unavailable (some
     # MicroPython frozen-module builds).
     try:
         installer_dir = __file__.rsplit("/", 1)[0]
         return installer_dir.rsplit("/", 1)[0]
     except (NameError, AttributeError):
-        return "/cartridge"
+        return "/disk"
 
 
-CARTRIDGE_MOUNT = _discover_cartridge_mount()
-CARTRIDGE_APPS_DIR = CARTRIDGE_MOUNT + "/apps"
+DISK_MOUNT = _discover_disk_mount()
+DISK_APPS_DIR = DISK_MOUNT + "/apps"
 BADGE_APPS_DIR = "/apps"
 
 _STATE_PICKER = "picker"
@@ -70,7 +70,7 @@ class InstallerApp(app.App):
         self._foregrounded = False
         self._state = _STATE_PICKER
 
-        self._catalog = _enumerate_cartridge_apps()
+        self._catalog = _enumerate_disk_apps()
         self._install_targets = []
         self._install_queue = []
         self._install_cursor = 0
@@ -178,7 +178,7 @@ class InstallerApp(app.App):
             # transition surfaces here rather than crashing the whole
             # app. Prints the type + message to the serial console so
             # we can diagnose later.
-            print("[cartridge] install tick crashed: %s: %s"
+            print("[disk] install tick crashed: %s: %s"
                   % (type(exc).__name__, exc))
             self._error_message = "%s: %s" % (type(exc).__name__, exc)
             self._state = _STATE_DONE
@@ -243,8 +243,8 @@ class InstallerApp(app.App):
         try:
             eventbus.emit(InstallNotificationEvent())
         except Exception as exc:
-            print("[cartridge] launcher notify failed: %s" % exc)
-        print("[cartridge] install complete: %d ok, %d failed"
+            print("[disk] launcher notify failed: %s" % exc)
+        print("[disk] install complete: %d ok, %d failed"
               % (sum(1 for r in self._install_results if r["ok"]),
                  sum(1 for r in self._install_results if not r["ok"])))
         self._state = _STATE_DONE
@@ -268,7 +268,7 @@ class InstallerApp(app.App):
         if self._state == _STATE_PICKER:
             self._menu.draw(ctx)
             if not self._catalog:
-                _draw_message(ctx, "No apps on this", "cartridge")
+                _draw_message(ctx, "No apps on this", "disk")
         elif self._state == _STATE_INSTALLING:
             self._draw_progress(ctx)
         elif self._state == _STATE_DONE:
@@ -284,7 +284,7 @@ class InstallerApp(app.App):
             try:
                 self._menu._cleanup()
             except Exception as exc:
-                print("[cartridge] menu cleanup failed: %s" % exc)
+                print("[disk] menu cleanup failed: %s" % exc)
             self._menu = None
             self._pending_menu_cleanup = False
         if self._state == _STATE_PICKER and self._menu is not None:
@@ -343,16 +343,16 @@ class InstallerApp(app.App):
         ctx.move_to(0, 100).text("C / F: exit")
 
 
-def _enumerate_cartridge_apps():
-    """Scan /cartridge/apps/*/cartridge.json into a menu-ready list."""
+def _enumerate_disk_apps():
+    """Scan /disk/apps/*/disk.json into a menu-ready list."""
     entries = []
     try:
-        names = os.listdir(CARTRIDGE_APPS_DIR)
+        names = os.listdir(DISK_APPS_DIR)
     except OSError:
         return entries
     names.sort()
     for name in names:
-        folder = CARTRIDGE_APPS_DIR + "/" + name
+        folder = DISK_APPS_DIR + "/" + name
         if not fsutil.path_isdir(folder):
             continue
         m = manifest.read(folder + "/" + manifest.MANIFEST_NAME)

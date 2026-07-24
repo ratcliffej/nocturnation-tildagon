@@ -1,7 +1,7 @@
 """Runs on the badge via `mpremote mount . run` from the populate
 script. Copies the installer + synthetic testapp from the mounted
-host repo (/remote/cartridge/{installer,dev/testapp}/) to the
-Flopagon flash at /cartridge/{installer,apps/testapp}/. All in one
+host repo (/remote/disk/{installer,dev/testapp}/) to the
+Flopagon flash at /disk/{installer,apps/testapp}/. All in one
 mpremote session so a mid-op contact drop can't strand us between
 mkdir and cp.
 
@@ -10,13 +10,13 @@ Not a badge app - no __app_export__. Not launched by the launcher.
 
 import os
 
-CARTRIDGE_ROOT = "/cartridge"
-INSTALLER_DIR = CARTRIDGE_ROOT + "/installer"
-APPS_DIR = CARTRIDGE_ROOT + "/apps"
+DISK_ROOT = "/disk"
+INSTALLER_DIR = DISK_ROOT + "/installer"
+APPS_DIR = DISK_ROOT + "/apps"
 TESTAPP_DIR = APPS_DIR + "/testapp"
 
-REPO_INSTALLER = "/remote/cartridge/installer"
-REPO_TESTAPP = "/remote/cartridge/dev/testapp"
+REPO_INSTALLER = "/remote/disk/installer"
+REPO_TESTAPP = "/remote/disk/dev/testapp"
 
 
 def rmtree(p):
@@ -61,11 +61,11 @@ def show(p, depth=0):
 
 
 try:
-    os.listdir(CARTRIDGE_ROOT)
+    os.listdir(DISK_ROOT)
 except OSError:
     print("ERROR: %s not mounted. Insert Flopagon and confirm the Phase 3"
-          " bootstrap ran - /cartridge/ should appear in"
-          " `mpremote resume ls`." % CARTRIDGE_ROOT)
+          " bootstrap ran - /disk/ should appear in"
+          " `mpremote resume ls`." % DISK_ROOT)
     raise SystemExit(1)
 
 print("[populate] wiping previous installer + apps")
@@ -82,11 +82,11 @@ for f in ("app.py", "_fsutil.py", "_manifest.py", "__init__.py"):
     copy_file(REPO_INSTALLER + "/" + f, INSTALLER_DIR + "/" + f)
 
 print("[populate] copying synthetic testapp")
-for f in ("app.py", "cartridge.json", "metadata.json"):
+for f in ("app.py", "disk.json", "metadata.json"):
     copy_file(REPO_TESTAPP + "/" + f, TESTAPP_DIR + "/" + f)
 
 print("[populate] verifying layout")
-print(CARTRIDGE_ROOT + "/")
-show(CARTRIDGE_ROOT, 1)
+print(DISK_ROOT + "/")
+show(DISK_ROOT, 1)
 
 print("[populate] done")

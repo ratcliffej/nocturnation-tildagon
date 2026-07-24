@@ -1,42 +1,42 @@
 #!/usr/bin/env bash
-# cartridge/dev/smoke_deploy.sh
+# disk/dev/smoke_deploy.sh
 #
 # Stage the Phase 2 installer + a synthetic "testapp" under
-# /apps/nocturnation_cartridge_smoke/ on the badge and register it as
+# /apps/nocturnation_disk_smoke/ on the badge and register it as
 # a first-class badge app so the badge launcher can start it the
 # normal way. Avoids the REPL-based launch path, which hits a circular
 # import in system.eventbus / system.scheduler when the scheduler
 # hasn't gone through its normal boot init.
 #
 # Layout on the badge:
-#   /apps/nocturnation_cartridge_smoke/
+#   /apps/nocturnation_disk_smoke/
 #       app.py           # thin wrapper: __app_export__ = InstallerApp
 #       __init__.py
-#       metadata.json    # visible in launcher as "Cartridge smoke test"
+#       metadata.json    # visible in launcher as "Disk smoke test"
 #       installer/
 #           app.py, _fsutil.py, _manifest.py, __init__.py
 #       apps/
 #           testapp/
-#               app.py, cartridge.json, metadata.json
+#               app.py, disk.json, metadata.json
 #
-# CARTRIDGE_MOUNT in installer/app.py is discovered from __file__ at
+# DISK_MOUNT in installer/app.py is discovered from __file__ at
 # import time, so it correctly reads
-# /apps/nocturnation_cartridge_smoke/apps/*/ without any config.
+# /apps/nocturnation_disk_smoke/apps/*/ without any config.
 #
 # Workflow:
 #   1. Run this script (deploys + resets the badge).
-#   2. On the badge launcher, tap "Cartridge smoke test".
-#   3. Picker should list "Cartridge test app v1.0.0" -> confirm.
+#   2. On the badge launcher, tap "Disk smoke test".
+#   3. Picker should list "Disk test app v1.0.0" -> confirm.
 #   4. Progress bar + done screen.
-#   5. Cancel back to launcher; verify "Cartridge test app" now shows.
+#   5. Cancel back to launcher; verify "Disk test app" now shows.
 #   6. Optional: soft-reboot and confirm it survives.
-#   7. ./cartridge/dev/smoke_deploy.sh --cleanup when done.
+#   7. ./disk/dev/smoke_deploy.sh --cleanup when done.
 #
 # Usage:
-#   ./cartridge/dev/smoke_deploy.sh              # deploy + reset
-#   ./cartridge/dev/smoke_deploy.sh --no-reset   # deploy, skip reset
-#   ./cartridge/dev/smoke_deploy.sh --cleanup    # wipe smoke folders + old /cartridge
-#   ./cartridge/dev/smoke_deploy.sh --help
+#   ./disk/dev/smoke_deploy.sh              # deploy + reset
+#   ./disk/dev/smoke_deploy.sh --no-reset   # deploy, skip reset
+#   ./disk/dev/smoke_deploy.sh --cleanup    # wipe smoke folders + old /disk
+#   ./disk/dev/smoke_deploy.sh --help
 
 set -euo pipefail
 
@@ -59,9 +59,12 @@ fi
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-SMOKE_ROOT="/apps/nocturnation_cartridge_smoke"
+SMOKE_ROOT="/apps/nocturnation_disk_smoke"
 INSTALLED_TARGET="/apps/testapp"
-OLD_ROOT="/cartridge"   # left over from the pre-persistence layout
+OLD_ROOT="/cartridge"   # legacy cleanup: /cartridge existed on badge root in
+                        # the pre-persistence-fix + pre-disk-rename layouts.
+                        # Left in place so a dev badge still carrying the
+                        # debris gets swept clean by --cleanup.
 
 RMTREE_PY="
 import os
@@ -120,7 +123,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 # Wrapper app.py: makes the smoke folder a normal launcher-visible
 # badge app. Delegates to InstallerApp via __app_export__.
 cat > "$TMPDIR/wrapper_app.py" <<'PY_EOF'
-"""Smoke-test wrapper for the cartridge installer.
+"""Smoke-test wrapper for the disk installer.
 
 Presents the installer as a normal badge app the launcher can start
 directly. Only used for Phase 2 dev; Phase 3 launches the installer
@@ -133,12 +136,12 @@ __app_export__ = InstallerApp
 PY_EOF
 
 cat > "$TMPDIR/wrapper_init.py" <<'PY_EOF'
-# Wrapper package for the cartridge installer smoke test.
+# Wrapper package for the disk installer smoke test.
 PY_EOF
 
 cat > "$TMPDIR/wrapper_metadata.json" <<'JSON_EOF'
 {
-    "name": "Cartridge smoke test",
+    "name": "Disk smoke test",
     "hidden": false,
     "version": "0.0.0"
 }
@@ -148,18 +151,18 @@ echo "[smoke] copying wrapper + installer sources"
 mpremote cp "$TMPDIR/wrapper_app.py"          ":${SMOKE_ROOT}/app.py"
 mpremote cp "$TMPDIR/wrapper_init.py"         ":${SMOKE_ROOT}/__init__.py"
 mpremote cp "$TMPDIR/wrapper_metadata.json"   ":${SMOKE_ROOT}/metadata.json"
-mpremote cp cartridge/installer/app.py        ":${SMOKE_ROOT}/installer/app.py"
-mpremote cp cartridge/installer/_fsutil.py    ":${SMOKE_ROOT}/installer/_fsutil.py"
-mpremote cp cartridge/installer/_manifest.py  ":${SMOKE_ROOT}/installer/_manifest.py"
-mpremote cp cartridge/installer/__init__.py   ":${SMOKE_ROOT}/installer/__init__.py"
+mpremote cp disk/installer/app.py        ":${SMOKE_ROOT}/installer/app.py"
+mpremote cp disk/installer/_fsutil.py    ":${SMOKE_ROOT}/installer/_fsutil.py"
+mpremote cp disk/installer/_manifest.py  ":${SMOKE_ROOT}/installer/_manifest.py"
+mpremote cp disk/installer/__init__.py   ":${SMOKE_ROOT}/installer/__init__.py"
 
 # Synthetic testapp payload: a real Tildagon App that renders a
-# label + a cartridge.json manifest for the installer's picker.
+# label + a disk.json manifest for the installer's picker.
 # NOTE: base App.update() returns False, which suppresses draw() -
 # the app MUST override update() to return non-False, or the screen
 # never repaints and the app "hangs" from the operator's view.
 cat > "$TMPDIR/app.py" <<'PY_EOF'
-# Synthetic testapp for the cartridge installer smoke test. Renders a
+# Synthetic testapp for the disk installer smoke test. Renders a
 # label + handles CANCEL so the operator can exit back to the launcher.
 import app
 from events.input import Buttons, BUTTON_TYPES
@@ -188,7 +191,7 @@ class TestApp(app.App):
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
         ctx.font_size = 22
-        ctx.move_to(0, -10).text("Cartridge")
+        ctx.move_to(0, -10).text("Disk")
         ctx.move_to(0, 15).text("test app")
         ctx.font_size = 12
         ctx.rgb(0.6, 0.6, 0.6)
@@ -198,10 +201,10 @@ class TestApp(app.App):
 __app_export__ = TestApp
 PY_EOF
 
-cat > "$TMPDIR/cartridge.json" <<'JSON_EOF'
+cat > "$TMPDIR/disk.json" <<'JSON_EOF'
 {
     "manifest_version": 1,
-    "name": "Cartridge test app",
+    "name": "Disk test app",
     "slug": "testapp",
     "version": "1.0.0",
     "files": 2,
@@ -211,7 +214,7 @@ JSON_EOF
 
 cat > "$TMPDIR/metadata.json" <<'JSON_EOF'
 {
-    "name": "Cartridge test app",
+    "name": "Disk test app",
     "hidden": false,
     "version": "1.0.0"
 }
@@ -219,7 +222,7 @@ JSON_EOF
 
 echo "[smoke] copying synthetic ${SMOKE_ROOT}/apps/testapp"
 mpremote cp "$TMPDIR/app.py"          ":${SMOKE_ROOT}/apps/testapp/app.py"
-mpremote cp "$TMPDIR/cartridge.json"  ":${SMOKE_ROOT}/apps/testapp/cartridge.json"
+mpremote cp "$TMPDIR/disk.json"  ":${SMOKE_ROOT}/apps/testapp/disk.json"
 mpremote cp "$TMPDIR/metadata.json"   ":${SMOKE_ROOT}/apps/testapp/metadata.json"
 
 echo "[smoke] verifying layout"
@@ -249,15 +252,15 @@ cat <<EOF
 
 Next steps on the badge:
   1. Wait for the badge to finish rebooting.
-  2. On the launcher, scroll to "Cartridge smoke test" and tap CONFIRM (C).
-  3. Picker should show "Install Cartridge test app v1.0.0" -> tap CONFIRM.
-  4. Progress bar animates, done screen shows "OK Cartridge test app".
+  2. On the launcher, scroll to "Disk smoke test" and tap CONFIRM (C).
+  3. Picker should show "Install Disk test app v1.0.0" -> tap CONFIRM.
+  4. Progress bar animates, done screen shows "OK Disk test app".
   5. Tap CANCEL (F) to exit; the launcher should now include a
-     "Cartridge test app" entry.
+     "Disk test app" entry.
 
 Verify install landed on disk:
   mpremote exec 'import os; print(os.listdir("${INSTALLED_TARGET}"))'
 
 Cleanup:
-  ./cartridge/dev/smoke_deploy.sh --cleanup
+  ./disk/dev/smoke_deploy.sh --cleanup
 EOF

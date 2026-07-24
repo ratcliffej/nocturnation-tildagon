@@ -1,6 +1,6 @@
 {
     "manifest_version": 1,
-    "name": "Cartridge test app",
+    "name": "Disk test app",
     "slug": "testapp",
     "version": "1.0.0",
     "files": 3,

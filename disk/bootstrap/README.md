@@ -1,6 +1,6 @@
 # Flopagon EEPROM autoboot bootstrap
 
-Phase 3 of the cartridge workflow. This is the tiny app that lives on
+Phase 3 of the disk workflow. This is the tiny app that lives on
 the Flopagon's 2 KB EEPROM and gets auto-run by the badge when the
 Flopagon is inserted. Its only job is to init the 16 MB flash, mount
 it, and hand off to the Phase 2 installer.
@@ -38,12 +38,12 @@ badge inserts Flopagon
         -> Bootstrap.__init__(config=HexpansionConfig(port))
             1. init SPI on config.pin[1..3] (sck/mosi/miso)
             2. init FLASH on config.pin[0] as CS (2-attempt retry on ValueError)
-            3. vfs.mount(flash, "/cartridge")
-            4. sys.path.append("/cartridge")
+            3. vfs.mount(flash, "/disk")
+            4. sys.path.append("/disk")
             5. from installer.app import InstallerApp
             6. Bootstrap forwards draw/update/background_update to installer
-        <- InstallerApp.__init__ discovers CARTRIDGE_MOUNT from __file__
-           = "/cartridge", reads /cartridge/apps/*/cartridge.json, etc.
+        <- InstallerApp.__init__ discovers DISK_MOUNT from __file__
+           = "/disk", reads /disk/apps/*/disk.json, etc.
 ```
 
 On Flopagon removal, `Bootstrap.deinit()` propagates to the installer
@@ -52,10 +52,10 @@ On Flopagon removal, `Bootstrap.deinit()` propagates to the installer
 ## Compile
 
 ```
-.venv/bin/mpy-cross cartridge/bootstrap/app.py
+.venv/bin/mpy-cross disk/bootstrap/app.py
 ```
 
-Output: `cartridge/bootstrap/app.mpy`. Check the byte count against
+Output: `disk/bootstrap/app.mpy`. Check the byte count against
 the ~1.6 KB V1 budget above before writing.
 
 The mpy version is determined by whatever mpy-cross is installed;
@@ -73,7 +73,7 @@ Overwriting his `app.mpy` with ours takes over the autoboot without
 touching the header (which the badge's hexpansion manager reads
 first).
 
-Steps (per Flopagon, once per cartridge):
+Steps (per Flopagon, once per disk):
 
 1. **Short the write-protect jumper.** The 0.1" header in the corner
    of the PCB — bridge with a jumper wire or tweezers. This is
@@ -88,7 +88,7 @@ Steps (per Flopagon, once per cartridge):
 3. **From the host, connect to the badge and overwrite the .mpy:**
 
    ```
-   mpremote cp cartridge/bootstrap/app.mpy :hexpansion_<N>/app.mpy
+   mpremote cp disk/bootstrap/app.mpy :hexpansion_<N>/app.mpy
    ```
 
    The badge's hexpansion manager will only re-launch our app on the
@@ -107,14 +107,14 @@ After writing + reset/re-insert:
 - Serial console should show the hexpansion insertion event and our
   bootstrap launching (not Nathan's mount menu).
 - If the flash is populated with `/installer/app.py` + at least one
-  `/apps/*/cartridge.json`, the installer picker appears.
+  `/apps/*/disk.json`, the installer picker appears.
 - If the flash is empty (no `installer/`), the bootstrap's error
-  screen shows `Cartridge error / No installer`.
+  screen shows `Disk error / No installer`.
 
-## Prerequisites for a full working cartridge
+## Prerequisites for a full working disk
 
 This bootstrap alone doesn't do anything useful — it hands off to the
-installer, which reads from the flash. A working cartridge needs, in
+installer, which reads from the flash. A working disk needs, in
 this order:
 
 1. Flopagon provisioned with Nathan's `setup_flopagon(port)` — one-off,
@@ -124,7 +124,7 @@ this order:
    (steps above).
 3. Installer + at least one app copied onto the 16 MB flash:
    - `/installer/{app.py, _fsutil.py, _manifest.py, __init__.py}`
-   - `/apps/<slug>/{app.py, cartridge.json, metadata.json, ...}`
+   - `/apps/<slug>/{app.py, disk.json, metadata.json, ...}`
 
 Phase 4 (provisioning script + docs) turns this into a repeatable
 one-command flow.
