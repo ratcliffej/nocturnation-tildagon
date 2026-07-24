@@ -82,14 +82,19 @@ class Bootstrap(app.App):
         if MOUNT not in sys.path:
             sys.path.append(MOUNT)
 
+        # Grab the installer via __app_export__ rather than a named
+        # class - the class was renamed once (InstallerApp -> Disk-
+        # ManagerApp) and any future rename shouldn't break the
+        # bootstrap. Badge OS convention: every app exposes its
+        # entry class as __app_export__.
         try:
-            from installer.app import InstallerApp
+            from installer.app import __app_export__ as InstallerCls
         except Exception:
             self._error = "No installer"
             return
 
         try:
-            self._installer = InstallerApp(config=config)
+            self._installer = InstallerCls(config=config)
         except Exception:
             self._error = "Installer init"
             return

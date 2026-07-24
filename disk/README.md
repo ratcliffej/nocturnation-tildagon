@@ -1,48 +1,52 @@
 # Flopagon disk
 
-Deploy NocturNation onto Tildagon badges without WiFi — plug in a
-pre-provisioned Flopagon, and the badge auto-launches an installer
-menu.
+Deploy Tildagon apps without WiFi. Plug in a pre-provisioned Flopagon
+and the badge auto-launches a disk manager: install apps from the
+disk, back apps up onto the disk, or delete apps from either side.
 
 Solves the EMF Stage D problem: punters wanted NocturNation on their
-badges but the site WiFi was too poor to reach the app store.
-
-## Status
-
-- **Phase 2 (this PR):** flash-resident installer — done.
-- **Phase 3:** EEPROM autoboot bootstrap — pending.
-- **Phase 1:** "Copy to Flopagon" menu item in the Lume app — pending.
-- **Phase 4:** provisioning script + end-to-end README — pending.
-
-Full workflow docs land with Phase 4. This README is the placeholder.
+badges but the site WiFi was too poor to reach the app store. The
+disk manager works for any Tildagon app, not just NocturNation.
 
 ## Layout
 
 ```
 disk/
-├── installer/       # Phase 2 — lives on the Flopagon flash at
-│   │                # /disk/installer/, auto-launched by the
-│   │                # Phase 3 EEPROM bootstrap on hexpansion insert.
-│   ├── app.py       # InstallerApp — Menu + picker + copier
-│   ├── _fsutil.py   # host-testable filesystem helpers
-│   └── _manifest.py # disk.json read/write helpers
-├── bootstrap/       # Phase 3 — pending
-└── provision/       # Phase 4 — pending
+├── installer/          # runs on the Tildagon when the disk is inserted
+│   ├── app.py          # DiskManagerApp — hub menu + all four flows
+│   ├── _jobs.py        # CopyJob + DeleteJob state machines
+│   ├── _badge_apps.py  # enumerate apps on /apps/
+│   ├── _fsutil.py      # filesystem helpers (dual-runtime)
+│   └── _manifest.py    # disk.json read/write helpers
+├── bootstrap/          # 2 KB EEPROM app that auto-launches installer
+├── dev/                # dev tooling (populate, smoke test, probe)
+└── README.md           # this file
 ```
+
+## Operations (hub menu)
+
+1. **Install app** — copy from disk to badge
+2. **Backup app** — copy from badge to disk (writes `disk.json` manifest)
+3. **Delete from disk** — remove an app from disk
+4. **Delete from badge** — remove an app from the Tildagon
+5. **Exit** — return to launcher
+
+Each operation drills into a sub-picker of the relevant apps, asks for
+confirmation, then progresses through the job with an on-screen bar
+(for copies) or a single-tick delete.
 
 ## Contract with the bootstrap
 
-Phase 3 mounts the Flopagon's 16 MB flash at whatever path it likes
-and adds it to `sys.path`. The installer discovers its own mount
-point at import time from `__file__` — installed as
-`<mount>/installer/app.py`, it reads `<mount>/apps/*/`. So the
-bootstrap can pick any mount path without a code change here.
+Bootstrap mounts the Flopagon's 16 MB flash at any path and adds it to
+`sys.path`. Installer discovers its own mount from `__file__` —
+installed as `<mount>/installer/app.py`, it reads `<mount>/apps/*/`.
+Production mount is `/disk`.
 
-The mount is expected to hold:
+Expected layout on the disk:
 
 ```
 <mount>/
-├── installer/       # this app
+├── installer/
 └── apps/
     ├── nocturnation/
     │   ├── disk.json
@@ -66,35 +70,37 @@ The mount is expected to hold:
 }
 ```
 
-Written by the Phase 1 self-copy feature. Read by the installer to
-build its menu. `slug` becomes the target folder name — e.g. it will
-install into `/apps/nocturnation/` on the badge.
+Written by the Backup flow. Read by the Install picker for display.
 
-## Installer behaviour
+## Behaviour details
 
-1. On launch, enumerate `/disk/apps/*/disk.json`.
-2. Show a picker:
-   - 0 apps → "No apps on this disk" + Exit
-   - 1 app → "Install &lt;name&gt; v&lt;version&gt;" + Cancel
-   - N apps → one row per app + "Install all" + Cancel
-3. On confirm, wipe existing `/apps/&lt;slug&gt;/` on the badge, then copy
-   one file per background-tick (`background_update`, ~20 Hz) so
-   the progress bar stays live.
-4. Per-app failure isolation: an OSError on one file marks that app
-   failed but doesn't stop the batch.
-5. On completion, emit `InstallNotificationEvent()` so the launcher
-   re-scans `/apps` and picks up newly installed apps without a reboot.
-6. Gracefully handles Flopagon yanked mid-install (OSError on read
-   surfaces as a failed install for the current app; the installer
-   itself is now running from RAM so it stays alive).
+- **Slug preservation** — a badge app at `/apps/<slug>/` backs up to
+  `<mount>/apps/<slug>/`. On install into a different badge, the same
+  slug is used.
+- **Overwrites** — Install wipes any existing `/apps/<slug>/` before
+  copying. Backup wipes any existing `<mount>/apps/<slug>/`.
+- **Copy progress** — one file per background-tick (~20 Hz) so draw()
+  keeps rendering. A 50-file app takes ~2.5 s.
+- **Failure handling** — file-level errors abort that job with a
+  visible message; other apps and the badge itself are untouched.
+- **Launcher rescan** — Install + Delete-from-badge emit
+  `InstallNotificationEvent` so newly present / absent apps update
+  in the launcher without a reboot.
+- **Yanking the Flopagon mid-op** — the current job errors on the
+  next read, transitions to Done with a fail message.
+
+## Hidden apps
+
+`metadata.json` with `hidden: true` are excluded from the Backup +
+Delete-from-badge pickers (the same filter the launcher uses).
 
 ## Testing
 
-Host pytest covers the filesystem + manifest helpers:
+Host pytest covers the pure-Python helpers:
 
-```
-.venv/bin/pytest tests/test_disk_fsutil.py tests/test_disk_manifest.py
+```bash
+.venv/bin/pytest tests/test_disk_*.py
 ```
 
-The `InstallerApp` class itself is Tildagon-runtime only (badge OS
-imports); it must be verified on hardware.
+The `DiskManagerApp` UI itself is Tildagon-runtime only and needs
+hardware validation.
