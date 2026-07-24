@@ -24,7 +24,7 @@ import os
 
 import app
 from app_components import Menu, clear_background
-from events.input import BUTTON_TYPES
+from events.input import Buttons, BUTTON_TYPES
 from system.eventbus import eventbus
 from system.launcher.events import InstallNotificationEvent
 from system.scheduler.events import (
@@ -61,6 +61,11 @@ class InstallerApp(app.App):
     def __init__(self, config=None):
         super().__init__()
         self.config = config
+        # Owns its own Buttons subscription because the done-screen
+        # exit path uses self.button_states.get() directly. The picker
+        # phase gets its buttons via Menu, but Menu goes away when we
+        # transition to installing, so we need our own for the tail.
+        self.button_states = Buttons(self)
 
         self._foregrounded = False
         self._state = _STATE_PICKER
