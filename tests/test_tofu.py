@@ -70,9 +70,11 @@ class TestFirstLock:
         assert t.locked_id == 0x42
 
     def test_broadcast_source_id_never_locks(self):
-        """0xFF is the wildcard / anonymous slot; never a valid Director."""
+        """0xFFFF is the wildcard / anonymous slot; never a valid Director.
+        (v3: widened from 0xFF alongside the source_id u8->u16 wire change.)
+        """
         t = TofuLock()
-        admitted = t.admit(make_frame(source_id=0xFF), channel=1, now_ms=0)
+        admitted = t.admit(make_frame(source_id=0xFFFF), channel=1, now_ms=0)
         assert admitted is False
         assert t.is_locked() is False
 

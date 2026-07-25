@@ -36,7 +36,7 @@ MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE - HEADER_SIZE
 # the auto-generated YAML.
 TEXT_DISPLAY_MAX_HEADER_LEN  = 64
 TEXT_DISPLAY_MAX_BODY_LEN    = 128
-TEXT_DISPLAY_FIXED_PREFIX    = 6   # target_group + r + g + b + ttl_ms(2 LE)
+TEXT_DISPLAY_FIXED_PREFIX    = 7   # v3: target_group(2 LE) + r + g + b + ttl_ms(2 LE)
 TEXT_DISPLAY_MIN_PAYLOAD_LEN = TEXT_DISPLAY_FIXED_PREFIX + 1 + 1  # both strings empty
 
 

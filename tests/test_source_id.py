@@ -21,15 +21,19 @@ class TestBoundaryValues:
         assert SourceId.PERFORMANCE_MIN == 0x40
         assert SourceId.PERFORMANCE_MAX == 0xFE
 
-    def test_broadcast_is_0xFF(self):
-        assert SourceId.BROADCAST == 0xFF
+    def test_broadcast_is_0xFFFF(self):
+        # v3: widened from 0xFF to 0xFFFF alongside the source_id u8->u16.
+        assert SourceId.BROADCAST == 0xFFFF
 
     def test_ranges_are_contiguous_and_dont_overlap(self):
         # The two ranges meet exactly at 0x3F/0x40 - no gap, no overlap.
         assert SourceId.COMMUNITY_MAX + 1 == SourceId.PERFORMANCE_MIN
 
-    def test_performance_range_stops_one_short_of_broadcast(self):
-        assert SourceId.PERFORMANCE_MAX + 1 == SourceId.BROADCAST
+    def test_performance_range_stops_well_below_broadcast(self):
+        # v3: the extended range 0x0100..0xFFFE sits between the Performance
+        # ceiling and the broadcast sentinel - unused by current UI/NVS but
+        # reserved by the wire for a future widening.
+        assert SourceId.PERFORMANCE_MAX < SourceId.BROADCAST
 
     def test_re_exported_from_protocol_package(self):
         # SourceId is reachable both via `from nocturnation.protocol import ...`
@@ -90,19 +94,39 @@ class TestIsPerformanceRange:
 
 
 class TestExhaustivePartition:
-    """For every possible source_id byte (0x00..0xFF), exactly one
-    of {is_community_range, is_performance_range, == BROADCAST} is
-    true. No source_id falls in a gap; none lands in two categories.
+    """For every u8-natural source_id (0x00..0xFF), at most one of
+    {is_community_range, is_performance_range, == BROADCAST} is true.
+    Contiguous 0x00..0xFE partitions cleanly into community / performance.
+    0xFF is the gap between the Performance ceiling and the extended range
+    (v3), reserved to prevent v3 sources from clashing with a v2-relic value.
+    0xFFFF is broadcast. Values in 0x0100..0xFFFE (extended range) are
+    NOT in any current-generation partition - future NVS/UI widening only.
     """
 
-    def test_every_byte_lands_in_exactly_one_partition(self):
+    def test_every_u8_byte_lands_in_at_most_one_partition(self):
+        # v3: iterate the current-UI-relevant u8 range. Extended-range
+        # values (0x0100..0xFFFE) are handled by a separate assertion below.
         for source_id in range(0x100):
             in_community = is_community_range(source_id)
             in_performance = is_performance_range(source_id)
             is_broadcast = source_id == SourceId.BROADCAST
             categories = sum([in_community, in_performance, is_broadcast])
-            assert categories == 1, (
+            assert categories <= 1, (
                 "source_id 0x%02X lands in %d categories "
-                "(community=%s, performance=%s, broadcast=%s); expected exactly 1"
+                "(community=%s, performance=%s, broadcast=%s); expected <= 1"
                 % (source_id, categories, in_community, in_performance, is_broadcast)
             )
+        # 0xFF is deliberately unpartitioned (v2-broadcast relic) so a
+        # v2-firmware receiver that misreads a v3 frame's LSB as its whole
+        # source_id doesn't accidentally lock to a valid partition value.
+        assert not is_community_range(0xFF)
+        assert not is_performance_range(0xFF)
+        assert 0xFF != SourceId.BROADCAST
+
+    def test_extended_range_reserved_but_unpartitioned(self):
+        # v3 wire carries 0x0100..0xFFFE for future NVS/UI. None of these
+        # values are in the current-UI partitions.
+        for source_id in (0x0100, 0x1234, 0xFFFE):
+            assert not is_community_range(source_id)
+            assert not is_performance_range(source_id)
+            assert source_id != SourceId.BROADCAST

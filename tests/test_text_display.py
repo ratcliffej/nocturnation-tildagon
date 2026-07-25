@@ -41,7 +41,7 @@ def test_encode_text_display_minimal_round_trip():
     # Magic + header size + payload >= MIN
     assert raw[:2] == bytes((MAGIC_0, MAGIC_1))
     assert raw[2] == PROTOCOL_VERSION
-    assert raw[6] == MessageType.TEXT_DISPLAY
+    assert raw[7] == MessageType.TEXT_DISPLAY   # v3: message_type at offset 7
     f = parse_frame(raw)
     assert f.message_type == MessageType.TEXT_DISPLAY
     assert f.text_target_group == 0

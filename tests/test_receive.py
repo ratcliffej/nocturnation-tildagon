@@ -10,18 +10,19 @@ from nocturnation.receive import process_frame, parse_admittable, MAX_HOP_COUNT
 
 
 # Manual annex C.1 reference vector. Modified per-test with helpers.
-# Spec v2: 2-byte "NN" magic prefix + protocol_version 0x02.
+# Spec v3: 2-byte "NN" magic prefix + protocol_version 0x03 + LE u16
+# source_id + LE u16 target_group.
 LIGHT_PULSE_VECTOR = bytes([
     0x4E,  # magic byte 0 ('N')
     0x4E,  # magic byte 1 ('N')
-    0x02,  # protocol_version
-    0x01,  # source_id
+    0x03,  # protocol_version (v3)
+    0x01, 0x00,  # source_id LE u16 (v3)
     0x2A,  # sequence (42)
     0x00,  # hop_count
     0x03,  # message_type LIGHT_PULSE
-    0x09,  # payload_len
+    0x0A,  # payload_len (v3: 10)
     0x00,  # target_class
-    0x00,  # target_group
+    0x00, 0x00,  # target_group LE u16 (v3)
     0xFF,  # r
     0x00,  # g
     0x00,  # b
@@ -33,10 +34,12 @@ LIGHT_PULSE_VECTOR = bytes([
 
 
 def make_frame(seq=42, hop=0, source=1):
+    # v3 header offsets: 3-4 source_id LE, 5 seq, 6 hop
     b = bytearray(LIGHT_PULSE_VECTOR)
-    b[3] = source           # offsets shifted +2 by the magic prefix
-    b[4] = seq
-    b[5] = hop
+    b[3] = source & 0xFF
+    b[4] = (source >> 8) & 0xFF
+    b[5] = seq
+    b[6] = hop
     return bytes(b)
 
 
@@ -98,7 +101,7 @@ class TestStructuralRejection:
     def test_payload_len_mismatch_dropped(self):
         d = DedupRing()
         bad = bytearray(LIGHT_PULSE_VECTOR)
-        bad[5] = 0x07  # claim 7-byte payload
+        bad[8] = 0x08  # v3 payload_len offset; claim 8, actual is 10
         assert process_frame(bytes(bad), d) is None
 
 
