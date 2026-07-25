@@ -65,8 +65,11 @@ def parse_target(target):
         target_group = int(parts[1], 16)
     except ValueError:
         raise ValueError("render_fx target fields must be hex, got %r" % (target,))
-    if not (0 <= target_class <= 0xFF) or not (0 <= target_group <= 0xFF):
-        raise ValueError("render_fx target fields out of range 0x00-0xFF: %r" % (target,))
+    # v3: target_group widened to u16 on the wire (0x0000..0xFFFE valid,
+    # 0xFFFF reserved). target_class stays u8. Existing shows all use
+    # values < 256; the wider range is available for future authoring.
+    if not (0 <= target_class <= 0xFF) or not (0 <= target_group <= 0xFFFE):
+        raise ValueError("render_fx target fields out of range: %r" % (target,))
     return target_class, target_group
 
 

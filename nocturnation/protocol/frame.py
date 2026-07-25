@@ -154,11 +154,15 @@ def parse_frame(buf):
 
     f = Frame()
     f.protocol_version = buf[2]
-    f.source_id = buf[3]
-    f.sequence_number = buf[4]
-    f.hop_count = buf[5]
-    f.message_type = buf[6]
-    f.payload_len = buf[7]
+    # v3: source_id widened to LE u16 at bytes 3-4; every field after
+    # it shifted by 1. Old-firmware devices reject at the version check
+    # below (they read byte 3 as the whole source_id and byte 6 as
+    # message_type, both of which we bump).
+    f.source_id = buf[3] | (buf[4] << 8)
+    f.sequence_number = buf[5]
+    f.hop_count = buf[6]
+    f.message_type = buf[7]
+    f.payload_len = buf[8]
 
     if f.protocol_version != PROTOCOL_VERSION:
         raise FrameError("unrecognised protocol version")
@@ -173,16 +177,18 @@ def parse_frame(buf):
     f.payload = bytes(buf[HEADER_SIZE:])
 
     if f.message_type == MessageType.LIGHT_PULSE:
+        # v3: target_group widened to LE u16 at payload[1..2]; every
+        # subsequent field shifted by 1.
         p = f.payload
         f.target_class = p[0]
-        f.target_group = p[1]
-        f.r = p[2]
-        f.g = p[3]
-        f.b = p[4]
-        f.attack = p[5]
-        f.sustain = p[6]
-        f.release = p[7]
-        f.chance = p[8]
+        f.target_group = p[1] | (p[2] << 8)
+        f.r = p[3]
+        f.g = p[4]
+        f.b = p[5]
+        f.attack = p[6]
+        f.sustain = p[7]
+        f.release = p[8]
+        f.chance = p[9]
     elif f.message_type == MessageType.HEARTBEAT:
         # Spec v0.29 §3.3.1: tick (u32 LE) + days_since_2026 (u16 LE)
         # + centiseconds_today (u24 LE). All little-endian.
@@ -191,58 +197,58 @@ def parse_frame(buf):
         f.days_since_2026 = p[4] | (p[5] << 8)
         f.centiseconds_today = p[6] | (p[7] << 8) | (p[8] << 16)
     elif f.message_type == MessageType.LIGHT_WASH:
-        # Epic 6C Phase D 16-byte layout. See protocol manual §3.3.3.
+        # v3 17-byte layout: +1 byte for the u16 target_group widening.
         p = f.payload
         f.target_class   = p[0]
-        f.target_group   = p[1]
-        f.r1 = p[2];  f.g1 = p[3];  f.b1 = p[4]
-        f.r2 = p[5];  f.g2 = p[6];  f.b2 = p[7]
-        f.wash_attack    = p[8]
-        f.wash_release   = p[9]
-        f.intensity      = p[10]
-        f.cycle_ms       = p[11] | (p[12] << 8)
-        f.ttl_seconds    = p[13] | (p[14] << 8)
-        f.pulse_response = p[15]
+        f.target_group   = p[1] | (p[2] << 8)
+        f.r1 = p[3];  f.g1 = p[4];  f.b1 = p[5]
+        f.r2 = p[6];  f.g2 = p[7];  f.b2 = p[8]
+        f.wash_attack    = p[9]
+        f.wash_release   = p[10]
+        f.intensity      = p[11]
+        f.cycle_ms       = p[12] | (p[13] << 8)
+        f.ttl_seconds    = p[14] | (p[15] << 8)
+        f.pulse_response = p[16]
     elif f.message_type == MessageType.LIGHT_WASH_END:
-        # Epic 6C Phase D 3-byte layout. See protocol manual §3.3.4.
+        # v3 4-byte layout: +1 byte for the u16 target_group widening.
         p = f.payload
         f.target_class = p[0]
-        f.target_group = p[1]
-        f.release_time = p[2]
+        f.target_group = p[1] | (p[2] << 8)
+        f.release_time = p[3]
     elif f.message_type == MessageType.LIGHT_WASH_PULSE:
         # Same wire layout as LIGHT_PULSE; dispatch semantics differ
         # (fires only on washing Lumes). See protocol manual §3.3.5.
         p = f.payload
         f.target_class = p[0]
-        f.target_group = p[1]
-        f.r = p[2]
-        f.g = p[3]
-        f.b = p[4]
-        f.attack  = p[5]
-        f.sustain = p[6]
-        f.release = p[7]
-        f.chance  = p[8]
+        f.target_group = p[1] | (p[2] << 8)
+        f.r = p[3]
+        f.g = p[4]
+        f.b = p[5]
+        f.attack  = p[6]
+        f.sustain = p[7]
+        f.release = p[8]
+        f.chance  = p[9]
     elif f.message_type == MessageType.TEXT_DISPLAY:
-        # Epic 13 variable-length layout. See protocol manual §3.3.6.
+        # v3 variable-length layout. See protocol manual §3.3.6.
         #
-        #   0   target_group    1 B
-        #   1   r               1 B
-        #   2   g               1 B
-        #   3   b               1 B
-        #   4-5 ttl_ms          2 B   u16 LE; 0 = sticky
-        #   6   header_len      1 B   0..64
-        #   7   header_bytes    header_len B   UTF-8
-        #   ... body_len        1 B   0..128
+        #   0-1 target_group    2 B  u16 LE
+        #   2   r               1 B
+        #   3   g               1 B
+        #   4   b               1 B
+        #   5-6 ttl_ms          2 B  u16 LE; 0 = sticky
+        #   7   header_len      1 B  0..64
+        #   8   header_bytes    header_len B   UTF-8
+        #   ... body_len        1 B  0..128
         #   ... body_bytes      body_len B     UTF-8
         p = f.payload
         if len(p) < TEXT_DISPLAY_MIN_PAYLOAD_LEN:
             raise FrameError("TEXT_DISPLAY payload too short")
-        f.text_target_group = p[0]
-        f.text_r = p[1]
-        f.text_g = p[2]
-        f.text_b = p[3]
-        f.ttl_ms = p[4] | (p[5] << 8)
-        header_len = p[6]
+        f.text_target_group = p[0] | (p[1] << 8)   # v3: LE u16
+        f.text_r = p[2]
+        f.text_g = p[3]
+        f.text_b = p[4]
+        f.ttl_ms = p[5] | (p[6] << 8)
+        header_len = p[7]
         if header_len > TEXT_DISPLAY_MAX_HEADER_LEN:
             raise FrameError("TEXT_DISPLAY header_len exceeds cap")
         if len(p) < TEXT_DISPLAY_FIXED_PREFIX + 1 + header_len + 1:
@@ -271,15 +277,15 @@ def parse_frame(buf):
         except ValueError:
             f.body = ""
     elif f.message_type == MessageType.CLEAR_SCREEN:
-        # Epic 13 3-byte layout.
+        # v3 4-byte layout: +1 byte for the u16 target_group widening.
         #
-        #   0   target_group    1 B
-        #   1   clear_text      1 B   0 = leave, 1 = clear
-        #   2   clear_bitmap    1 B   0 = leave, 1 = clear
+        #   0-1 target_group    2 B  u16 LE
+        #   2   clear_text      1 B  0 = leave, 1 = clear
+        #   3   clear_bitmap    1 B  0 = leave, 1 = clear
         p = f.payload
-        f.clear_target_group = p[0]
-        f.clear_text   = bool(p[1])
-        f.clear_bitmap = bool(p[2])
+        f.clear_target_group = p[0] | (p[1] << 8)   # v3: LE u16
+        f.clear_text   = bool(p[2])
+        f.clear_bitmap = bool(p[3])
 
     return f
 
@@ -303,25 +309,27 @@ def encode_light_pulse(
 ):
     """Build the wire bytes for a LIGHT_PULSE frame.
 
-    Inverse of the LIGHT_PULSE branch in ``parse_frame``: 8-byte
-    header + 9-byte payload = 17 bytes. Every field is masked to a
-    byte so an out-of-range argument can't corrupt the frame length.
+    Inverse of the LIGHT_PULSE branch in ``parse_frame``: v3 9-byte
+    header + 10-byte payload = 19 bytes. source_id and target_group
+    are both LE u16 (v3 widening from u8).
 
     The Director originates frames at ``hop_count`` 0; relays increment
     it. ``sequence_number`` wraps at 256 and the caller owns the
     counter (see RenderDispatcher).
     """
+    src = source_id  & 0xFFFF
+    tgt = target_group & 0xFFFF
     return bytes((
         MAGIC_0,
         MAGIC_1,
         PROTOCOL_VERSION,
-        source_id & 0xFF,
+        src  & 0xFF, (src  >> 8) & 0xFF,     # v3: source_id LE u16
         sequence_number & 0xFF,
         hop_count & 0xFF,
         MessageType.LIGHT_PULSE,
         _LIGHT_PULSE_PAYLOAD_LEN,
         target_class & 0xFF,
-        target_group & 0xFF,
+        tgt  & 0xFF, (tgt  >> 8) & 0xFF,     # v3: target_group LE u16
         r & 0xFF,
         g & 0xFF,
         b & 0xFF,
@@ -404,17 +412,19 @@ def encode_light_wash(
     """
     cycle_ms     &= 0xFFFF
     ttl_seconds  &= 0xFFFF
+    src = source_id & 0xFFFF
+    tgt = target_group & 0xFFFF
     return bytes((
         MAGIC_0,
         MAGIC_1,
         PROTOCOL_VERSION,
-        source_id & 0xFF,
+        src & 0xFF, (src >> 8) & 0xFF,       # v3: source_id LE u16
         sequence_number & 0xFF,
         hop_count & 0xFF,
         MessageType.LIGHT_WASH,
         _LIGHT_WASH_PAYLOAD_LEN,
         target_class & 0xFF,
-        target_group & 0xFF,
+        tgt & 0xFF, (tgt >> 8) & 0xFF,       # v3: target_group LE u16
         r1 & 0xFF, g1 & 0xFF, b1 & 0xFF,
         r2 & 0xFF, g2 & 0xFF, b2 & 0xFF,
         attack & 0xFF,
@@ -440,17 +450,19 @@ def encode_light_wash_end(
 
     3-byte payload. See protocol manual §3.3.4.
     """
+    src = source_id & 0xFFFF
+    tgt = target_group & 0xFFFF
     return bytes((
         MAGIC_0,
         MAGIC_1,
         PROTOCOL_VERSION,
-        source_id & 0xFF,
+        src & 0xFF, (src >> 8) & 0xFF,       # v3: source_id LE u16
         sequence_number & 0xFF,
         hop_count & 0xFF,
         MessageType.LIGHT_WASH_END,
         _LIGHT_WASH_END_PAYLOAD_LEN,
         target_class & 0xFF,
-        target_group & 0xFF,
+        tgt & 0xFF, (tgt >> 8) & 0xFF,       # v3: target_group LE u16
         release_time & 0xFF,
     ))
 
@@ -470,17 +482,19 @@ def encode_light_wash_pulse(
     9-byte payload, identical layout to LIGHT_PULSE. Dispatch semantics
     differ (fires only on washing Lumes). See protocol manual §3.3.5.
     """
+    src = source_id & 0xFFFF
+    tgt = target_group & 0xFFFF
     return bytes((
         MAGIC_0,
         MAGIC_1,
         PROTOCOL_VERSION,
-        source_id & 0xFF,
+        src & 0xFF, (src >> 8) & 0xFF,       # v3: source_id LE u16
         sequence_number & 0xFF,
         hop_count & 0xFF,
         MessageType.LIGHT_WASH_PULSE,
         _LIGHT_WASH_PULSE_PAYLOAD_LEN,
         target_class & 0xFF,
-        target_group & 0xFF,
+        tgt & 0xFF, (tgt >> 8) & 0xFF,       # v3: target_group LE u16
         r & 0xFF, g & 0xFF, b & 0xFF,
         attack & 0xFF,
         sustain & 0xFF,
@@ -619,11 +633,12 @@ def encode_heartbeat(
     tick &= 0xFFFFFFFF
     days = days_since_2026 & 0xFFFF
     cs = centiseconds_today & 0xFFFFFF
+    src = source_id & 0xFFFF
     return bytes((
         MAGIC_0,
         MAGIC_1,
         PROTOCOL_VERSION,
-        source_id & 0xFF,
+        src & 0xFF, (src >> 8) & 0xFF,       # v3: source_id LE u16
         sequence_number & 0xFF,
         hop_count & 0xFF,
         MessageType.HEARTBEAT,
@@ -677,17 +692,19 @@ def encode_text_display(
     if payload_len > 255:
         raise FrameError("TEXT_DISPLAY payload overflows u8 payload_len")
     ttl = ttl_ms & 0xFFFF
+    src = source_id & 0xFFFF
+    tgt = target_group & 0xFFFF
     out = bytearray()
     out.extend((
         MAGIC_0,
         MAGIC_1,
         PROTOCOL_VERSION,
-        source_id & 0xFF,
+        src & 0xFF, (src >> 8) & 0xFF,       # v3: source_id LE u16
         sequence_number & 0xFF,
         hop_count & 0xFF,
         MessageType.TEXT_DISPLAY,
         payload_len & 0xFF,
-        target_group & 0xFF,
+        tgt & 0xFF, (tgt >> 8) & 0xFF,       # v3: target_group LE u16
         r & 0xFF,
         g & 0xFF,
         b & 0xFF,
@@ -716,16 +733,18 @@ def encode_clear_screen(
     can clear just the text layer (e.g. lyric off-screen between verses)
     without disturbing a sticky bitmap, and vice versa.
     """
+    src = source_id & 0xFFFF
+    tgt = target_group & 0xFFFF
     return bytes((
         MAGIC_0,
         MAGIC_1,
         PROTOCOL_VERSION,
-        source_id & 0xFF,
+        src & 0xFF, (src >> 8) & 0xFF,       # v3: source_id LE u16
         sequence_number & 0xFF,
         hop_count & 0xFF,
         MessageType.CLEAR_SCREEN,
         _CLEAR_SCREEN_PAYLOAD_LEN,
-        target_group & 0xFF,
+        tgt & 0xFF, (tgt >> 8) & 0xFF,       # v3: target_group LE u16
         1 if clear_text else 0,
         1 if clear_bitmap else 0,
     ))
