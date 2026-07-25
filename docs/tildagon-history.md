@@ -17,6 +17,16 @@ manifest → `disk.json`, `/cartridge` mount path → `/disk`, all
 Flopagon PCB name (Nathan's product) stays. Pre-rename references in
 older commit messages are left as-is.
 
+**Repo extraction (2026-07-25)**: the `disk/` tree and its host tests
+were moved out of this repo into [ratcliffej/nocturnation-disk][disk-repo].
+The disk manager works for any Tildagon app, has no code dependency on
+the NocturNation firmware, and was bloating a repo scoped to the
+NocturNation app. History for PR #53, #54, #55, #50 was preserved
+in the new repo via `git filter-repo`. This file no longer covers the
+disk stack; see the new repo's `README.md` and `bootstrap/README.md`.
+
+[disk-repo]: https://github.com/ratcliffej/nocturnation-disk
+
 ## app.py
 
 ### sys.path shim for the Tildagon launcher
