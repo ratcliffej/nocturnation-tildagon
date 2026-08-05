@@ -22,6 +22,25 @@ MAX_HOP_COUNT = 3
 # ESP-NOW airtime (~1.3 ms) + scheduling jitter, with 3-10x headroom.
 PEER_WATCH_MS = 100
 
+# Per-device systematic offset added to PEER_WATCH_MS at each watch-arm.
+# Two Tildagons receiving the same Director frame arm their watches at
+# almost the same instant (radio propagation < 1 ms); without jitter,
+# both their watches expire simultaneously, so if both promote to
+# CANDIDATE and roll the same random countdown target they both hit
+# _to_active on the exact same admitted frame, then both TX hop+1
+# concurrently, colliding on the radio and never hearing each other -
+# stuck REPEAT/REPEAT. The jitter is applied ONCE per FSM instance
+# (fixed offset per device) so a given device's peer-watches are
+# systematically ahead of or behind its neighbours, letting the
+# earlier-expiring device promote first and the later-expiring one
+# see hop+1 traffic during its still-active watch window and cover it.
+# Range chosen to be:
+#   - smaller than PEER_WATCH_MS (~30% of the window) so nominal
+#     coverage still fires on the intended hop+1 arrival
+#   - larger than a single-frame air time (~3 ms LR) so the offset
+#     genuinely separates the two devices' expiry ticks
+PEER_WATCH_JITTER_MS = 30
+
 # CANDIDATE frame counter range. Minimum 2 absorbs the ~2% single-frame
 # peer-relay loss; probability of two consecutive failed peer relays
 # from a healthy peer is 0.04%.
@@ -83,7 +102,8 @@ class DynamicRepeater:
     """
 
     def __init__(self, send_fn, random_int_fn, now_ms=0,
-                 on_relay_state_change=None, skip_tx=False):
+                 on_relay_state_change=None, skip_tx=False,
+                 watch_jitter_fn=None):
         self._send_fn = send_fn
         self._random_int = random_int_fn
         # Notified whenever the FSM enters or leaves a relay-eligible
@@ -96,6 +116,30 @@ class DynamicRepeater:
         # still runs so peer detection stays accurate. When False, this
         # is the sole TX path.
         self._skip_tx = skip_tx
+
+        # Per-device peer-watch jitter offset. Picked once at
+        # construction and applied to every armed watch, so this device's
+        # deadlines are systematically ahead of or behind a neighbour's
+        # for the same input frame. See PEER_WATCH_JITTER_MS docstring
+        # above for the anti-collision rationale.
+        # Callable form (rather than a plain random_int call at ctor)
+        # keeps existing test harnesses working: their random_int fixture
+        # queues are consumed only by the CANDIDATE / COOLDOWN countdown
+        # picks as before. The default lambda pulls from random_int_fn
+        # on first use, at which point the harness has already had a
+        # chance to inject its own callable if it wants deterministic
+        # jitter.
+        if watch_jitter_fn is None:
+            def _default_jitter():
+                return random_int_fn(-PEER_WATCH_JITTER_MS,
+                                     PEER_WATCH_JITTER_MS)
+            self._watch_jitter_fn = _default_jitter
+        else:
+            self._watch_jitter_fn = watch_jitter_fn
+        # Cache the jitter after first draw so the whole session uses
+        # a consistent per-device offset rather than re-rolling every
+        # watch.
+        self._watch_jitter_ms = None
 
         self._state = STATE_LISTENING
         self._state_entered_ms = now_ms
@@ -374,7 +418,13 @@ class DynamicRepeater:
                          if not (w[0] == src and w[1] == seq and w[2] > hop)]
 
     def _add_watch(self, frame, now_ms):
-        deadline = now_ms + PEER_WATCH_MS
+        if self._watch_jitter_ms is None:
+            # Lazy first-use draw so the default lambda's call to
+            # random_int_fn happens AFTER any test-side ctor injection
+            # of a jitter_fn override. Cached for the rest of the
+            # session so a device's watches don't oscillate.
+            self._watch_jitter_ms = self._watch_jitter_fn()
+        deadline = now_ms + PEER_WATCH_MS + self._watch_jitter_ms
         entry = (frame.source_id, frame.sequence_number,
                  frame.hop_count, deadline)
         self._watches.append(entry)

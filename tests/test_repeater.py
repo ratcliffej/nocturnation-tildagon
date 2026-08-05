@@ -20,6 +20,7 @@ from nocturnation.repeater import (
     STATE_ACTIVE,
     STATE_COOLDOWN,
     PEER_WATCH_MS,
+    PEER_WATCH_JITTER_MS,
     CANDIDATE_MIN_FRAMES,
     CANDIDATE_MAX_FRAMES,
     COOLDOWN_MIN_FRAMES,
@@ -61,7 +62,19 @@ class RepeaterHarness:
     """Convenience wrapper around DynamicRepeater with deterministic
     randomness + TX capture. `randoms` is a list consumed left-to-right.
     """
-    def __init__(self, randoms=None):
+    def __init__(self, randoms=None, watch_jitter_ms=0):
+        """
+        randoms          - queued values consumed by the CANDIDATE /
+                           COOLDOWN countdown-target picks. Watch jitter
+                           does NOT consume from this queue by default
+                           (watch_jitter_ms below controls it) so pre-
+                           jitter tests keep working unchanged.
+        watch_jitter_ms  - fixed peer-watch jitter for this FSM. Zero
+                           by default preserves the pre-jitter behaviour
+                           where deadline = arm_time + PEER_WATCH_MS
+                           exactly. Tests that specifically exercise the
+                           jitter pass an explicit value.
+        """
         self.txs = []
         self._randoms = list(randoms or [])
         self._random_calls = 0
@@ -79,7 +92,11 @@ class RepeaterHarness:
             # supply explicit values.
             return (lo + hi) // 2
 
-        self.fsm = DynamicRepeater(send_fn, random_int, now_ms=0)
+        def watch_jitter():
+            return watch_jitter_ms
+
+        self.fsm = DynamicRepeater(send_fn, random_int, now_ms=0,
+                                   watch_jitter_fn=watch_jitter)
 
     def admit(self, frame, is_duplicate=False, now_ms=None, raw_buf=None):
         if raw_buf is None:
@@ -679,3 +696,90 @@ class TestStateLabel:
         h.admit(FakeFrame(seq=100, hop=1), is_duplicate=True, now_ms=3050,
                 raw_buf=make_buf(seq=100, hop=1))
         assert h.fsm.state_label() == "CDOWN"
+
+
+class TestWatchJitter:
+    """Per-device peer-watch jitter (see PEER_WATCH_JITTER_MS).
+
+    Two Tildagons receiving the same Director frame within radio
+    propagation time would arm identical watches without jitter. That
+    made co-election likely when both freshly booted at the same
+    moment - one of the failure modes behind the bench-observed
+    stuck REPEAT/REPEAT case (2026-07-27).
+    """
+
+    def test_jitter_shifts_watch_deadline(self):
+        # Two FSMs with distinct jitter offsets, same input frame,
+        # same arm time -> different deadlines. Assert via observable
+        # state: tick at the earlier deadline expires the earlier
+        # FSM's watch but NOT the later one's.
+        early = RepeaterHarness(randoms=[3], watch_jitter_ms=-20)
+        late  = RepeaterHarness(randoms=[3], watch_jitter_ms=+20)
+        f = FakeFrame(seq=1, hop=0)
+        early.admit(f, now_ms=0)
+        late.admit(f,  now_ms=0)
+
+        # Deadline of early = 0 + 100 - 20 = 80; late = 0 + 100 + 20 = 120.
+        # Tick at 85 expires early, leaves late intact.
+        early.tick(now_ms=85)
+        late.tick(now_ms=85)
+        assert early.fsm.state == STATE_CANDIDATE, \
+            "early jitter should trigger election by t=85"
+        assert late.fsm.state == STATE_LISTENING, \
+            "late jitter should NOT trigger election by t=85"
+
+    def test_jitter_zero_preserves_pre_jitter_behaviour(self):
+        # watch_jitter_ms=0 (harness default) reproduces the pre-jitter
+        # timing exactly: deadline = arm_time + PEER_WATCH_MS.
+        h = RepeaterHarness(randoms=[3])
+        h.admit(FakeFrame(seq=1, hop=0), now_ms=0)
+        # Just before the (un-jittered) deadline: no expiry.
+        h.tick(now_ms=PEER_WATCH_MS - 1)
+        assert h.fsm.state == STATE_LISTENING
+        # Just after: expiry, promotion to CANDIDATE.
+        h.tick(now_ms=PEER_WATCH_MS + 1)
+        assert h.fsm.state == STATE_CANDIDATE
+
+    def test_jitter_still_covers_when_hop_plus_1_arrives_in_time(self):
+        # Coverage window is well inside PEER_WATCH_MS + jitter regardless
+        # of sign, so a nominal hop+1 relay (~5 ms after hop=0) still
+        # covers the watch on both an early-jittered and late-jittered
+        # device.
+        for j in (-PEER_WATCH_JITTER_MS, 0, +PEER_WATCH_JITTER_MS):
+            h = RepeaterHarness(randoms=[3], watch_jitter_ms=j)
+            h.admit(FakeFrame(seq=1, hop=0), now_ms=0)
+            h.admit(FakeFrame(seq=1, hop=1), is_duplicate=True, now_ms=5)
+            # Even at the earliest jitter (deadline = 100 - 30 = 70),
+            # the hop+1 at t=5 covers well before any expiry.
+            h.tick(now_ms=200)   # well past every possible deadline
+            assert h.fsm.state == STATE_LISTENING, \
+                "jitter=%d: watch should be covered by hop+1 at t=5" % j
+
+    def test_jitter_default_lambda_draws_from_random_int(self):
+        # When no watch_jitter_fn is supplied, the FSM's default lambda
+        # pulls from random_int_fn. Verify the draw happens exactly
+        # once (cached) - it must NOT re-roll on every watch-arm.
+        calls = []
+
+        def send_fn(_):
+            pass
+
+        def random_int(lo, hi):
+            calls.append((lo, hi))
+            return 10
+
+        fsm = DynamicRepeater(send_fn, random_int, now_ms=0)
+        # No watches armed yet; jitter not yet drawn.
+        assert (-PEER_WATCH_JITTER_MS, PEER_WATCH_JITTER_MS) \
+            not in calls
+
+        # Arm three watches; expect exactly one jitter draw.
+        for seq in (1, 2, 3):
+            fsm.on_admitted_frame(FakeFrame(seq=seq, hop=0), False, 0,
+                                  make_buf(seq=seq, hop=0))
+        jitter_draws = [c for c in calls
+                        if c == (-PEER_WATCH_JITTER_MS,
+                                 PEER_WATCH_JITTER_MS)]
+        assert len(jitter_draws) == 1, \
+            "jitter should be drawn once and cached, got %d draws" \
+            % len(jitter_draws)
