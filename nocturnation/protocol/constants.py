@@ -20,6 +20,25 @@ from ._generated import (
     PAYLOAD_LENGTHS,
 )
 
+
+# Byte offset of hop_count within the wire header. Callers that mutate
+# hop_count in place (relays incrementing on retransmit) MUST use this
+# constant rather than a hard-coded 5 / 6. Hard-coded copies got out of
+# sync when v3 widened source_id from 1 byte to 2 bytes, silently
+# breaking the IRQ fast-relay path (repeater FSMs elected but no bytes
+# ever left the radio at hop+1). Every caller now imports this so the
+# next wire bump touches one authority.
+#
+# Wire layout for reference (v3):
+#   bytes 0-1: magic
+#   byte 2:    protocol_version
+#   bytes 3-4: source_id (LE u16)
+#   byte 5:    sequence_number
+#   byte 6:    hop_count      <-- HOP_COUNT_OFFSET
+#   byte 7:    message_type
+#   byte 8:    payload_len
+HOP_COUNT_OFFSET = 6
+
 # ESP-NOW supports up to 250-byte payloads; Epic 13 raised the
 # NocturNation cap from 32 to 250 to fit the new display family.
 # TEXT_DISPLAY's max payload is 200 bytes (6 prefix + 1 + 64 header

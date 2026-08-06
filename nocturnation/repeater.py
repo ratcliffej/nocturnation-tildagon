@@ -14,6 +14,13 @@ ESP-NOW broadcast does NOT loop back on this platform - any received
 frame matching a TX-ring entry is by construction from a peer device.
 """
 
+# Byte offset of hop_count in the wire header. Sourced from the protocol
+# constants module so a future header-layout change (e.g. the v2 -> v3
+# source_id widening that broke this in 2026-08) only has to update one
+# authority - see docs/tildagon-history.md for the drift incident.
+from .protocol.constants import HOP_COUNT_OFFSET as HOP_COUNT_BYTE_OFFSET
+
+
 # Wire-spec hop_count ceiling (protocol manual section 2.3). Frames at
 # this hop are received but not relayed; system-wide limit.
 MAX_HOP_COUNT = 3
@@ -48,10 +55,6 @@ RECENT_HOP_MEMORY_SIZE = 64
 # stayed stuck when its hop 1 upstream was turned off (received hop=0
 # from Director but out of role to relay it). 3 s ~= 3 heartbeat cycles.
 ACTIVE_IDLE_TIMEOUT_MS = 3000
-
-# Byte offset of hop_count in the wire format. Relay increments in place.
-# Must match protocol frame layout.
-HOP_COUNT_BYTE_OFFSET = 5
 
 # String state constants (no IntEnum on MicroPython). Log output and
 # debug overlays are self-describing without a lookup table.
@@ -168,7 +171,8 @@ class DynamicRepeater:
         ``frame`` is the parsed Frame; ``is_duplicate`` is the dedup
         result (True = dedup-suppressed for rendering). ``now_ms`` is a
         monotonic millisecond clock; may be None in host tests. ``raw_buf``
-        is the untouched wire payload so we can relay by mutating byte 5.
+        is the untouched wire payload so we can relay by mutating the
+        hop_count byte (see HOP_COUNT_BYTE_OFFSET / constants.HOP_COUNT_OFFSET).
         """
         if now_ms is None:
             # Host tests may not supply a clock. Fake a monotonic tick

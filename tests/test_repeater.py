@@ -42,18 +42,28 @@ class FakeFrame:
 
 
 def make_buf(src=1, seq=1, hop=0):
-    """Wire-format bytes matching FakeFrame. Only the byte at
-    HOP_COUNT_BYTE_OFFSET (5) is read/mutated by the FSM; padding bytes
-    are placeholders.
+    """Wire-format bytes matching FakeFrame. v3 header layout:
+      bytes 0-1: magic 'NN'
+      byte 2:    protocol_version (0x03)
+      bytes 3-4: source_id LE u16
+      byte 5:    sequence_number
+      byte 6:    hop_count   <-- HOP_COUNT_BYTE_OFFSET
+      byte 7:    message_type
+      byte 8:    payload_len
+    Only the hop_count byte is read/mutated by the FSM; padding bytes
+    are placeholders. See the round-trip test in TestWireOffsetSanity
+    for the drift-catcher that pins these offsets against the actual
+    protocol encoder/parser.
     """
     buf = bytearray(16)
     buf[0:2] = b"NN"
-    buf[2] = 0x02       # protocol version
-    buf[3] = src
-    buf[4] = seq
-    buf[5] = hop
-    buf[6] = 0x00       # HEARTBEAT
-    buf[7] = 0          # payload_len
+    buf[2] = 0x03       # protocol version (v3)
+    buf[3] = src & 0xFF
+    buf[4] = (src >> 8) & 0xFF
+    buf[5] = seq
+    buf[6] = hop
+    buf[7] = 0x00       # HEARTBEAT
+    buf[8] = 0          # payload_len
     return bytes(buf)
 
 
@@ -338,9 +348,11 @@ class TestActiveRelay:
                 raw_buf=make_buf(src=1, seq=100, hop=0))
         assert len(h.txs) == pre + 1
         assert h.txs[-1][HOP_COUNT_BYTE_OFFSET] == 1
-        # Same src+seq preserved on the wire.
-        assert h.txs[-1][3] == 1  # src
-        assert h.txs[-1][4] == 100  # seq
+        # Same src+seq preserved on the wire (v3 header: source LE u16
+        # at bytes 3-4, sequence_number at byte 5).
+        assert h.txs[-1][3] == 1     # source_id LSB
+        assert h.txs[-1][4] == 0     # source_id MSB
+        assert h.txs[-1][5] == 100   # sequence_number
 
     def test_relays_hop_one_as_hop_two(self):
         # Shell-2 elected: hop=1 → hop=2.
@@ -679,3 +691,67 @@ class TestStateLabel:
         h.admit(FakeFrame(seq=100, hop=1), is_duplicate=True, now_ms=3050,
                 raw_buf=make_buf(seq=100, hop=1))
         assert h.fsm.state_label() == "CDOWN"
+
+
+class TestWireOffsetSanity:
+    """Drift-catcher for the hop_count byte offset.
+
+    The v2 -> v3 header change (source_id widened u8 -> u16) shifted
+    hop_count from byte 5 to byte 6. The repeater's HOP_COUNT_BYTE_OFFSET
+    and app.py's IRQ-hot-path duplicate constant weren't updated in
+    lockstep; the peer-facing symptom was "both Tildagons stuck REPEAT
+    with Hop:0 () everywhere" because no relay TX ever actually left
+    the radio (the gate read seq+1 instead of hop+1).
+
+    These tests would have caught that: they use the ACTUAL protocol
+    encoder + parser to round-trip a hop_count mutation, so if
+    HOP_COUNT_BYTE_OFFSET points at the wrong byte, the parsed
+    hop_count won't match what was written.
+    """
+
+    def test_repeater_offset_matches_protocol_offset(self):
+        # Belt-and-braces: the constants are supposed to be the same
+        # value from the same authority (repeater imports from
+        # protocol.constants), but a future refactor could re-hard-code
+        # one and drift again. Assert they're equal here.
+        from nocturnation.protocol.constants import HOP_COUNT_OFFSET
+        assert HOP_COUNT_BYTE_OFFSET == HOP_COUNT_OFFSET
+
+    def test_relay_mutation_round_trips_through_parser(self):
+        # Encode a real LIGHT_PULSE frame with the protocol encoder,
+        # then mutate the hop-count byte the way the FSM's
+        # _transmit_relay does, then parse it back with the protocol
+        # parser. The parsed hop_count MUST equal what we wrote. If
+        # HOP_COUNT_BYTE_OFFSET points at the wrong byte, the parser
+        # will read a completely different field (in v3 offset 5 is
+        # sequence_number, offset 6 is hop_count).
+        from nocturnation.protocol import (
+            encode_light_pulse, parse_frame, MessageType,
+        )
+        raw = encode_light_pulse(
+            source_id=0x42, sequence_number=17,
+            target_class=0, target_group=0,
+            r=1, g=2, b=3,
+            attack=0, sustain=0, release=0, chance=0,
+            hop_count=0,
+        )
+        # Sanity: fresh frame has hop=0 per the parser.
+        f0 = parse_frame(raw)
+        assert f0.hop_count == 0
+        assert f0.sequence_number == 17
+        assert f0.source_id == 0x42
+        assert f0.message_type == MessageType.LIGHT_PULSE
+
+        # Now mutate the hop-count byte the way the repeater does.
+        mutated = bytearray(raw)
+        mutated[HOP_COUNT_BYTE_OFFSET] = 2
+        f1 = parse_frame(bytes(mutated))
+        # The parser must see the mutated value on the hop_count
+        # field, NOT on sequence_number or any other adjacent field.
+        assert f1.hop_count == 2, \
+            "HOP_COUNT_BYTE_OFFSET=%d points at wrong byte for v3 wire" \
+            % HOP_COUNT_BYTE_OFFSET
+        # And every other header field is untouched.
+        assert f1.sequence_number == 17
+        assert f1.source_id == 0x42
+        assert f1.message_type == MessageType.LIGHT_PULSE

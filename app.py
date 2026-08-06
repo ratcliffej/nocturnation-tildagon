@@ -197,11 +197,16 @@ _broadcast_mac_bytes = b'\xff\xff\xff\xff\xff\xff'
 _fast_paint_cb = None
 
 # Wire-spec byte offsets duplicated as module constants so the IRQ
-# fast-path doesn't have to import them from the protocol package.
-# Must match protocol frame layout.
-_HOP_COUNT_BYTE_OFFSET = 5
+# fast-path doesn't have to import them from the protocol package
+# (the IRQ handler is installed before the nocturnation package
+# imports resolve at boot). Values are validated against the
+# authoritative protocol constants via _verify_wire_offsets() once the
+# lume stack has loaded - a mismatch fails loud, not silent (the v2->v3
+# source_id widening drifted these silently once, sinking the whole
+# repeater path; see docs/tildagon-history.md).
+_HOP_COUNT_BYTE_OFFSET = 6      # v3 header layout; v2 was 5
 _MAX_HOP_COUNT_FOR_RELAY = 3
-_MIN_FRAME_LEN_FOR_RELAY = 8
+_MIN_FRAME_LEN_FOR_RELAY = 9    # v3 header is 9 bytes; v2 was 8
 
 
 def _espnow_irq_handler(esp):
@@ -556,6 +561,30 @@ class NocturNationApp(app.App):
             from .nocturnation.tofu import TofuLock, format_lock_label
             await asyncio.sleep_ms(0)
             from .nocturnation.repeater import DynamicRepeater
+            await asyncio.sleep_ms(0)
+
+            # Drift-guard the IRQ-hot-path byte offsets against the
+            # authoritative protocol constants now that they're loaded.
+            # These constants can't be imported at module top (IRQ
+            # handler installs before nocturnation imports resolve), so
+            # they're hard-coded above and validated here at first
+            # lume-stack load. A mismatch fails loud rather than the
+            # v2->v3 silent-drift failure that sank the whole repeater
+            # path in 2026-08.
+            from .nocturnation.protocol.constants import (
+                HOP_COUNT_OFFSET as _prot_hop_off,
+                HEADER_SIZE as _prot_hdr_sz,
+            )
+            if _HOP_COUNT_BYTE_OFFSET != _prot_hop_off:
+                raise RuntimeError(
+                    "IRQ hop-offset drift: app.py _HOP_COUNT_BYTE_OFFSET=%d, "
+                    "protocol constants HOP_COUNT_OFFSET=%d. Update app.py."
+                    % (_HOP_COUNT_BYTE_OFFSET, _prot_hop_off))
+            if _MIN_FRAME_LEN_FOR_RELAY != _prot_hdr_sz:
+                raise RuntimeError(
+                    "IRQ min-frame drift: app.py _MIN_FRAME_LEN_FOR_RELAY=%d, "
+                    "protocol constants HEADER_SIZE=%d. Update app.py."
+                    % (_MIN_FRAME_LEN_FOR_RELAY, _prot_hdr_sz))
             await asyncio.sleep_ms(0)
 
             # Perimeter module bench flag mirror (was module-scope).
@@ -1563,7 +1592,13 @@ class NocturNationApp(app.App):
             if _pending_msgs is None:
                 _pending_msgs = []
             if _relay_send_buffer is None:
-                _relay_send_buffer = bytearray(32)   # protocol max frame
+                # Sized to MAX_FRAME_SIZE (250) so relay can carry any
+                # message type - TEXT_DISPLAY / BITMAP_PLANE can exceed
+                # 200 bytes. The 32-byte cap here was v0x02-era when
+                # every message fit in 32; a wider frame would silently
+                # truncate before send. Static allocation so the mp_sched
+                # IRQ handler never needs to touch the heap.
+                _relay_send_buffer = bytearray(250)
             # Older MicroPython builds without irq() degrade to the
             # async poll path - _try_recv falls back to esp.recv().
             global _espnow_irq_installed, _fast_paint_cb
