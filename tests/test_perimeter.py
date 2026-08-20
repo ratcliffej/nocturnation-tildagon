@@ -27,11 +27,13 @@ class FakeFrame:
     the renderer reads. Real Frame objects work equally well but are noisier
     to construct in test cases."""
 
-    __slots__ = ("r", "g", "b", "attack", "sustain", "release", "chance")
+    __slots__ = ("r", "g", "b", "attack", "sustain", "release", "chance",
+                 "led_mode", "led_modifier1", "led_modifier2")
 
     def __init__(self, r=255, g=0, b=0,
                  attack=Time.T_32_MS, sustain=Time.T_96_MS, release=Time.T_96_MS,
-                 chance=Chance.CHANCE_100):
+                 chance=Chance.CHANCE_100,
+                 led_mode=0, led_modifier1=0, led_modifier2=0):
         self.r = r
         self.g = g
         self.b = b
@@ -39,6 +41,9 @@ class FakeFrame:
         self.sustain = sustain
         self.release = release
         self.chance = chance
+        self.led_mode      = led_mode
+        self.led_modifier1 = led_modifier1
+        self.led_modifier2 = led_modifier2
 
 
 def make_capture():
@@ -464,3 +469,218 @@ class TestWashTtlFailsafe:
         r.on_light_wash(self._wash_frame(), now_ms=0)
         r.tick(now_ms=60_000, set_led=make_capture()[1])
         assert r.is_washing() is True
+
+
+# ==========================================================================
+# Epic 18 v0x04 LED-level addressing on the Tildagon perimeter.
+#
+# Perimeter is a single chain of 12 LEDs (1-based indexing). Wire LED-index
+# is 0-based. Mode 1 accepts chain 0 or 1 (both map to our ring); chain>=2
+# has no matching hardware and drops. Mode 2 uses a 12-bit tile mask where
+# bit i lights ring LED (i + 1) — width matches the ring so no tiling
+# ambiguity vs a longer strip.
+# ==========================================================================
+
+class TestLedAddressingSingleLed:
+    """LedMode.SingleLed fires deterministically at the addressed wire index,
+    bypassing CHANCE."""
+
+    def test_single_led_lights_only_target_pixel(self):
+        # Wire index 0 -> Tildagon ring LED 1. Wire index 5 -> ring LED 6.
+        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        lit = r.dispatch(
+            FakeFrame(chance=Chance.CHANCE_4,
+                      led_mode=1, led_modifier1=0, led_modifier2=5),
+            now_ms=0,
+        )
+        assert lit == 1
+
+        cap, set_led = make_capture()
+        r.tick(now_ms=20, set_led=set_led)   # mid-sustain window
+        by_index = {i: (r_, g_, b_) for i, r_, g_, b_ in cap}
+        # Ring LED 6 (wire index 5 + 1) should be at pulse RED; all others zero.
+        assert by_index[LED_MIN_INDEX + 5][0] > 0
+        for i in range(LED_MIN_INDEX, LED_MAX_INDEX + 1):
+            if i == LED_MIN_INDEX + 5:
+                continue
+            assert by_index[i] == (0, 0, 0), \
+                "non-target LED %d should be dark" % i
+
+    def test_single_led_chain_id_1_hits_our_ring(self):
+        # chain=1 is our ring specifically; treated identically to chain=0
+        # on single-chain hardware.
+        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        lit = r.dispatch(
+            FakeFrame(led_mode=1, led_modifier1=1, led_modifier2=0),
+            now_ms=0,
+        )
+        assert lit == 1
+
+    def test_single_led_chain_id_2_drops(self):
+        # No physical chain 2 exists; frame silently drops.
+        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        lit = r.dispatch(
+            FakeFrame(led_mode=1, led_modifier1=2, led_modifier2=0),
+            now_ms=0,
+        )
+        assert lit == 0
+
+    def test_single_led_out_of_range_index_drops(self):
+        # Wire index 12 would map to ring LED 13, which doesn't exist.
+        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        lit = r.dispatch(
+            FakeFrame(led_mode=1, led_modifier1=0, led_modifier2=12),
+            now_ms=0,
+        )
+        assert lit == 0
+
+
+class TestLedAddressingRepeatPattern:
+    """LedMode.RepeatPattern applies a 12-bit tile mask across the ring.
+    Bit i lights ring LED (i + 1). Bypasses CHANCE."""
+
+    def test_alternating_mask_0x555_lights_even_wire_positions(self):
+        # 0x555 = 0b010101010101 -> bits 0, 2, 4, 6, 8, 10
+        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        lit = r.dispatch(
+            FakeFrame(led_mode=2, led_modifier1=0x55, led_modifier2=0x05),
+            now_ms=0,
+        )
+        assert lit == 6
+
+        cap, set_led = make_capture()
+        r.tick(now_ms=20, set_led=set_led)
+        by_index = {i: (r_, g_, b_) for i, r_, g_, b_ in cap}
+        # Wire bits 0, 2, 4, 6, 8, 10 -> ring LEDs 1, 3, 5, 7, 9, 11.
+        for wire_bit in (0, 2, 4, 6, 8, 10):
+            ring_idx = LED_MIN_INDEX + wire_bit
+            assert by_index[ring_idx][0] > 0, \
+                "ring LED %d should be lit" % ring_idx
+        for wire_bit in (1, 3, 5, 7, 9, 11):
+            ring_idx = LED_MIN_INDEX + wire_bit
+            assert by_index[ring_idx] == (0, 0, 0), \
+                "ring LED %d should be dark" % ring_idx
+
+    def test_zero_mask_lights_nothing(self):
+        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        lit = r.dispatch(
+            FakeFrame(led_mode=2, led_modifier1=0, led_modifier2=0),
+            now_ms=0,
+        )
+        assert lit == 0
+
+    def test_full_mask_0xfff_lights_every_led(self):
+        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        lit = r.dispatch(
+            FakeFrame(led_mode=2, led_modifier1=0xFF, led_modifier2=0x0F),
+            now_ms=0,
+        )
+        assert lit == LED_COUNT == 12
+
+    def test_reserved_upper_4_bits_of_modifier2_ignored(self):
+        # modifier2 = 0xFF should be treated as 0x0F (upper 4 bits reserved).
+        # 0xFFF = full mask -> all 12 LEDs. If the upper bits weren't
+        # masked, we'd try to address ring LEDs 13..16 and drop them.
+        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        lit = r.dispatch(
+            FakeFrame(led_mode=2, led_modifier1=0xFF, led_modifier2=0xFF),
+            now_ms=0,
+        )
+        assert lit == LED_COUNT == 12
+
+
+class TestLedAddressingBypassesChance:
+    """Mode-1 and mode-2 must fire regardless of CHANCE, so a Director
+    targeting one LED with CHANCE_4 still hits deterministically."""
+
+    def test_mode_1_ignores_chance(self):
+        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        lit = r.dispatch(
+            FakeFrame(chance=Chance.CHANCE_4,
+                      led_mode=1, led_modifier1=0, led_modifier2=0),
+            now_ms=0,
+        )
+        assert lit == 1
+
+    def test_mode_2_ignores_chance(self):
+        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        lit = r.dispatch(
+            FakeFrame(chance=Chance.CHANCE_4,
+                      led_mode=2, led_modifier1=0xFF, led_modifier2=0x0F),
+            now_ms=0,
+        )
+        assert lit == 12
+
+
+class TestLedAddressingParity:
+    """LedMode.ALL (0) must preserve pre-v4 behaviour: per-LED CHANCE
+    roll, whole-ring semantics."""
+
+    def test_mode_0_defaults_to_v3_chance_roll(self):
+        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        # LedMode fields default to 0/0/0 on FakeFrame.
+        lit = r.dispatch(
+            FakeFrame(chance=Chance.CHANCE_100),
+            now_ms=0,
+        )
+        assert lit == LED_COUNT == 12
+
+
+class TestLedAddressingModeZeroOnlyEscapeHatch:
+    """The MODE_0_ONLY module flag coalesces mode-1/2 into whole-ring
+    behaviour. Documented emergency fallback if the bench ever shows
+    per-LED envelope work can't hold the perimeter tick budget."""
+
+    def test_mode_0_only_flag_coerces_mode_1_to_whole_ring(self):
+        # Toggle the flag by importing the module. This test restores it
+        # after so subsequent tests still see MODE_0_ONLY == False.
+        from nocturnation.render import perimeter as pm
+        original = pm.MODE_0_ONLY
+        try:
+            pm.MODE_0_ONLY = True
+            r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+            lit = r.dispatch(
+                FakeFrame(chance=Chance.CHANCE_100,
+                          led_mode=1, led_modifier1=0, led_modifier2=5),
+                now_ms=0,
+            )
+            assert lit == LED_COUNT == 12, \
+                "MODE_0_ONLY should coalesce mode-1 into whole-ring behaviour"
+        finally:
+            pm.MODE_0_ONLY = original
+
+
+class TestLedAddressingResponsiveness:
+    """Documenting bench: perimeter tick + dispatch under sustained per-LED
+    envelope traffic must complete quickly enough not to disturb the
+    ~20 Hz UI tick + IRQ fast-relay path.
+
+    Host CPython is 10-100x faster than the badge's MicroPython, so this
+    test is a floor guard rather than a precise budget assertion. Absolute
+    on-badge timing is measured empirically at bench and documented in
+    docs/tildagon-history.md.
+    """
+
+    def test_worst_case_12_concurrent_envelopes_tick_bounded(self):
+        import time
+        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        # 12 concurrent envelopes, one per LED, each with a long sustain
+        # so they all remain active for the duration of the sample.
+        r.dispatch(
+            FakeFrame(r=200, g=100, b=50,
+                      attack=Time.T_192_MS, sustain=Time.T_2400_MS,
+                      release=Time.T_192_MS, chance=Chance.CHANCE_100),
+            now_ms=0,
+        )
+        # 500 ticks approximates ~25 seconds at the badge's 20 Hz cadence.
+        # On host CPython this completes well under 1 second; a regression
+        # that made per-LED math accidentally quadratic would blow that.
+        _cap, set_led = make_capture()
+        start = time.time()
+        for step in range(500):
+            r.tick(now_ms=step * 50, set_led=set_led)
+        elapsed = time.time() - start
+        assert elapsed < 1.0, \
+            "500 host ticks with 12 active envelopes took %.3f s; " \
+            "expected < 1.0 s. Per-LED envelope work may have regressed." \
+            % elapsed

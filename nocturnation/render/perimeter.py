@@ -29,6 +29,25 @@ LED_MIN_INDEX = 1
 LED_MAX_INDEX = 12
 LED_COUNT = LED_MAX_INDEX - LED_MIN_INDEX + 1
 
+# Epic 18 v0x04 LED-level addressing. Tildagon perimeter is a single
+# chain of 12 pixels; mode-1 addressing accepts chain=0 (all chains,
+# same index) or chain=1 (specific chain 1) and drops chain>=2 as
+# there's no physical chain to write. Mode-2 uses a 12-bit tile mask
+# packed LSB-first across the two modifier bytes; upper 4 bits of
+# modifier2 are reserved. The mask width matches the ring width
+# exactly so no tiling ambiguity here (unlike variable-length strips).
+_LED_MODE_ALL             = 0
+_LED_MODE_SINGLE_LED      = 1
+_LED_MODE_REPEAT_PATTERN  = 2
+
+# Escape hatch (Epic 18 B4): if the bench measurement ever shows the
+# per-LED envelope tick can't hold its budget under sustained mode-1
+# traffic, flip this to True to coalesce mode 1+ into mode-0 whole-ring
+# writes on the Tildagon side only. Ships false today; the existing
+# renderer already runs per-LED envelopes on every tick so honouring
+# LedMode is basically free. Documented for future emergency use.
+MODE_0_ONLY = False
+
 # Frequency caps - minimum ms between accepted dispatch calls. Calm mode
 # keeps the Harding-safe 500 ms (2 Hz) floor for audience badges. Full
 # mode 60 ms (~16 Hz) covers per-beat sparkles to 200+ BPM; guards
@@ -292,23 +311,77 @@ class PerimeterRenderer:
 
         chance_prob = CHANCE_PROB[frame.chance]
         cap = self._brightness_cap
+        dst_r = _clip(frame.r * cap)
+        dst_g = _clip(frame.g * cap)
+        dst_b = _clip(frame.b * cap)
+
+        # Epic 18 v0x04 LED-level addressing. Fields default to 0/0/0
+        # (LedMode.ALL) so a Director that hasn't yet been taught to fill
+        # them produces the v3-era whole-ring CHANCE roll below. Fields
+        # are attribute-safe on Frames from older code paths via the
+        # default None -> treat as ALL.
+        led_mode      = getattr(frame, "led_mode",      None) or _LED_MODE_ALL
+        led_modifier1 = getattr(frame, "led_modifier1", None) or 0
+        led_modifier2 = getattr(frame, "led_modifier2", None) or 0
+
+        if MODE_0_ONLY and led_mode != _LED_MODE_ALL:
+            # Escape hatch coalesces mode-1/2 into whole-ring behaviour.
+            led_mode      = _LED_MODE_ALL
+            led_modifier1 = 0
+            led_modifier2 = 0
 
         lit = 0
-        for i in range(LED_MIN_INDEX, LED_MAX_INDEX + 1):
-            if self._rng() < chance_prob:
-                # Source colour for attack lerp: the LED's current
-                # rendered colour, so consecutive rainbow pulses
-                # crossfade rather than snap through black.
-                src_r, src_g, src_b = self._last_rendered[i]
-                self._envelopes[i] = (
+        if led_mode == _LED_MODE_SINGLE_LED:
+            # Chain 0 (all chains, this index) and chain 1 (specific
+            # chain 1) both hit our one physical ring. Chain >= 2 has
+            # no matching hardware and drops silently.
+            if led_modifier1 > 1:
+                self._last_dispatch_ms = now_ms
+                return 0
+            # Wire LED-index is 0-based; Tildagon perimeter is 1-based.
+            wire_idx = led_modifier2
+            ring_idx = wire_idx + LED_MIN_INDEX
+            if LED_MIN_INDEX <= ring_idx <= LED_MAX_INDEX:
+                src_r, src_g, src_b = self._last_rendered[ring_idx]
+                self._envelopes[ring_idx] = (
                     now_ms,
                     src_r, src_g, src_b,
-                    _clip(frame.r * cap),
-                    _clip(frame.g * cap),
-                    _clip(frame.b * cap),
+                    dst_r, dst_g, dst_b,
+                    attack_ms, sustain_ms, release_ms, total_ms,
+                )
+                lit = 1
+        elif led_mode == _LED_MODE_REPEAT_PATTERN:
+            # 12-bit tile mask, LSB=position 0 (wire index 0 = ring
+            # position 0). Ring width matches tile width, so bit i lights
+            # ring LED (i + LED_MIN_INDEX).
+            mask = (led_modifier1 & 0xFF) | ((led_modifier2 & 0x0F) << 8)
+            if mask == 0:
+                self._last_dispatch_ms = now_ms
+                return 0
+            for wire_idx in range(LED_COUNT):
+                if not (mask & (1 << wire_idx)):
+                    continue
+                ring_idx = wire_idx + LED_MIN_INDEX
+                src_r, src_g, src_b = self._last_rendered[ring_idx]
+                self._envelopes[ring_idx] = (
+                    now_ms,
+                    src_r, src_g, src_b,
+                    dst_r, dst_g, dst_b,
                     attack_ms, sustain_ms, release_ms, total_ms,
                 )
                 lit += 1
+        else:
+            # LedMode.ALL (v3-parity path): per-LED CHANCE roll.
+            for i in range(LED_MIN_INDEX, LED_MAX_INDEX + 1):
+                if self._rng() < chance_prob:
+                    src_r, src_g, src_b = self._last_rendered[i]
+                    self._envelopes[i] = (
+                        now_ms,
+                        src_r, src_g, src_b,
+                        dst_r, dst_g, dst_b,
+                        attack_ms, sustain_ms, release_ms, total_ms,
+                    )
+                    lit += 1
 
         self._last_dispatch_ms = now_ms
         return lit
