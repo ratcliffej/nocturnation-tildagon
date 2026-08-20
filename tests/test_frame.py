@@ -22,17 +22,17 @@ from nocturnation.protocol.constants import Time, Chance
 
 # Manual annex C.1: LIGHT_PULSE from source_id 1, sequence 42, broadcast,
 # red (255, 0, 0), envelope T_96 / T_0 / T_480, CHANCE_100.
-# Spec v3: 2-byte "NN" magic prefix + protocol_version 0x03 + LE u16
-# source_id + LE u16 target_group.
+# Spec v4 (Epic 18): 2-byte "NN" magic prefix + protocol_version 0x04 +
+# LE u16 source_id + LE u16 target_group + 3 trailing LED-addressing bytes.
 LIGHT_PULSE_VECTOR = bytes([
     0x4E,  # magic byte 0 ('N')
     0x4E,  # magic byte 1 ('N')
-    0x03,  # protocol_version (v3)
+    0x04,  # protocol_version (v4)
     0x01, 0x00,  # source_id LE u16 (v3)
     0x2A,  # sequence (42)
     0x00,  # hop_count
     0x03,  # message_type LIGHT_PULSE
-    0x0A,  # payload_len (v3: 10, was 9)
+    0x0D,  # payload_len (v4: 13, was 10)
     0x00,  # target_class (All)
     0x00, 0x00,  # target_group LE u16 (v3): broadcast
     0xFF,  # r
@@ -42,16 +42,19 @@ LIGHT_PULSE_VECTOR = bytes([
     0x00,  # sustain T_0_MS
     0x04,  # release T_480_MS
     0x00,  # chance CHANCE_100
+    0x00,  # led_mode  (v4: LedMode.ALL)
+    0x00,  # led_modifier1  (v4: reserved when mode == 0)
+    0x00,  # led_modifier2  (v4: reserved when mode == 0)
 ])
 
 # Manual annex C.2: HEARTBEAT from source_id 1, sequence 43.
-# Spec v3 §3.3.1 payload: tick (u32 LE) + days_since_2026 (u16 LE) +
-# centiseconds_today (u24 LE). Picked tick = 0x12345678 / days = 0x0123 /
-# centiseconds = 0xABCDEF to exercise each field's byte width.
+# Spec v4 §3.3.1 payload: tick (u32 LE) + days_since_2026 (u16 LE) +
+# centiseconds_today (u24 LE). Payload layout unaffected by v4;
+# only the header version byte bumps.
 HEARTBEAT_VECTOR = bytes([
     0x4E,  # magic byte 0 ('N')
     0x4E,  # magic byte 1 ('N')
-    0x03,  # protocol_version (v3)
+    0x04,  # protocol_version (v4)
     0x01, 0x00,  # source_id LE u16 (v3)
     0x2B,  # sequence (43)
     0x00,  # hop_count
@@ -66,15 +69,16 @@ HEARTBEAT_VECTOR = bytes([
 class TestHeaderParsing:
     def test_light_pulse_header_fields(self):
         f = parse_frame(LIGHT_PULSE_VECTOR)
-        assert f.protocol_version == 0x03   # v3
+        assert f.protocol_version == 0x04   # v4 (Epic 18)
         assert f.source_id == 1
         assert f.sequence_number == 42
         assert f.hop_count == 0
         assert f.message_type == MessageType.LIGHT_PULSE
-        assert f.payload_len == 10          # v3: was 9
+        assert f.payload_len == 13          # v4: was 10 in v3, 9 in v2
 
     def test_heartbeat_header_fields(self):
         f = parse_frame(HEARTBEAT_VECTOR)
+        assert f.protocol_version == 0x04
         assert f.message_type == MessageType.HEARTBEAT
         assert f.payload_len == 9
 
@@ -99,6 +103,10 @@ class TestLightCommandPayload:
         assert f.sustain == Time.T_0_MS
         assert f.release == Time.T_480_MS
         assert f.chance == Chance.CHANCE_100
+        # v4 LED addressing defaults (LedMode.ALL, both modifiers 0).
+        assert f.led_mode == 0
+        assert f.led_modifier1 == 0
+        assert f.led_modifier2 == 0
 
 
 class TestFrameRejection:
@@ -124,21 +132,30 @@ class TestFrameRejection:
 
     def test_wrong_version_rejected(self):
         bad = bytearray(LIGHT_PULSE_VECTOR)
-        bad[2] = 0x09  # protocol_version offset; not 0x03
+        bad[2] = 0x09  # protocol_version offset; not 0x04
+        with pytest.raises(FrameError):
+            parse_frame(bytes(bad))
+
+    def test_v3_version_rejected(self):
+        # v4 hard cutover: a v3 receiver should already be reflashed by
+        # the time v4 hits the wire; the parser here rejects v3 frames
+        # so a stale sender is loud, not silent.
+        bad = bytearray(LIGHT_PULSE_VECTOR)
+        bad[2] = 0x03  # v3 protocol_version
         with pytest.raises(FrameError):
             parse_frame(bytes(bad))
 
     def test_payload_len_mismatch_rejected(self):
         bad = bytearray(LIGHT_PULSE_VECTOR)
-        # v3 payload_len offset is 8; claim 9-byte payload, actual is 10.
+        # v4 payload_len offset is 8; claim 9-byte payload, actual is 13.
         bad[8] = 0x09
         with pytest.raises(FrameError):
             parse_frame(bytes(bad))
 
     def test_wrong_payload_len_for_known_type_rejected(self):
-        # HEARTBEAT MUST be 9-byte payload per spec v3 §3.3.1.
+        # HEARTBEAT MUST be 9-byte payload per spec §3.3.1 (unchanged in v4).
         bad = bytearray(HEARTBEAT_VECTOR)
-        # v3 payload_len offset is 8; claim 5-byte payload, actual is 9.
+        # payload_len offset is 8; claim 5-byte payload, actual is 9.
         bad[8] = 0x05
         with pytest.raises(FrameError):
             parse_frame(bytes(bad))

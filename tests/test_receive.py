@@ -10,17 +10,18 @@ from nocturnation.receive import process_frame, parse_admittable, MAX_HOP_COUNT
 
 
 # Manual annex C.1 reference vector. Modified per-test with helpers.
-# Spec v3: 2-byte "NN" magic prefix + protocol_version 0x03 + LE u16
-# source_id + LE u16 target_group.
+# Spec v4 (Epic 18): 2-byte "NN" magic prefix + protocol_version 0x04
+# + LE u16 source_id + LE u16 target_group + 3 trailing LED-addressing
+# bytes.
 LIGHT_PULSE_VECTOR = bytes([
     0x4E,  # magic byte 0 ('N')
     0x4E,  # magic byte 1 ('N')
-    0x03,  # protocol_version (v3)
+    0x04,  # protocol_version (v4)
     0x01, 0x00,  # source_id LE u16 (v3)
     0x2A,  # sequence (42)
     0x00,  # hop_count
     0x03,  # message_type LIGHT_PULSE
-    0x0A,  # payload_len (v3: 10)
+    0x0D,  # payload_len (v4: 13, was 10 in v3)
     0x00,  # target_class
     0x00, 0x00,  # target_group LE u16 (v3)
     0xFF,  # r
@@ -30,6 +31,9 @@ LIGHT_PULSE_VECTOR = bytes([
     0x00,  # sustain T_0_MS
     0x04,  # release T_480_MS
     0x00,  # chance CHANCE_100
+    0x00,  # led_mode (v4: LedMode.ALL default)
+    0x00,  # led_modifier1 (v4)
+    0x00,  # led_modifier2 (v4)
 ])
 
 
@@ -101,7 +105,7 @@ class TestStructuralRejection:
     def test_payload_len_mismatch_dropped(self):
         d = DedupRing()
         bad = bytearray(LIGHT_PULSE_VECTOR)
-        bad[8] = 0x08  # v3 payload_len offset; claim 8, actual is 10
+        bad[8] = 0x08  # v4 payload_len offset; claim 8, actual is 13
         assert process_frame(bytes(bad), d) is None
 
 
