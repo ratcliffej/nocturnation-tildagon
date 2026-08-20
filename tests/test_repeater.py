@@ -42,9 +42,10 @@ class FakeFrame:
 
 
 def make_buf(src=1, seq=1, hop=0):
-    """Wire-format bytes matching FakeFrame. v3 header layout:
+    """Wire-format bytes matching FakeFrame. v4 header layout (unchanged
+    from v3 at the header level; v4 only touched the four LIGHT_* payloads):
       bytes 0-1: magic 'NN'
-      byte 2:    protocol_version (0x03)
+      byte 2:    protocol_version (0x04)
       bytes 3-4: source_id LE u16
       byte 5:    sequence_number
       byte 6:    hop_count   <-- HOP_COUNT_BYTE_OFFSET
@@ -57,7 +58,7 @@ def make_buf(src=1, seq=1, hop=0):
     """
     buf = bytearray(16)
     buf[0:2] = b"NN"
-    buf[2] = 0x03       # protocol version (v3)
+    buf[2] = 0x04       # protocol version (v4)
     buf[3] = src & 0xFF
     buf[4] = (src >> 8) & 0xFF
     buf[5] = seq
@@ -749,7 +750,7 @@ class TestWireOffsetSanity:
         # The parser must see the mutated value on the hop_count
         # field, NOT on sequence_number or any other adjacent field.
         assert f1.hop_count == 2, \
-            "HOP_COUNT_BYTE_OFFSET=%d points at wrong byte for v3 wire" \
+            "HOP_COUNT_BYTE_OFFSET=%d points at wrong byte for v4 wire" \
             % HOP_COUNT_BYTE_OFFSET
         # And every other header field is untouched.
         assert f1.sequence_number == 17

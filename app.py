@@ -204,9 +204,9 @@ _fast_paint_cb = None
 # lume stack has loaded - a mismatch fails loud, not silent (the v2->v3
 # source_id widening drifted these silently once, sinking the whole
 # repeater path; see docs/tildagon-history.md).
-_HOP_COUNT_BYTE_OFFSET = 6      # v3 header layout; v2 was 5
+_HOP_COUNT_BYTE_OFFSET = 6      # v3+ header layout (unchanged in v4); v2 was 5
 _MAX_HOP_COUNT_FOR_RELAY = 3
-_MIN_FRAME_LEN_FOR_RELAY = 9    # v3 header is 9 bytes; v2 was 8
+_MIN_FRAME_LEN_FOR_RELAY = 9    # v3+ header is 9 bytes (unchanged in v4); v2 was 8
 
 
 def _espnow_irq_handler(esp):

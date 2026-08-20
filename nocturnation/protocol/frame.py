@@ -78,6 +78,14 @@ class Frame:
         "pulse_response",     # 0 = drop PULSE while washing; 1 = additive overlay
         # LIGHT_WASH_END-specific
         "release_time",       # 100 ms units; overrides wash's own release
+        # v4 LED-level addressing (Epic 18). Populated for LIGHT_PULSE /
+        # LIGHT_WASH / LIGHT_WASH_END / LIGHT_WASH_PULSE. Renderer honours
+        # them only on Lumes with the AddressableLeds capability; single-
+        # LED Lumes (PixMob) drop modes 1+ at the gate. Default 0 (=All)
+        # reproduces v3-era whole-strip behaviour.
+        "led_mode",
+        "led_modifier1",
+        "led_modifier2",
         # TEXT_DISPLAY-specific (Epic 13). Display family has no
         # target_class on the wire (message type IS the class signal);
         # `target_group` here is the dedicated display-side group ID.
@@ -117,6 +125,11 @@ class Frame:
         self.ttl_seconds = None
         self.pulse_response = None
         self.release_time = None
+        # v4 LED-level addressing (Epic 18). Default None; parse_frame
+        # populates them for the four LIGHT_* message types.
+        self.led_mode = None
+        self.led_modifier1 = None
+        self.led_modifier2 = None
         # TEXT_DISPLAY (Epic 13). Display-family attrs default to None
         # so a Frame instance representing a non-text message type
         # doesn't carry stale state. ClearScreen reuses target_group
@@ -177,8 +190,8 @@ def parse_frame(buf):
     f.payload = bytes(buf[HEADER_SIZE:])
 
     if f.message_type == MessageType.LIGHT_PULSE:
-        # v3: target_group widened to LE u16 at payload[1..2]; every
-        # subsequent field shifted by 1.
+        # v3: target_group widened to LE u16 at payload[1..2].
+        # v4: +3 trailing bytes at payload[10..12] for LED-level addressing.
         p = f.payload
         f.target_class = p[0]
         f.target_group = p[1] | (p[2] << 8)
@@ -189,6 +202,9 @@ def parse_frame(buf):
         f.sustain = p[7]
         f.release = p[8]
         f.chance = p[9]
+        f.led_mode      = p[10]   # v4
+        f.led_modifier1 = p[11]   # v4
+        f.led_modifier2 = p[12]   # v4
     elif f.message_type == MessageType.HEARTBEAT:
         # Spec v0.29 §3.3.1: tick (u32 LE) + days_since_2026 (u16 LE)
         # + centiseconds_today (u24 LE). All little-endian.
@@ -198,6 +214,7 @@ def parse_frame(buf):
         f.centiseconds_today = p[6] | (p[7] << 8) | (p[8] << 16)
     elif f.message_type == MessageType.LIGHT_WASH:
         # v3 17-byte layout: +1 byte for the u16 target_group widening.
+        # v4 20-byte layout: +3 trailing bytes for LED-level addressing.
         p = f.payload
         f.target_class   = p[0]
         f.target_group   = p[1] | (p[2] << 8)
@@ -209,25 +226,36 @@ def parse_frame(buf):
         f.cycle_ms       = p[12] | (p[13] << 8)
         f.ttl_seconds    = p[14] | (p[15] << 8)
         f.pulse_response = p[16]
+        f.led_mode       = p[17]   # v4
+        f.led_modifier1  = p[18]   # v4
+        f.led_modifier2  = p[19]   # v4
     elif f.message_type == MessageType.LIGHT_WASH_END:
         # v3 4-byte layout: +1 byte for the u16 target_group widening.
+        # v4 7-byte layout: +3 trailing bytes for LED-level addressing.
         p = f.payload
-        f.target_class = p[0]
-        f.target_group = p[1] | (p[2] << 8)
-        f.release_time = p[3]
+        f.target_class  = p[0]
+        f.target_group  = p[1] | (p[2] << 8)
+        f.release_time  = p[3]
+        f.led_mode      = p[4]     # v4
+        f.led_modifier1 = p[5]     # v4
+        f.led_modifier2 = p[6]     # v4
     elif f.message_type == MessageType.LIGHT_WASH_PULSE:
         # Same wire layout as LIGHT_PULSE; dispatch semantics differ
         # (fires only on washing Lumes). See protocol manual §3.3.5.
+        # v4: +3 trailing bytes for LED-level addressing at payload[10..12].
         p = f.payload
         f.target_class = p[0]
         f.target_group = p[1] | (p[2] << 8)
         f.r = p[3]
         f.g = p[4]
         f.b = p[5]
-        f.attack  = p[6]
-        f.sustain = p[7]
-        f.release = p[8]
-        f.chance  = p[9]
+        f.attack        = p[6]
+        f.sustain       = p[7]
+        f.release       = p[8]
+        f.chance        = p[9]
+        f.led_mode      = p[10]    # v4
+        f.led_modifier1 = p[11]    # v4
+        f.led_modifier2 = p[12]    # v4
     elif f.message_type == MessageType.TEXT_DISPLAY:
         # v3 variable-length layout. See protocol manual §3.3.6.
         #
@@ -306,12 +334,17 @@ def encode_light_pulse(
     release,
     chance,
     hop_count=0,
+    led_mode=0,        # v4 (Epic 18); 0 = LedMode.ALL (whole strip)
+    led_modifier1=0,   # v4
+    led_modifier2=0,   # v4
 ):
     """Build the wire bytes for a LIGHT_PULSE frame.
 
-    Inverse of the LIGHT_PULSE branch in ``parse_frame``: v3 9-byte
-    header + 10-byte payload = 19 bytes. source_id and target_group
-    are both LE u16 (v3 widening from u8).
+    Inverse of the LIGHT_PULSE branch in ``parse_frame``: v4 9-byte
+    header + 13-byte payload = 22 bytes. source_id and target_group
+    are both LE u16 (v3 widening from u8). led_mode/led_modifier1/
+    led_modifier2 default to 0 for parity with v3-era Directors that
+    don't yet emit LED-level addressing.
 
     The Director originates frames at ``hop_count`` 0; relays increment
     it. ``sequence_number`` wraps at 256 and the caller owns the
@@ -337,6 +370,9 @@ def encode_light_pulse(
         sustain & 0xFF,
         release & 0xFF,
         chance & 0xFF,
+        led_mode      & 0xFF,   # v4
+        led_modifier1 & 0xFF,   # v4
+        led_modifier2 & 0xFF,   # v4
     ))
 
 
@@ -353,6 +389,9 @@ def make_light_pulse_frame(
     source_id=0,
     sequence_number=0,
     hop_count=0,
+    led_mode=0,        # v4 (Epic 18)
+    led_modifier1=0,   # v4
+    led_modifier2=0,   # v4
 ):
     """Construct a LIGHT_PULSE Frame directly, for local loopback.
 
@@ -381,6 +420,9 @@ def make_light_pulse_frame(
     f.sustain = sustain
     f.release = release
     f.chance = chance
+    f.led_mode      = led_mode
+    f.led_modifier1 = led_modifier1
+    f.led_modifier2 = led_modifier2
     return f
 
 
@@ -403,12 +445,16 @@ def encode_light_wash(
     ttl_seconds,     # u16 LE; 0 = infinite
     pulse_response,  # 0 = drop PULSE while washing; 1 = additive overlay
     hop_count=0,
+    led_mode=0,        # v4 (Epic 18)
+    led_modifier1=0,   # v4
+    led_modifier2=0,   # v4
 ):
     """Build the wire bytes for a LIGHT_WASH frame (Epic 6C Phase D).
 
-    16-byte payload; see protocol manual §3.3.3. Tildagon Director mode
-    is pulse-only in v1 - this encoder exists for round-trip tests and
-    future cross-platform parity, not for routine Director-side use.
+    v4 20-byte payload (v3 17 + 3 for LED addressing); see protocol
+    manual §3.3.3. Tildagon Director mode is pulse-only in v1 - this
+    encoder exists for round-trip tests and future cross-platform
+    parity, not for routine Director-side use.
     """
     cycle_ms     &= 0xFFFF
     ttl_seconds  &= 0xFFFF
@@ -435,6 +481,9 @@ def encode_light_wash(
         ttl_seconds & 0xFF,
         (ttl_seconds >> 8) & 0xFF,
         pulse_response & 0xFF,
+        led_mode      & 0xFF,   # v4
+        led_modifier1 & 0xFF,   # v4
+        led_modifier2 & 0xFF,   # v4
     ))
 
 
@@ -445,10 +494,15 @@ def encode_light_wash_end(
     target_group,
     release_time,    # 100 ms units; overrides wash's own release
     hop_count=0,
+    led_mode=0,        # v4 (Epic 18); mode-0 ends whole strip's wash
+    led_modifier1=0,   # v4
+    led_modifier2=0,   # v4
 ):
     """Build the wire bytes for a LIGHT_WASH_END frame.
 
-    3-byte payload. See protocol manual §3.3.4.
+    v4 7-byte payload (v3 4 + 3 for LED addressing). See protocol
+    manual §3.3.4. LedMode-0 ends the whole strip's wash; mode-1 ends
+    one pixel; mode-2 ends the masked pixels.
     """
     src = source_id & 0xFFFF
     tgt = target_group & 0xFFFF
@@ -464,6 +518,9 @@ def encode_light_wash_end(
         target_class & 0xFF,
         tgt & 0xFF, (tgt >> 8) & 0xFF,       # v3: target_group LE u16
         release_time & 0xFF,
+        led_mode      & 0xFF,   # v4
+        led_modifier1 & 0xFF,   # v4
+        led_modifier2 & 0xFF,   # v4
     ))
 
 
@@ -476,11 +533,15 @@ def encode_light_wash_pulse(
     attack, sustain, release,
     chance,
     hop_count=0,
+    led_mode=0,        # v4 (Epic 18)
+    led_modifier1=0,   # v4
+    led_modifier2=0,   # v4
 ):
     """Build the wire bytes for a LIGHT_WASH_PULSE frame.
 
-    9-byte payload, identical layout to LIGHT_PULSE. Dispatch semantics
-    differ (fires only on washing Lumes). See protocol manual §3.3.5.
+    v4 13-byte payload (v3 10 + 3 for LED addressing), identical
+    layout to LIGHT_PULSE. Dispatch semantics differ (fires only on
+    washing Lumes). See protocol manual §3.3.5.
     """
     src = source_id & 0xFFFF
     tgt = target_group & 0xFFFF
@@ -500,6 +561,9 @@ def encode_light_wash_pulse(
         sustain & 0xFF,
         release & 0xFF,
         chance & 0xFF,
+        led_mode      & 0xFF,   # v4
+        led_modifier1 & 0xFF,   # v4
+        led_modifier2 & 0xFF,   # v4
     ))
 
 
@@ -517,6 +581,9 @@ def make_light_wash_frame(
     source_id=0,
     sequence_number=0,
     hop_count=0,
+    led_mode=0,        # v4 (Epic 18)
+    led_modifier1=0,   # v4
+    led_modifier2=0,   # v4
 ):
     """Construct a LIGHT_WASH Frame directly, for local loopback.
 
@@ -543,6 +610,9 @@ def make_light_wash_frame(
     f.cycle_ms = cycle_ms
     f.ttl_seconds = ttl_seconds
     f.pulse_response = pulse_response
+    f.led_mode      = led_mode
+    f.led_modifier1 = led_modifier1
+    f.led_modifier2 = led_modifier2
     return f
 
 
@@ -553,6 +623,9 @@ def make_light_wash_end_frame(
     source_id=0,
     sequence_number=0,
     hop_count=0,
+    led_mode=0,        # v4 (Epic 18)
+    led_modifier1=0,   # v4
+    led_modifier2=0,   # v4
 ):
     """Construct a LIGHT_WASH_END Frame directly, for local loopback."""
     f = Frame()
@@ -566,6 +639,9 @@ def make_light_wash_end_frame(
     f.target_class = target_class
     f.target_group = target_group
     f.release_time = release_time
+    f.led_mode      = led_mode
+    f.led_modifier1 = led_modifier1
+    f.led_modifier2 = led_modifier2
     return f
 
 
@@ -582,6 +658,9 @@ def make_light_wash_pulse_frame(
     source_id=0,
     sequence_number=0,
     hop_count=0,
+    led_mode=0,        # v4 (Epic 18)
+    led_modifier1=0,   # v4
+    led_modifier2=0,   # v4
 ):
     """Construct a LIGHT_WASH_PULSE Frame directly, for local loopback.
 
@@ -606,6 +685,9 @@ def make_light_wash_pulse_frame(
     f.sustain = sustain
     f.release = release
     f.chance = chance
+    f.led_mode      = led_mode
+    f.led_modifier1 = led_modifier1
+    f.led_modifier2 = led_modifier2
     return f
 
 

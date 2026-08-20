@@ -17,8 +17,26 @@ from ._generated import (
     PROTOCOL_VERSION,
     HEADER_SIZE,
     MessageType,
+    LedMode,
     PAYLOAD_LENGTHS,
 )
+
+
+# v4 (Epic 18) LED-level addressing constants. RepeatPattern mask is 12
+# bits packed LSB-first across the two modifier bytes; upper 4 bits of
+# modifier2 are reserved (encoders emit 0, decoders MUST NOT read).
+LED_REPEAT_MASK_WIDTH = 12
+LED_REPEAT_MASK_MAX   = (1 << LED_REPEAT_MASK_WIDTH) - 1   # 0x0FFF
+
+
+def pack_repeat_mask(modifier1, modifier2):
+    """Combine two LedModifier bytes into a 12-bit tile mask."""
+    return (modifier1 & 0xFF) | ((modifier2 & 0x0F) << 8)
+
+
+def unpack_repeat_mask(mask):
+    """Split a 12-bit tile mask into the two LedModifier wire bytes."""
+    return (mask & 0xFF, (mask >> 8) & 0x0F)
 
 
 # Byte offset of hop_count within the wire header. Callers that mutate
