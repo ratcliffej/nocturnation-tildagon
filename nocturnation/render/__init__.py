@@ -16,14 +16,14 @@ from .perimeter import (
     LED_MIN_INDEX,
     LED_MAX_INDEX,
     LED_COUNT,
-    CALM_MIN_INTERVAL_MS,
-    FULL_MIN_INTERVAL_MS,
 )
 from .lcd import (
     LcdRenderer,
     LCD_MIN_INTERVAL_MS,
-    FULL_BRIGHTNESS_CAP,
 )
+# LCD brightness cap re-export - kept for callers that read the comfort
+# value directly; not calm-mode-tied (Epic 19).
+from .lcd import BRIGHTNESS_CAP as LCD_BRIGHTNESS_CAP
 from .pulse import RgbPulse
 from .wash import RgbWash
 from .display import CtxDisplay, SCREEN_W, SCREEN_H
@@ -39,11 +39,9 @@ __all__ = [
     "LED_MIN_INDEX",
     "LED_MAX_INDEX",
     "LED_COUNT",
-    "CALM_MIN_INTERVAL_MS",
-    "FULL_MIN_INTERVAL_MS",
     "LcdRenderer",
     "LCD_MIN_INTERVAL_MS",
-    "FULL_BRIGHTNESS_CAP",
+    "LCD_BRIGHTNESS_CAP",
     "RgbPulse",
     "RgbWash",
     "CtxDisplay",

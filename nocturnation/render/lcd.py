@@ -9,23 +9,19 @@ wash should be drawn) so the whole contract is host-testable; the
 actual rectangle/fill happens in app.py via ctx.
 
 Safety:
-  - Calm Mode (default) disables LCD pulsing AND wash entirely per
-    architecture spec section 15.3 ("screen flashing disabled").
-    current_colour returns None in Calm Mode and the caller falls back
-    to the static UI background (black).
-  - Full mode arms an envelope on each accepted dispatch with peak
-    brightness capped at FULL_BRIGHTNESS_CAP for eye comfort. A
+  - Peak brightness capped at BRIGHTNESS_CAP for eye comfort: a
     full-screen 100 percent wash would be uncomfortably bright at the
-    badge's face-distance.
-  - Frequency cap matches the perimeter renderer's Full mode (4 Hz, per
-    architecture spec section 15.1) - PULSE only; WASH is a state
+    badge's face-distance. Not a calm-mode choice - a glare comfort
+    cap that applies to every dispatch (Epic 19).
+  - LCD hardware pacing: LCD_MIN_INTERVAL_MS gates PULSE dispatches
+    below the SPI-refresh characteristic of the round 240x240 panel.
+    Orthogonal to any Director-side pacing; WASH is a state
     transition, not a periodic flash, so it isn't rate-limited.
 
 Reference manuals:
   Protocol manual section 3.3.2/3/4/5 (LIGHT_PULSE + LIGHT_WASH family)
-  Architecture spec section 15 (photosensitivity / Calm Mode)
   lume-capabilities-design.md (wash semantics)
-  Epic 5 Block 4, Epic 6C Phase G
+  Epic 5 Block 4, Epic 6C Phase G, Epic 19 (calm-mode removed from Lume)
 """
 
 import math
@@ -34,16 +30,17 @@ from ..clock import ticks_diff
 from .envelope import TIME_MS, envelope_brightness  # noqa: F401 (re-exported)
 
 
-# Peak brightness multiplier in Full mode. A full-screen face-distance
-# wash at 100 percent is uncomfortably bright; 60 percent is the upper
-# bound that bench-tested as comfortable while still visible.
-FULL_BRIGHTNESS_CAP = 0.6
+# Peak brightness multiplier applied to every dispatch. A full-screen
+# face-distance wash at 100 percent is uncomfortably bright; 60 percent
+# is the upper bound that bench-tested as comfortable while still
+# visible. Not a calm-mode choice - a glare comfort cap that applies
+# always (Epic 19).
+BRIGHTNESS_CAP = 0.6
 
-# Frequency cap: minimum milliseconds between accepted PULSE dispatches
-# when the renderer is enabled (Full mode). Matches the perimeter
-# renderer's Full-mode interval (~16 Hz) so both surfaces accept per-
-# beat sparkles up to 200+ BPM. Was 250 ms (4 Hz), which silently
-# dropped every other sparkle at 140 BPM sparkle_on_beat tempo.
+# LCD hardware pacing: minimum milliseconds between accepted PULSE
+# dispatches. Below this the round 240x240 SPI panel struggles to
+# refresh cleanly. Orthogonal to Director-side airtime pacing; kept
+# as a per-driver technical constraint (Epic 19).
 LCD_MIN_INTERVAL_MS = 60
 
 # Lost-WASH_END failsafe (not a protocol change). A LIGHT_WASH with
@@ -87,42 +84,22 @@ class LcdRenderer:
       on_light_wash_pulse(frame, now_ms) - LIGHT_WASH_PULSE.
       current_colour(now_ms)             - on every draw() call.
 
-    Calm Mode makes current_colour always return None so the LCD stays
-    with its static UI. Default changed 2026-07-12 (v1.0.0) to Full
-    Mode (calm_mode=False); operator opts INTO Calm Mode via the in-
-    app menu for photosensitivity-sensitive contexts.
+    Renders every accepted frame; photosensitivity / tone-down is
+    Director-composition territory as of Epic 19 (no Lume-side gate).
     """
 
     __slots__ = (
-        "_enabled",
         "_last_dispatch_ms",
         "_pulse",       # (start_ms, src_r, src_g, src_b, dst_r, dst_g, dst_b, atk, sus, rel, total)
         "_wash",
         "_last_rendered",  # (r, g, b) last output, for next pulse's src-lerp
     )
 
-    def __init__(self, calm_mode=False):
-        # Calm Mode disables LCD pulsing AND wash entirely; the renderer
-        # is effectively a no-op until the operator opts into Full mode.
-        self._enabled = not bool(calm_mode)
+    def __init__(self):
         self._last_dispatch_ms = -LCD_MIN_INTERVAL_MS - 1
         self._pulse = None
         self._wash = None
         self._last_rendered = (0, 0, 0)
-
-    @property
-    def enabled(self):
-        return self._enabled
-
-    def set_calm_mode(self, on):
-        on = bool(on)
-        self._enabled = not on
-        if on:
-            # Drop any in-flight wash / pulse so the LCD darkens cleanly
-            # when the operator switches back to Calm Mode mid-render.
-            self._pulse = None
-            self._wash = None
-            self._last_rendered = (0, 0, 0)
 
     # ------------------------------------------------------------------
     # Wash baseline (Epic 6C Phase G)
@@ -140,7 +117,7 @@ class LcdRenderer:
             base_b = _lerp(w["b1"], w["b2"], t)
         else:
             base_r, base_g, base_b = w["r1"], w["g1"], w["b1"]
-        scale = (w["intensity"] / 255.0) * FULL_BRIGHTNESS_CAP
+        scale = (w["intensity"] / 255.0) * BRIGHTNESS_CAP
         post = (_clip(base_r * scale), _clip(base_g * scale), _clip(base_b * scale))
         if w["phase"] == _WASH_HOLD:
             return post
@@ -168,8 +145,6 @@ class LcdRenderer:
         return (0, 0, 0)
 
     def on_light_wash(self, frame, now_ms):
-        if not self._enabled:
-            return
         pre = self._wash_baseline_at(now_ms) if self._wash is not None else (0, 0, 0)
         self._wash = {
             "phase":               _WASH_ATTACK,
@@ -220,16 +195,14 @@ class LcdRenderer:
 
         Returns True if the dispatch was accepted (envelope armed),
         False otherwise. Drop reasons (all silent):
-          - Calm Mode (renderer disabled)
           - Wash active with pulse_response = 0
-          - Rate-limited (< LCD_MIN_INTERVAL_MS since last accepted)
+          - Rate-limited (< LCD_MIN_INTERVAL_MS since last accepted -
+            LCD hardware pacing, orthogonal to Director-side airtime)
           - Primer frame (rgb = 0,0,0); a black wash would be invisible
             anyway, and primers don't consume the rate-limit budget so
             the main fire that follows is allowed.
           - Zero-duration envelope (attack + sustain + release == 0).
         """
-        if not self._enabled:
-            return False
         if frame.r == 0 and frame.g == 0 and frame.b == 0:
             return False
         if ticks_diff(now_ms, self._last_dispatch_ms) < LCD_MIN_INTERVAL_MS:
@@ -247,9 +220,9 @@ class LcdRenderer:
         self._pulse = (
             now_ms,
             src_r, src_g, src_b,
-            _clip(frame.r * FULL_BRIGHTNESS_CAP),
-            _clip(frame.g * FULL_BRIGHTNESS_CAP),
-            _clip(frame.b * FULL_BRIGHTNESS_CAP),
+            _clip(frame.r * BRIGHTNESS_CAP),
+            _clip(frame.g * BRIGHTNESS_CAP),
+            _clip(frame.b * BRIGHTNESS_CAP),
             attack_ms, sustain_ms, release_ms, total,
         )
         self._last_dispatch_ms = now_ms
@@ -273,11 +246,8 @@ class LcdRenderer:
     def current_colour(self, now_ms):
         """Return (r, g, b) in 0..255 for the screen at now_ms, or None.
 
-        None means "no wash; use static background". Callers in Calm
-        Mode always see None.
+        None means "no wash and no live pulse; use static background".
         """
-        if not self._enabled:
-            return None
         # Advance wash phase machine.
         if self._wash is not None and self._wash["phase"] != _WASH_INACTIVE:
             self._advance_wash_phase(now_ms)

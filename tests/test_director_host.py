@@ -72,7 +72,7 @@ class TestDispatchRenderFx:
         assert host.dispatch_render_fx("01:01", RgbPulse(255, 0, 0)) is True
 
     def test_returns_true_on_local_loopback_only(self):
-        perimeter = PerimeterRenderer(calm_mode=False, rng=lambda: 0.0)
+        perimeter = PerimeterRenderer(rng=lambda: 0.0)
         host = DirectorHost(RenderDispatcher(send_fn=None, perimeter=perimeter))
         assert host.dispatch_render_fx("01:00", RgbPulse(255, 0, 0)) is True
 
@@ -87,7 +87,7 @@ class TestDispatchRenderFx:
         # from its clock. Verify the perimeter envelope starts at the
         # host clock value.
         clock_val = {"t": 7000}
-        perimeter = PerimeterRenderer(calm_mode=False, rng=lambda: 0.0)
+        perimeter = PerimeterRenderer(rng=lambda: 0.0)
         host = DirectorHost(
             RenderDispatcher(send_fn=None, perimeter=perimeter),
             clock=lambda: clock_val["t"],
@@ -102,7 +102,7 @@ class TestDispatchRenderFx:
 class TestEndToEndShowToWire:
     def _wire(self, tmp_path):
         sent = []
-        perimeter = PerimeterRenderer(calm_mode=False, rng=lambda: 0.0)
+        perimeter = PerimeterRenderer(rng=lambda: 0.0)
         dispatcher = RenderDispatcher(send_fn=sent.append, perimeter=perimeter, source_id=0x40)
         host = DirectorHost(dispatcher, clock=lambda: 0)
         show = _BeatShow()
@@ -146,13 +146,13 @@ class TestDispatchRenderWash:
         assert host.dispatch_render_wash("01:00", self._wash()) is True
 
     def test_render_wash_returns_true_on_local_loopback_only(self):
-        perimeter = PerimeterRenderer(calm_mode=False, rng=lambda: 0.0)
+        perimeter = PerimeterRenderer(rng=lambda: 0.0)
         host = DirectorHost(RenderDispatcher(send_fn=None, perimeter=perimeter))
         assert host.dispatch_render_wash("01:00", self._wash()) is True
         assert perimeter.is_washing() is True
 
     def test_render_wash_end_cancels_local_wash(self):
-        perimeter = PerimeterRenderer(calm_mode=False, rng=lambda: 0.0)
+        perimeter = PerimeterRenderer(rng=lambda: 0.0)
         host = DirectorHost(RenderDispatcher(send_fn=None, perimeter=perimeter))
         host.dispatch_render_wash("01:00", self._wash())
         assert perimeter.is_washing() is True
@@ -160,7 +160,7 @@ class TestDispatchRenderWash:
         assert perimeter.is_washing() is False
 
     def test_render_wash_pulse_returns_true_when_washing(self):
-        perimeter = PerimeterRenderer(calm_mode=False, rng=lambda: 0.0)
+        perimeter = PerimeterRenderer(rng=lambda: 0.0)
         host = DirectorHost(RenderDispatcher(send_fn=None, perimeter=perimeter))
         host.dispatch_render_wash("01:00", self._wash())
         # Wash-pulse only fires when a wash is active locally.
@@ -189,7 +189,7 @@ class TestShowContextWashSurface:
         return RgbWash(255, 140, 30, intensity=200, cycle_ms=5000)
 
     def _wired(self, tmp_path):
-        perimeter = PerimeterRenderer(calm_mode=False, rng=lambda: 0.0)
+        perimeter = PerimeterRenderer(rng=lambda: 0.0)
         dispatcher = RenderDispatcher(send_fn=lambda p: None, perimeter=perimeter)
         host = DirectorHost(dispatcher, clock=lambda: 0)
         show = _BeatShow()

@@ -19,8 +19,9 @@ fans to three sinks:
 The loopback is class-gated only, not group-gated: the Director
 always sees its own output regardless of group, matching the M5
 loopback (group filtering is a receive-side concern for *remote*
-Lumes). The renderers apply their own Calm-Mode frequency / brightness
-caps, so the dispatcher doesn't second-guess them.
+Lumes). Post-Epic-19 the renderers apply only their LCD-hardware
+brightness cap (glare comfort); frequency + tone-down decisions are
+Director-composition territory now.
 
 The dispatcher is hardware-free: the ESP-NOW send is an injected
 callable so the whole fan-out is host-testable. B6 wires the real
