@@ -1,19 +1,17 @@
 """LCD renderer tests.
 
-Calm Mode (default): renderer is fully disabled. dispatch returns False,
-current_colour returns None, the LCD stays on its static UI background.
-
-Full mode: each accepted dispatch arms a full-screen envelope.
-current_colour returns the (r, g, b) at that moment, capped at 60 % of
-the LIGHT_PULSE's RGB to keep the face-distance wash from being
-uncomfortably bright. Frequency cap is 4 Hz (250 ms minimum interval).
+Renders every accepted dispatch as a full-screen envelope
+(post-Epic-19 - no calm-mode toggle). current_colour returns the
+(r, g, b) at that moment, capped at BRIGHTNESS_CAP (60 %) for
+face-distance glare comfort. Rate-limited by LCD_MIN_INTERVAL_MS
+(hardware SPI pacing, not calm-mode).
 """
 
 from nocturnation.protocol.constants import Time, Chance
 from nocturnation.render.lcd import (
     LcdRenderer,
     LCD_MIN_INTERVAL_MS,
-    FULL_BRIGHTNESS_CAP,
+    BRIGHTNESS_CAP,
     WASH_MAX_HOLD_MS,
 )
 
@@ -52,49 +50,23 @@ class FakeFrame:
         self.chance = chance
 
 
-class TestCalmMode:
-    def test_default_is_full_mode_enabled(self):
-        # Default flipped 2026-07-12 (v1.0.0): calm_mode=False, renderer
-        # enabled out of the box.
-        r = LcdRenderer()
-        assert r.enabled is True
-
-    def test_calm_mode_dispatch_returns_false(self):
-        r = LcdRenderer(calm_mode=True)
-        assert r.dispatch(FakeFrame(), now_ms=0) is False
-
-    def test_calm_mode_current_colour_is_none(self):
-        r = LcdRenderer(calm_mode=True)
-        r.dispatch(FakeFrame(), now_ms=0)
-        assert r.current_colour(now_ms=50) is None
-
-    def test_switching_to_calm_clears_active_wash(self):
-        r = LcdRenderer(calm_mode=False)
-        r.dispatch(FakeFrame(sustain=Time.T_3840_MS), now_ms=0)
-        # Wash is active.
-        assert r.current_colour(now_ms=100) is not None
-        # Switch to Calm Mode mid-envelope.
-        r.set_calm_mode(True)
-        assert r.current_colour(now_ms=200) is None
-
-
 class TestFullModeDispatch:
     def test_full_mode_dispatch_accepts_valid_frame(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         assert r.dispatch(FakeFrame(), now_ms=0) is True
 
     def test_primer_dropped(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         assert r.dispatch(FakeFrame(r=0, g=0, b=0), now_ms=0) is False
 
     def test_primer_does_not_consume_rate_limit(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         r.dispatch(FakeFrame(r=0, g=0, b=0), now_ms=0)
         # Main fire right after a primer is allowed.
         assert r.dispatch(FakeFrame(r=200), now_ms=50) is True
 
     def test_zero_duration_dropped(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         assert r.dispatch(
             FakeFrame(attack=Time.T_0_MS, sustain=Time.T_0_MS, release=Time.T_0_MS),
             now_ms=0,
@@ -103,13 +75,13 @@ class TestFullModeDispatch:
 
 class TestFrequencyCap:
     def test_cap_blocks_repeat_within_interval(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         r.dispatch(FakeFrame(), now_ms=0)
         # At exactly cap - 1 ms, blocked.
         assert r.dispatch(FakeFrame(), now_ms=LCD_MIN_INTERVAL_MS - 1) is False
 
     def test_cap_allows_at_interval(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         r.dispatch(FakeFrame(), now_ms=0)
         assert r.dispatch(FakeFrame(), now_ms=LCD_MIN_INTERVAL_MS) is True
 
@@ -122,7 +94,7 @@ class TestFrequencyCap:
 
 class TestEnvelopeShape:
     def test_attack_phase_ramps_up(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         r.dispatch(
             FakeFrame(r=200, g=0, b=0,
                       attack=Time.T_96_MS, sustain=Time.T_0_MS, release=Time.T_0_MS),
@@ -134,7 +106,7 @@ class TestEnvelopeShape:
         assert rgb[0] == 60
 
     def test_sustain_phase_holds_peak(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         r.dispatch(
             FakeFrame(r=200, g=0, b=0,
                       attack=Time.T_0_MS, sustain=Time.T_192_MS, release=Time.T_0_MS),
@@ -145,7 +117,7 @@ class TestEnvelopeShape:
         assert rgb == (120, 0, 0)
 
     def test_envelope_clears_after_total(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         r.dispatch(
             FakeFrame(r=255, attack=Time.T_32_MS, sustain=Time.T_32_MS, release=Time.T_32_MS),
             now_ms=0,
@@ -156,7 +128,7 @@ class TestEnvelopeShape:
 
 class TestBrightnessCap:
     def test_peak_capped_at_60_percent(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         r.dispatch(
             FakeFrame(r=255, g=255, b=255,
                       attack=Time.T_0_MS, sustain=Time.T_192_MS, release=Time.T_0_MS),
@@ -169,12 +141,12 @@ class TestBrightnessCap:
     def test_brightness_cap_constant(self):
         # Architecture spec section 15.2: no high-contrast full-screen
         # flashes. 60 % is the agreed bench-tested upper bound.
-        assert FULL_BRIGHTNESS_CAP == 0.6
+        assert BRIGHTNESS_CAP == 0.6
 
 
 class TestClear:
     def test_clear_drops_active_envelope(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         r.dispatch(FakeFrame(sustain=Time.T_3840_MS), now_ms=0)
         assert r.current_colour(now_ms=100) is not None
         r.clear()
@@ -188,7 +160,7 @@ class TestWashTtlFailsafe:
     WASH_MAX_HOLD_MS the receiver self-releases."""
 
     def test_ttl_zero_wash_self_releases_after_max_hold(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         r.on_light_wash(FakeWashFrame(), now_ms=0)
         # Just before the failsafe, still washing.
         assert r.is_washing() is True
@@ -200,7 +172,7 @@ class TestWashTtlFailsafe:
         assert r.is_washing() is False
 
     def test_explicit_short_ttl_still_honoured(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         r.on_light_wash(FakeWashFrame(ttl_seconds=5), now_ms=0)
         _ = r.current_colour(now_ms=4_000)
         assert r.is_washing() is True
@@ -208,7 +180,7 @@ class TestWashTtlFailsafe:
         assert r.is_washing() is False
 
     def test_failsafe_does_not_fire_before_its_time(self):
-        r = LcdRenderer(calm_mode=False)
+        r = LcdRenderer()
         r.on_light_wash(FakeWashFrame(), now_ms=0)
         _ = r.current_colour(now_ms=60_000)
         assert r.is_washing() is True

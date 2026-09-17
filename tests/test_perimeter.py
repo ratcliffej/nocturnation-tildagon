@@ -4,8 +4,8 @@ The renderer is two-phase: dispatch arms envelopes (chance-gated per
 LED), tick computes current brightness. Both run on the host; the
 hardware drive happens via the set_led callback passed to tick.
 
-Calm Mode (default): 2 Hz dispatch cap, 50 % brightness cap.
-Full mode: 4 Hz dispatch cap, 100 % brightness cap.
+Renders every incoming frame with no Lume-side rate gate (Epic 19);
+peak brightness held at 100 %.
 """
 
 import pytest
@@ -16,8 +16,7 @@ from nocturnation.render.perimeter import (
     LED_MIN_INDEX,
     LED_MAX_INDEX,
     LED_COUNT,
-    CALM_MIN_INTERVAL_MS,
-    FULL_MIN_INTERVAL_MS,
+    BRIGHTNESS_CAP,
     WASH_MAX_HOLD_MS,
 )
 
@@ -106,34 +105,15 @@ class TestPrimerAndZeroDuration:
         assert lit == 0
 
 
-class TestFrequencyCap:
-    def test_calm_mode_cap_500ms_blocks_499ms_repeat(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=True)
+class TestNoLumeRateGate:
+    """Epic 19 removed the Lume-side rate gate; back-to-back dispatches
+    both land regardless of the interval between them."""
+    def test_back_to_back_dispatches_both_land(self):
+        r = PerimeterRenderer(rng=always_pass_rng)
         assert r.dispatch(FakeFrame(), now_ms=0) == LED_COUNT
-        assert r.dispatch(FakeFrame(), now_ms=499) == 0  # blocked
-
-    def test_calm_mode_cap_allows_at_500ms(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=True)
-        r.dispatch(FakeFrame(), now_ms=0)
-        assert r.dispatch(FakeFrame(), now_ms=500) == LED_COUNT  # allowed
-
-    def test_full_mode_cap_60ms(self):
-        """Full-mode cap was 250 ms (4 Hz) and silently dropped every
-        other sparkle at 140 BPM tempo. Bumped to 60 ms (~16 Hz) so
-        per-beat sparkles land through 200+ BPM."""
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
-        r.dispatch(FakeFrame(), now_ms=0)
-        assert r.dispatch(FakeFrame(), now_ms=FULL_MIN_INTERVAL_MS - 1) == 0       # blocked
-        assert r.dispatch(FakeFrame(), now_ms=FULL_MIN_INTERVAL_MS) == LED_COUNT  # allowed
-
-    def test_set_calm_mode_switches_cap(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=True)
-        assert CALM_MIN_INTERVAL_MS == 500
-        r.set_calm_mode(False)
-        assert FULL_MIN_INTERVAL_MS == 60
-        # First dispatch is always allowed after the switch (re-init of state).
-        r.dispatch(FakeFrame(), now_ms=0)
-        assert r.dispatch(FakeFrame(), now_ms=FULL_MIN_INTERVAL_MS) == LED_COUNT
+        # Would have been blocked under the old 500 ms / 60 ms gate.
+        assert r.dispatch(FakeFrame(), now_ms=1) == LED_COUNT
+        assert r.dispatch(FakeFrame(), now_ms=2) == LED_COUNT
 
 
 class TestEnvelope:
@@ -147,7 +127,7 @@ class TestEnvelope:
 
     def test_attack_phase_ramps_up(self):
         # Frame: attack 96 ms, sustain 0, release 0.
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         r.dispatch(
             FakeFrame(r=200, g=0, b=0,
                       attack=Time.T_96_MS, sustain=Time.T_0_MS, release=Time.T_0_MS),
@@ -166,7 +146,7 @@ class TestEnvelope:
         assert first_led[1] == 100
 
     def test_sustain_phase_holds_peak(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         r.dispatch(
             FakeFrame(r=200, g=0, b=0,
                       attack=Time.T_0_MS, sustain=Time.T_192_MS, release=Time.T_0_MS),
@@ -178,7 +158,7 @@ class TestEnvelope:
         assert first_led[1] == 200  # full brightness
 
     def test_release_phase_ramps_down(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         # attack 0, sustain 0, release 96. Whole envelope = 0..96 ms decay.
         r.dispatch(
             FakeFrame(r=200, g=0, b=0,
@@ -192,7 +172,7 @@ class TestEnvelope:
         assert first_led[1] == 100
 
     def test_envelope_clears_after_total(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         r.dispatch(
             FakeFrame(r=255, g=0, b=0,
                       attack=Time.T_32_MS, sustain=Time.T_32_MS, release=Time.T_32_MS),
@@ -205,10 +185,11 @@ class TestEnvelope:
         assert all(rgb[1] == 0 and rgb[2] == 0 and rgb[3] == 0 for rgb in captured)
 
 
-class TestCalmModeBrightnessCap:
-    def test_calm_mode_caps_brightness_at_50_percent(self):
-        # Sustain phase, calm mode: r=200 should output 100 (200 * 0.5).
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=True)
+class TestBrightnessCap:
+    def test_full_brightness_passes_through(self):
+        # Epic 19: perimeter cap held at 100 %, so r=200 renders as-is.
+        assert BRIGHTNESS_CAP == 1.0
+        r = PerimeterRenderer(rng=always_pass_rng)
         r.dispatch(
             FakeFrame(r=200, g=0, b=0,
                       attack=Time.T_0_MS, sustain=Time.T_192_MS, release=Time.T_0_MS),
@@ -216,23 +197,12 @@ class TestCalmModeBrightnessCap:
         )
         captured, set_led = make_capture()
         r.tick(now_ms=100, set_led=set_led)
-        assert captured[0][1] == 100  # half of 200
-
-    def test_full_mode_passes_full_brightness(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
-        r.dispatch(
-            FakeFrame(r=200, g=0, b=0,
-                      attack=Time.T_0_MS, sustain=Time.T_192_MS, release=Time.T_0_MS),
-            now_ms=0,
-        )
-        captured, set_led = make_capture()
-        r.tick(now_ms=100, set_led=set_led)
-        assert captured[0][1] == 200  # full of 200
+        assert captured[0][1] == 200
 
 
 class TestClear:
     def test_clear_dampens_all_active_envelopes(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         r.dispatch(
             FakeFrame(r=200, sustain=Time.T_3840_MS),
             now_ms=0,
@@ -261,7 +231,7 @@ class TestAdrCrossfade:
     snapping through black between colours."""
 
     def test_attack_lerps_from_previous_pulse_colour(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         # First pulse: red at full sustain so the LEDs sit at red.
         r.dispatch(
             FakeFrame(r=200, g=0, b=0,
@@ -273,9 +243,7 @@ class TestAdrCrossfade:
         r.tick(now_ms=10, set_led=set_led1)
         assert cap1[0][1] == 200  # red at full
 
-        # Now arm a second pulse to blue with a 96ms attack (frequency
-        # cap is bypassed by advancing now well beyond the Full-mode
-        # FULL_MIN_INTERVAL_MS interval).
+        # Now arm a second pulse to blue with a 96 ms attack.
         r.dispatch(
             FakeFrame(r=0, g=0, b=200,
                       attack=Time.T_96_MS, sustain=Time.T_0_MS, release=Time.T_0_MS),
@@ -297,7 +265,7 @@ class TestAdrCrossfade:
         # non-zero-attack pulses. (Existing test_attack_phase_ramps_up
         # covers the from-black case; this is the regression guard for
         # T_0_MS attacks not accidentally lerping.)
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         r.dispatch(
             FakeFrame(r=255, g=0, b=0,
                       attack=Time.T_0_MS, sustain=Time.T_96_MS, release=Time.T_0_MS),
@@ -330,7 +298,7 @@ class TestWashBaseline:
         return f
 
     def test_wash_baseline_paints_all_leds_uniformly(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         r.on_light_wash(self._wash_frame(), now_ms=0)
         cap, set_led = make_capture()
         # Advance past attack (which is 0 here).
@@ -342,7 +310,7 @@ class TestWashBaseline:
         assert all(g == 0 for g in greens)
 
     def test_wash_drift_oscillates_between_colours(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         # cycle_ms = 1000: t=0 -> r1, t=500 -> r2, t=1000 -> r1.
         f = self._wash_frame(cycle_ms=1000)
         r.on_light_wash(f, now_ms=0)
@@ -357,7 +325,7 @@ class TestWashBaseline:
         assert r0[3]   < rmid[3],  "midpoint should have more blue than start"
 
     def test_wash_end_fades_to_black(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         r.on_light_wash(self._wash_frame(), now_ms=0)
         # Hold at red.
         cap, set_led = make_capture()
@@ -378,7 +346,7 @@ class TestWashBaseline:
         assert all(c[1] == 0 and c[2] == 0 and c[3] == 0 for c in cap3)
 
     def test_pulse_on_wash_overlay_fades_back_to_baseline(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         r.on_light_wash(self._wash_frame(), now_ms=0)  # red baseline (r=255, g=0, b=0)
         cap1, set_led1 = make_capture()
         r.tick(now_ms=10, set_led=set_led1)
@@ -403,7 +371,7 @@ class TestWashBaseline:
         assert led[1] > 0, f"red should reappear mid-release; got {led}"
 
     def test_pulse_response_zero_drops_pulse(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         r.on_light_wash(self._wash_frame(pulse_response=0), now_ms=0)
         cap1, set_led1 = make_capture()
         r.tick(now_ms=10, set_led=set_led1)
@@ -439,7 +407,7 @@ class TestWashTtlFailsafe:
         return f
 
     def test_ttl_zero_wash_self_releases_after_max_hold(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         r.on_light_wash(self._wash_frame(), now_ms=0)
         # Just before the failsafe, the wash is still holding (no release).
         cap_before, set_before = make_capture()
@@ -456,7 +424,7 @@ class TestWashTtlFailsafe:
         # An explicit ttl_seconds shorter than WASH_MAX_HOLD_MS must still
         # release on the operator's schedule - the failsafe is the floor
         # for "infinite", not a ceiling for everything.
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         r.on_light_wash(self._wash_frame(ttl_seconds=5), now_ms=0)
         r.tick(now_ms=4_000, set_led=make_capture()[1])
         assert r.is_washing() is True   # still holding at 4s
@@ -465,7 +433,7 @@ class TestWashTtlFailsafe:
 
     def test_failsafe_does_not_fire_before_its_time(self):
         # Generous failsafe; at the 1-minute mark the wash must still hold.
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         r.on_light_wash(self._wash_frame(), now_ms=0)
         r.tick(now_ms=60_000, set_led=make_capture()[1])
         assert r.is_washing() is True
@@ -487,7 +455,7 @@ class TestLedAddressingSingleLed:
 
     def test_single_led_lights_only_target_pixel(self):
         # Wire index 0 -> Tildagon ring LED 1. Wire index 5 -> ring LED 6.
-        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_fail_rng)
         lit = r.dispatch(
             FakeFrame(chance=Chance.CHANCE_4,
                       led_mode=1, led_modifier1=0, led_modifier2=5),
@@ -509,7 +477,7 @@ class TestLedAddressingSingleLed:
     def test_single_led_chain_id_1_hits_our_ring(self):
         # chain=1 is our ring specifically; treated identically to chain=0
         # on single-chain hardware.
-        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_fail_rng)
         lit = r.dispatch(
             FakeFrame(led_mode=1, led_modifier1=1, led_modifier2=0),
             now_ms=0,
@@ -518,7 +486,7 @@ class TestLedAddressingSingleLed:
 
     def test_single_led_chain_id_2_drops(self):
         # No physical chain 2 exists; frame silently drops.
-        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_fail_rng)
         lit = r.dispatch(
             FakeFrame(led_mode=1, led_modifier1=2, led_modifier2=0),
             now_ms=0,
@@ -527,7 +495,7 @@ class TestLedAddressingSingleLed:
 
     def test_single_led_out_of_range_index_drops(self):
         # Wire index 12 would map to ring LED 13, which doesn't exist.
-        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_fail_rng)
         lit = r.dispatch(
             FakeFrame(led_mode=1, led_modifier1=0, led_modifier2=12),
             now_ms=0,
@@ -541,7 +509,7 @@ class TestLedAddressingRepeatPattern:
 
     def test_alternating_mask_0x555_lights_even_wire_positions(self):
         # 0x555 = 0b010101010101 -> bits 0, 2, 4, 6, 8, 10
-        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_fail_rng)
         lit = r.dispatch(
             FakeFrame(led_mode=2, led_modifier1=0x55, led_modifier2=0x05),
             now_ms=0,
@@ -562,7 +530,7 @@ class TestLedAddressingRepeatPattern:
                 "ring LED %d should be dark" % ring_idx
 
     def test_zero_mask_lights_nothing(self):
-        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_fail_rng)
         lit = r.dispatch(
             FakeFrame(led_mode=2, led_modifier1=0, led_modifier2=0),
             now_ms=0,
@@ -570,7 +538,7 @@ class TestLedAddressingRepeatPattern:
         assert lit == 0
 
     def test_full_mask_0xfff_lights_every_led(self):
-        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_fail_rng)
         lit = r.dispatch(
             FakeFrame(led_mode=2, led_modifier1=0xFF, led_modifier2=0x0F),
             now_ms=0,
@@ -581,7 +549,7 @@ class TestLedAddressingRepeatPattern:
         # modifier2 = 0xFF should be treated as 0x0F (upper 4 bits reserved).
         # 0xFFF = full mask -> all 12 LEDs. If the upper bits weren't
         # masked, we'd try to address ring LEDs 13..16 and drop them.
-        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_fail_rng)
         lit = r.dispatch(
             FakeFrame(led_mode=2, led_modifier1=0xFF, led_modifier2=0xFF),
             now_ms=0,
@@ -594,7 +562,7 @@ class TestLedAddressingBypassesChance:
     targeting one LED with CHANCE_4 still hits deterministically."""
 
     def test_mode_1_ignores_chance(self):
-        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_fail_rng)
         lit = r.dispatch(
             FakeFrame(chance=Chance.CHANCE_4,
                       led_mode=1, led_modifier1=0, led_modifier2=0),
@@ -603,7 +571,7 @@ class TestLedAddressingBypassesChance:
         assert lit == 1
 
     def test_mode_2_ignores_chance(self):
-        r = PerimeterRenderer(rng=always_fail_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_fail_rng)
         lit = r.dispatch(
             FakeFrame(chance=Chance.CHANCE_4,
                       led_mode=2, led_modifier1=0xFF, led_modifier2=0x0F),
@@ -617,7 +585,7 @@ class TestLedAddressingParity:
     roll, whole-ring semantics."""
 
     def test_mode_0_defaults_to_v3_chance_roll(self):
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         # LedMode fields default to 0/0/0 on FakeFrame.
         lit = r.dispatch(
             FakeFrame(chance=Chance.CHANCE_100),
@@ -638,7 +606,7 @@ class TestLedAddressingModeZeroOnlyEscapeHatch:
         original = pm.MODE_0_ONLY
         try:
             pm.MODE_0_ONLY = True
-            r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+            r = PerimeterRenderer(rng=always_pass_rng)
             lit = r.dispatch(
                 FakeFrame(chance=Chance.CHANCE_100,
                           led_mode=1, led_modifier1=0, led_modifier2=5),
@@ -663,7 +631,7 @@ class TestLedAddressingResponsiveness:
 
     def test_worst_case_12_concurrent_envelopes_tick_bounded(self):
         import time
-        r = PerimeterRenderer(rng=always_pass_rng, calm_mode=False)
+        r = PerimeterRenderer(rng=always_pass_rng)
         # 12 concurrent envelopes, one per LED, each with a long sustain
         # so they all remain active for the duration of the sample.
         r.dispatch(

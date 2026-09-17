@@ -17,9 +17,6 @@ from nocturnation.settings import Settings, DEFAULT_PATH, DEFAULT_HELP_URL
 class TestDefaults:
     def test_default_values(self):
         s = Settings()
-        # calm_mode default flipped True -> False on 2026-07-12 (v1.0.0)
-        # so fresh installs render the authored show at full brightness.
-        assert s.calm_mode is False
         assert s.group == 0
         assert s.channel == "auto"
         assert s.active_show == ""
@@ -67,13 +64,12 @@ class TestChannelCoercion:
 
 class TestDictRoundTrip:
     def test_to_dict_has_all_fields(self):
-        s = Settings(calm_mode=False, group=3, channel="11",
+        s = Settings(group=3, channel="11",
                      active_show="simple_tap", mode="director",
                      help_url="http://example.com", debug_mode=True,
                      repeat="OFF")
         d = s.to_dict()
         assert d == {
-            "calm_mode": False,
             "group": 3,
             "channel": "11",
             "active_show": "simple_tap",
@@ -96,11 +92,10 @@ class TestDictRoundTrip:
 
     def test_from_dict_populates(self):
         s = Settings.from_dict({
-            "calm_mode": False, "group": 2, "channel": "1",
+            "group": 2, "channel": "1",
             "active_show": "motion_wave", "mode": "director",
             "help_url": "http://example.com",
         })
-        assert s.calm_mode is False
         assert s.group == 2
         assert s.channel == "1"
         assert s.active_show == "motion_wave"
@@ -108,13 +103,20 @@ class TestDictRoundTrip:
         assert s.help_url == "http://example.com"
 
     def test_from_dict_missing_keys_uses_defaults(self):
-        s = Settings.from_dict({"calm_mode": False})
-        assert s.calm_mode is False
+        s = Settings.from_dict({"group": 0})
         assert s.group == 0
         assert s.channel == "auto"
         assert s.active_show == ""
         assert s.mode == "lume"
         assert s.help_url == DEFAULT_HELP_URL
+
+    def test_from_dict_ignores_legacy_calm_mode_key(self):
+        # Epic 19: old on-disk settings that carry `calm_mode` should
+        # load cleanly - the field is silently ignored since it's no
+        # longer part of the Settings surface.
+        s = Settings.from_dict({"calm_mode": True, "group": 2})
+        assert s.group == 2
+        assert not hasattr(s, "calm_mode")
 
     def test_from_dict_non_dict_returns_defaults(self):
         # Corrupted JSON might decode to a list or string; fall back
@@ -131,7 +133,7 @@ class TestPersistence:
         ) as f:
             path = f.name
         try:
-            original = Settings(calm_mode=False, group=2, channel="11")
+            original = Settings(group=2, channel="11")
             original.save(path)
             loaded = Settings.load(path)
             assert loaded == original
@@ -150,7 +152,6 @@ class TestPersistence:
             # Group is randomised into [1, 3] inclusive.
             assert 1 <= loaded.group <= 3
             # Other fields are still default.
-            assert loaded.calm_mode is False
             assert loaded.channel == "auto"
             assert loaded.mode == "lume"
         finally:
@@ -311,9 +312,6 @@ class TestEquality:
     def test_equal_settings_compare_equal(self):
         assert Settings() == Settings()
         assert Settings(group=3) == Settings(group=3)
-
-    def test_different_calm_mode_not_equal(self):
-        assert Settings(calm_mode=True) != Settings(calm_mode=False)
 
     def test_different_type_not_equal(self):
         assert Settings() != "not a Settings"

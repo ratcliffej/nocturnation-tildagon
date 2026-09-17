@@ -8,8 +8,11 @@ drift; pulses overlay additively on top.
 Pure logic - the caller drives the actual hardware via the set_led
 callback passed to tick().
 
-Calm Mode (default on): 2 Hz dispatch cap, 50 % peak brightness.
-Full-effect (operator opt-in): 16 Hz dispatch cap, 100 %.
+Renders every incoming frame as soon as it arrives (no Lume-side
+rate gate; Director enforces the airtime cap upstream, Epic 19).
+Peak brightness held at 100 % of authored intensity; photosensitivity
+and pacing are the show's compositional responsibility, not the
+Lume's.
 
 Design decisions: docs/tildagon-history.md.
 """
@@ -48,19 +51,13 @@ _LED_MODE_REPEAT_PATTERN  = 2
 # LedMode is basically free. Documented for future emergency use.
 MODE_0_ONLY = False
 
-# Frequency caps - minimum ms between accepted dispatch calls. Calm mode
-# keeps the Harding-safe 500 ms (2 Hz) floor for audience badges. Full
-# mode 60 ms (~16 Hz) covers per-beat sparkles to 200+ BPM; guards
-# against pathological back-to-back dispatches, not legitimate music
-# tempo. See docs/tildagon-history.md.
-CALM_MIN_INTERVAL_MS = 500
-FULL_MIN_INTERVAL_MS = 60
-
 # Bench-time dispatch drop logging. Flipped on by app.py._BENCH_HOP0.
 _BENCH_DISPATCH_LOG = False
 
-CALM_BRIGHTNESS_CAP = 0.5
-FULL_BRIGHTNESS_CAP = 1.0
+# Peak brightness multiplier for the perimeter ring, applied uniformly
+# to pulse + wash. Held at 100 % of authored intensity - Director-side
+# shows own any calm/tone-down decisions (Epic 19).
+BRIGHTNESS_CAP = 1.0
 
 # Lost-WASH_END failsafe: a wash with ttl_seconds == 0 is "infinite" per
 # spec. If the WASH_END frame is lost and pulse_response = 0 gates
@@ -108,17 +105,13 @@ class PerimeterRenderer:
     """
 
     __slots__ = (
-        "_calm_mode",
-        "_min_interval_ms",
-        "_brightness_cap",
-        "_last_dispatch_ms",
         "_envelopes",
         "_last_rendered",
         "_wash",
         "_rng",
     )
 
-    def __init__(self, calm_mode=False, rng=None):
+    def __init__(self, rng=None):
         if rng is None:
             import random
             rng = random.random
@@ -128,20 +121,6 @@ class PerimeterRenderer:
         self._envelopes        = [None] * (LED_MAX_INDEX + 1)
         self._last_rendered = [(0, 0, 0)] * (LED_MAX_INDEX + 1)
         self._wash          = None
-
-        self._calm_mode = bool(calm_mode)
-        self._min_interval_ms = CALM_MIN_INTERVAL_MS if self._calm_mode else FULL_MIN_INTERVAL_MS
-        self._brightness_cap = CALM_BRIGHTNESS_CAP if self._calm_mode else FULL_BRIGHTNESS_CAP
-        self._last_dispatch_ms = -self._min_interval_ms - 1
-
-    @property
-    def calm_mode(self):
-        return self._calm_mode
-
-    def set_calm_mode(self, on):
-        self._calm_mode = bool(on)
-        self._min_interval_ms = CALM_MIN_INTERVAL_MS if self._calm_mode else FULL_MIN_INTERVAL_MS
-        self._brightness_cap = CALM_BRIGHTNESS_CAP if self._calm_mode else FULL_BRIGHTNESS_CAP
 
     # ------------------------------------------------------------------
     # Wash baseline - one wash struct for all 12 LEDs.
@@ -168,7 +147,7 @@ class PerimeterRenderer:
         else:
             base_r, base_g, base_b = w["r1"], w["g1"], w["b1"]
 
-        scale = (w["intensity"] / 255.0) * self._brightness_cap
+        scale = (w["intensity"] / 255.0) * BRIGHTNESS_CAP
 
         post_r = _clip(base_r * scale)
         post_g = _clip(base_g * scale)
@@ -277,17 +256,9 @@ class PerimeterRenderer:
         Returns the number of LEDs lit. When a wash is active and
         pulse_response = 0, the pulse is silently dropped; with
         pulse_response = 1 (the wash-demo default) it overlays additively.
+        No Lume-side rate gate - Director enforces the airtime cap
+        upstream (Epic 19).
         """
-        # Primers and zero-duration envelopes don't count against the
-        # cap so they don't consume the budget the main fire needs.
-        gap = ticks_diff(now_ms, self._last_dispatch_ms)
-        if gap < self._min_interval_ms:
-            if _BENCH_DISPATCH_LOG:
-                print("[BENCH-DROP] src=%d seq=%d ticks=%d reason=rate_limit gap=%d min=%d"
-                      % (frame.source_id, frame.sequence_number, now_ms,
-                         gap, self._min_interval_ms))
-            return 0
-
         if frame.r == 0 and frame.g == 0 and frame.b == 0:
             if _BENCH_DISPATCH_LOG:
                 print("[BENCH-DROP] src=%d seq=%d ticks=%d reason=black"
@@ -310,10 +281,9 @@ class PerimeterRenderer:
             return 0
 
         chance_prob = CHANCE_PROB[frame.chance]
-        cap = self._brightness_cap
-        dst_r = _clip(frame.r * cap)
-        dst_g = _clip(frame.g * cap)
-        dst_b = _clip(frame.b * cap)
+        dst_r = _clip(frame.r * BRIGHTNESS_CAP)
+        dst_g = _clip(frame.g * BRIGHTNESS_CAP)
+        dst_b = _clip(frame.b * BRIGHTNESS_CAP)
 
         # Epic 18 v0x04 LED-level addressing. Fields default to 0/0/0
         # (LedMode.ALL) so a Director that hasn't yet been taught to fill
@@ -336,7 +306,6 @@ class PerimeterRenderer:
             # chain 1) both hit our one physical ring. Chain >= 2 has
             # no matching hardware and drops silently.
             if led_modifier1 > 1:
-                self._last_dispatch_ms = now_ms
                 return 0
             # Wire LED-index is 0-based; Tildagon perimeter is 1-based.
             wire_idx = led_modifier2
@@ -356,7 +325,6 @@ class PerimeterRenderer:
             # ring LED (i + LED_MIN_INDEX).
             mask = (led_modifier1 & 0xFF) | ((led_modifier2 & 0x0F) << 8)
             if mask == 0:
-                self._last_dispatch_ms = now_ms
                 return 0
             for wire_idx in range(LED_COUNT):
                 if not (mask & (1 << wire_idx)):
@@ -383,7 +351,6 @@ class PerimeterRenderer:
                     )
                     lit += 1
 
-        self._last_dispatch_ms = now_ms
         return lit
 
     def on_light_wash_pulse(self, frame, now_ms):
@@ -498,8 +465,9 @@ class PerimeterRenderer:
                 self._wash = None
 
     def clear(self):
-        """Reset every LED envelope + drop any active wash. Useful on
-        Calm Mode change or backgrounding."""
+        """Reset every LED envelope + drop any active wash. Called on
+        foreground/background transitions to leave the ring in a
+        clean state."""
         for i in range(LED_MIN_INDEX, LED_MAX_INDEX + 1):
             self._envelopes[i] = None
             self._last_rendered[i] = (0, 0, 0)

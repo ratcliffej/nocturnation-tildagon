@@ -16,12 +16,11 @@ from nocturnation.protocol.constants import DeviceClass, MessageType, Time, Chan
 def _always_fire_perimeter():
     # rng=lambda:0.0 means every chance gate passes (0.0 < prob), so a
     # CHANCE_100 fire lights all 12 LEDs deterministically.
-    return PerimeterRenderer(calm_mode=False, rng=lambda: 0.0)
+    return PerimeterRenderer(rng=lambda: 0.0)
 
 
 def _full_lcd():
-    # Full mode so the LCD actually arms (Calm Mode disables it).
-    return LcdRenderer(calm_mode=False)
+    return LcdRenderer()
 
 
 def _pulse():
@@ -223,26 +222,6 @@ class TestLoopbackClassGating:
         assert result.lcd_armed is False
         assert result.sent is True
         assert len(sent) == 1
-
-
-class TestLoopbackRespectsRendererCaps:
-    def test_calm_lcd_never_arms(self):
-        # Calm Mode LCD is disabled; loopback to Screen does nothing
-        # on the LCD even though the class matches.
-        lcd = LcdRenderer(calm_mode=True)
-        d = RenderDispatcher(send_fn=lambda p: None, lcd=lcd)
-        result = d.dispatch("00:00", _pulse(), now_ms=0)
-        assert result.lcd_armed is False
-
-    def test_perimeter_frequency_cap_applies(self):
-        # Two fires inside the Calm-mode 500 ms window: the second is
-        # rate-limited to zero lit LEDs.
-        perimeter = PerimeterRenderer(calm_mode=True, rng=lambda: 0.0)
-        d = RenderDispatcher(send_fn=lambda p: None, perimeter=perimeter)
-        first = d.dispatch("01:00", _pulse(), now_ms=0)
-        second = d.dispatch("01:00", _pulse(), now_ms=100)
-        assert first.perimeter_lit == 12
-        assert second.perimeter_lit == 0
 
 
 class TestHeartbeat:

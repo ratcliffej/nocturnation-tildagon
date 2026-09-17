@@ -1,15 +1,6 @@
 """Persistent settings for the NocturNation Tildagon app.
 
-Three operator-tunable values:
-
-  calm_mode (bool, default False)
-    When True the perimeter LED renderer caps at 50 % peak brightness
-    and 2 Hz dispatch, and the LCD pulse wash is disabled entirely
-    (the LCD stays on its static UI). Architecture spec section 15
-    photosensitivity bounds. Default flipped OFF on 2026-07-12 (v1.0.0)
-    so a fresh install renders the authored show at full authored
-    brightness; the operator opts INTO calm mode via the in-app menu
-    for photosensitivity-sensitive contexts.
+Operator-tunable values:
 
   group (int 0..255, default 0)
     NocturNation device group per protocol manual section 4.2.
@@ -63,13 +54,12 @@ _VALID_REPEAT = ("AUTO", "OFF")
 
 
 class Settings:
-    __slots__ = ("calm_mode", "group", "channel", "active_show", "mode",
+    __slots__ = ("group", "channel", "active_show", "mode",
                  "help_url", "debug_mode", "repeat")
 
-    def __init__(self, calm_mode=False, group=0, channel="auto", active_show="",
+    def __init__(self, group=0, channel="auto", active_show="",
                  mode="lume", help_url=DEFAULT_HELP_URL, debug_mode=False,
                  repeat="OFF"):
-        self.calm_mode = bool(calm_mode)
         self.group = self._coerce_group(group)
         self.channel = self._coerce_channel(channel)
         self.active_show = self._coerce_active_show(active_show)
@@ -148,7 +138,6 @@ class Settings:
 
     def to_dict(self):
         return {
-            "calm_mode": self.calm_mode,
             "group": self.group,
             "channel": self.channel,
             "active_show": self.active_show,
@@ -160,10 +149,12 @@ class Settings:
 
     @classmethod
     def from_dict(cls, d):
+        # Old on-disk settings that carry a `calm_mode` key are loaded
+        # cleanly: d.get() ignores unknown keys, the field simply
+        # disappears from the in-memory Settings (Epic 19).
         if not isinstance(d, dict):
             return cls()
         return cls(
-            calm_mode=d.get("calm_mode", False),
             group=d.get("group", 0),
             channel=d.get("channel", "auto"),
             active_show=d.get("active_show", ""),
@@ -211,8 +202,7 @@ class Settings:
         if not isinstance(other, Settings):
             return NotImplemented
         return (
-            self.calm_mode == other.calm_mode
-            and self.group == other.group
+            self.group == other.group
             and self.channel == other.channel
             and self.active_show == other.active_show
             and self.mode == other.mode
@@ -223,10 +213,9 @@ class Settings:
 
     def __repr__(self):
         return (
-            "Settings(calm_mode=%r, group=%r, channel=%r, active_show=%r, "
+            "Settings(group=%r, channel=%r, active_show=%r, "
             "mode=%r, help_url=%r, debug_mode=%r, repeat=%r)"
             % (
-                self.calm_mode,
                 self.group,
                 self.channel,
                 self.active_show,

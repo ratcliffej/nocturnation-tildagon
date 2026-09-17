@@ -4,6 +4,41 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-09-16 — v1.0.21: Epic 19 B3 — remove Lume-side calm mode
+
+Calm mode is now a Director-side attribute (Epic 19 B1 in the StickC
+firmware). The Tildagon Lume renders every frame it accepts at 100 %
+authored intensity with no per-Lume rate gate; photosensitivity and
+tone-down are the show's compositional responsibility.
+
+Removed:
+- `Settings.calm_mode` field + on-disk persistence path. Legacy
+  settings that still carry the key load cleanly - the field is
+  silently ignored.
+- Settings-menu "Calm Mode: ON/OFF" entry + `_apply_calm_mode` app
+  handler.
+- `PerimeterRenderer` rate-limit gate (500 ms / 60 ms depending on
+  mode). Back-to-back dispatches now both land.
+- Perimeter Calm vs Full brightness split (50 % / 100 %) - single
+  `BRIGHTNESS_CAP = 1.0` constant.
+- `LcdRenderer` calm-disable path (`_enabled` slot + `set_calm_mode`
+  setter + `enabled` property). LCD renders every accepted frame.
+
+Kept:
+- LCD's 60 ms `LCD_MIN_INTERVAL_MS` rate gate (SPI panel hardware
+  pacing, orthogonal to calm mode).
+- LCD's 0.6 `BRIGHTNESS_CAP` (face-distance glare comfort cap, not
+  a calm-mode choice).
+- Fast-relay IRQ path unchanged.
+
+Constants renamed to shed the calm-vs-full framing:
+- `perimeter.FULL_BRIGHTNESS_CAP` → `perimeter.BRIGHTNESS_CAP`.
+- `lcd.FULL_BRIGHTNESS_CAP`       → `lcd.BRIGHTNESS_CAP`.
+- `render/__init__.py` re-exports the LCD cap as `LCD_BRIGHTNESS_CAP`.
+- `perimeter.CALM_MIN_INTERVAL_MS` / `FULL_MIN_INTERVAL_MS` dropped.
+
+All 585 host tests pass.
+
 ## 2026-07-19 — v1.0.2: Stop other badge OS apps while NocturNation runs
 
 Performance patch. On `__init__` NocturNation now stops the badge OS

@@ -598,8 +598,8 @@ class NocturNationApp(app.App):
         # imports are already cached.
         self._settings = Settings.load()
         self._dedup = DedupRing()
-        self._renderer = PerimeterRenderer(calm_mode=self._settings.calm_mode)
-        self._lcd_renderer = LcdRenderer(calm_mode=self._settings.calm_mode)
+        self._renderer = PerimeterRenderer()
+        self._lcd_renderer = LcdRenderer()
         self._lume_text_renderer = LumeTextRenderer()
         self._display = CtxDisplay()
         self._signal_tracker = SignalTracker()
@@ -954,7 +954,6 @@ class NocturNationApp(app.App):
 
     def _settings_menu_items(self):
         return [
-            "Calm Mode: %s" % ("ON" if self._settings.calm_mode else "OFF"),
             "Group: %d" % self._settings.group,
             "Channel: %s" % self._settings.channel,
             "Debug: %s" % ("ON" if self._settings.debug_mode else "OFF"),
@@ -979,29 +978,26 @@ class NocturNationApp(app.App):
 
     def _settings_select(self, item, idx) -> None:
         if idx == 0:
-            self._settings.calm_mode = not self._settings.calm_mode
-            self._apply_calm_mode()
-        elif idx == 1:
             cur = self._settings.group
             try:
                 pos = _GROUP_CYCLE.index(cur)
             except ValueError:
                 pos = -1
             self._settings.group = _GROUP_CYCLE[(pos + 1) % len(_GROUP_CYCLE)]
-        elif idx == 2:
+        elif idx == 1:
             cur = self._settings.channel
             try:
                 pos = _CHANNEL_CYCLE.index(cur)
             except ValueError:
                 pos = -1
             self._settings.channel = _CHANNEL_CYCLE[(pos + 1) % len(_CHANNEL_CYCLE)]
-        elif idx == 3:
+        elif idx == 2:
             self._settings.debug_mode = not self._settings.debug_mode
-        elif idx == 4:
+        elif idx == 3:
             # Repeat toggle. Takes effect on next Lume-mode session entry -
             # a mid-session toggle does not tear down an active FSM here.
             self._settings.repeat = "OFF" if self._settings.repeat == "AUTO" else "AUTO"
-        elif idx == 5:
+        elif idx == 4:
             # Rescan: TOFU-only reset. The Tildagon's radio doesn't
             # reliably support channel re-scanning post-boot (Q6), so the
             # channel stays the same.
@@ -1009,7 +1005,7 @@ class NocturNationApp(app.App):
             print("[nocturnation] TOFU lock cleared by operator")
             self._close_settings()
             return
-        elif idx == 6:
+        elif idx == 5:
             self._close_settings()
             return
         # If save fails we keep the in-memory change so the UI is
@@ -1022,11 +1018,6 @@ class NocturNationApp(app.App):
 
     def _settings_back(self) -> None:
         self._close_settings()
-
-    def _apply_calm_mode(self) -> None:
-        on = self._settings.calm_mode
-        self._renderer.set_calm_mode(on)
-        self._lcd_renderer.set_calm_mode(on)
         if not on:
             # Switching into Full mode - clear the LCD wash so it starts
             # from black at the next dispatch rather than holding stale.
