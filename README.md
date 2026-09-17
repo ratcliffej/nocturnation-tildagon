@@ -2,11 +2,11 @@
 
 > Open-source crowd lighting, on the EMF Tildagon badge.
 
-> ⚠️ **Photosensitivity warning.** NocturNation flashes the badge's perimeter LEDs in time with music — and, in Full mode, the round screen too. Flashing light can trigger seizures in people with photosensitive epilepsy, and the badge sits close to your face. **Calm Mode is ON by default** (reduced brightness, 2 Hz cap, screen flashing disabled), and we strongly recommend leaving it on, especially in a crowd. If you have photosensitive epilepsy or are sensitive to flashing light, please take care — keep Calm Mode on, or skip this app. NocturNation is an open-source hobby project, not a certified safety or medical device; you use it at your own risk.
+> ⚠️ **Photosensitivity warning.** NocturNation flashes the badge's perimeter LEDs in time with music, and the round screen too. Flashing light can trigger seizures in people with photosensitive epilepsy, and the badge sits close to your face. Show composition and venue signage are the primary safety layer; the LD running the Director can also toggle **Calm Mode** on the transmitting device (Epic 19) to have the show emit softer, lower-cadence content. If you have photosensitive epilepsy or are sensitive to flashing light, please take care and consider skipping this app in a crowd. NocturNation is an open-source hobby project, not a certified safety or medical device; you use it at your own risk.
 
 NocturNation turns a crowd into a light show: a **Director** listens to music, detects the beat, and broadcasts light commands over ESP-NOW to a swarm of **Lumes** that light up in time. This repository is the [EMF Tildagon badge](https://tildagon.badge.emfcamp.org/) app — it lets a badge join a NocturNation show in two ways:
 
-- **Lume (receiver).** The badge listens for a Director's light commands and animates its twelve perimeter LEDs and round LCD in sync with the music. **Calm Mode** is on by default, so it is comfortable to wear straight out of the box.
+- **Lume (receiver).** The badge listens for a Director's light commands and animates its twelve perimeter LEDs and round LCD in sync with the music. As of Epic 19 (v1.0.21) the Lume renders every accepted frame at 100 % of authored intensity; photosensitivity mitigation lives on the Director side (Calm Mode) and in the show composition.
 - **Director.** The badge runs the show itself: tap it to the beat (the IMU turns a sharp tap into a beat) or press a button, and it fires a pulse to its own LEDs *and* broadcasts to any other badges and bracelets in range. A group of people can tap together and watch the room flash as one — useful when there is no Director Stick nearby. Director transmits on the hobby channel only, so it never competes with a venue's official show.
 
 It is a fresh MicroPython codebase, not a port of the [M5 Stick firmware](https://github.com/ratcliffej/nocturnation-stickc). The two share only the on-wire [NocturNation ESP-NOW protocol](https://github.com/ratcliffej/nocturnation-docs/blob/main/manuals/protocol-manual.md) — different chip (ESP32-C3), different language (MicroPython), different SDK (Tildagon OS).
@@ -38,7 +38,7 @@ The NocturNation manuals live in the [**nocturnation-docs**](https://github.com/
 **Throughout:**
 
 - A MicroPython **Show plug-in framework** that mirrors the M5 firmware's `Show` surface — folder-per-show, auto-discovered, with persisted per-show settings.
-- **Calm Mode** default-on (frequency and brightness caps, LCD flashing disabled) for photosensitivity safety; opt in to full effects in Settings.
+- **Photosensitivity mitigation** lives on the Director side (Calm Mode - Epic 19). The Tildagon Lume renders every accepted frame at 100 % of authored intensity; the LCD keeps a face-distance glare-comfort cap (60 %) that applies regardless.
 - An idle start menu (**Lume / Director / Settings / Help / Quit**). WiFi stays up while idle and the radio is taken only once a mode starts, so ESP-NOW and the badge's WiFi coexist cleanly. **Help** shows a scannable QR code to the project site.
 - Trust-On-First-Use source locking and Performance-band filtering, so the badge follows a single trusted Director (see the protocol manual's access-control section).
 - **559 host-side tests**, all passing, including byte-level parity against the protocol manual's reference vectors.
@@ -147,7 +147,7 @@ On the badge the app lives at `/apps/nocturnation/` (via `deploy.sh`) or `/apps/
 - **Device class** is `MultiLedScreen` (`0x03`); the badge also renders Light-class broadcasts (`01:00`) on the perimeter ring.
 - **Receives** on channel 1 or 11 (11 first, per the protocol manual's channel-discovery section); **transmits** on channel 1 only.
 - **Group ID** defaults to a random value in {1, 2, 3} at first boot, matching the M5 Stick behaviour.
-- **Calm Mode** default-on: frequency cap, brightness cap, LCD flash disabled. Full effects are an opt-in in Settings.
+- **Calm Mode is a Director-side attribute** (Epic 19, v1.0.21). The Tildagon Lume no longer carries a Calm/Full toggle; it renders every frame it accepts. Photosensitivity is a show-composition responsibility and a Director-toggled attribute.
 
 ## Publishing to the EMF app store
 
