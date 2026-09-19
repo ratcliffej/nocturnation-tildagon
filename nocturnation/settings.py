@@ -55,11 +55,24 @@ _VALID_REPEAT = ("AUTO", "OFF")
 
 class Settings:
     __slots__ = ("group", "channel", "active_show", "mode",
-                 "help_url", "debug_mode", "repeat")
+                 "help_url", "debug_mode", "repeat",
+                 # Epic 20 B5: BLE-writable fields. `friendly_name`
+                 # overrides the MAC-derived advertising name;
+                 # `pair_win_s` controls the pairing-window duration.
+                 # Both persist in the same JSON as everything else.
+                 "friendly_name", "pair_win_s",
+                 # Accepted-and-remembered for cross-host consistency
+                 # with the property bag, even though Tildagon has a
+                 # fixed 12-pixel perimeter. Values written via BLE
+                 # are stored so the phone's view of the fleet stays
+                 # coherent; rendering ignores them in v0x01.
+                 "led_power", "strip_chain", "strip_group_size")
 
     def __init__(self, group=0, channel="auto", active_show="",
                  mode="lume", help_url=DEFAULT_HELP_URL, debug_mode=False,
-                 repeat="OFF"):
+                 repeat="OFF",
+                 friendly_name="", pair_win_s=30,
+                 led_power=100, strip_chain=12, strip_group_size=12):
         self.group = self._coerce_group(group)
         self.channel = self._coerce_channel(channel)
         self.active_show = self._coerce_active_show(active_show)
@@ -82,6 +95,12 @@ class Settings:
         # cover the venue; opt INTO AUTO from Settings when running a
         # coverage-marginal deployment without engineered repeaters.
         self.repeat = self._coerce_repeat(repeat)
+        # Epic 20 B5: BLE-writable fields.
+        self.friendly_name = self._coerce_friendly_name(friendly_name)
+        self.pair_win_s = self._coerce_pair_win_s(pair_win_s)
+        self.led_power = self._coerce_u8(led_power, 100)
+        self.strip_chain = self._coerce_u16(strip_chain, 12)
+        self.strip_group_size = self._coerce_u8(strip_group_size, 12)
 
     @staticmethod
     def _coerce_group(g):
@@ -136,6 +155,47 @@ class Settings:
             return r
         return "OFF"
 
+    @staticmethod
+    def _coerce_friendly_name(n):
+        """Non-string / non-str-coercible falls back to empty. Clipped
+        to 20 bytes (matches spec section 5.1)."""
+        if not isinstance(n, str):
+            return ""
+        return n[:20]
+
+    @staticmethod
+    def _coerce_pair_win_s(v):
+        """Clamp to [5, 255]; non-int falls back to 30 (spec default)."""
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return 30
+        if n < 5:
+            return 5
+        if n > 255:
+            return 255
+        return n
+
+    @staticmethod
+    def _coerce_u8(v, default):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return default
+        if n < 0 or n > 255:
+            return default
+        return n
+
+    @staticmethod
+    def _coerce_u16(v, default):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return default
+        if n < 0 or n > 65535:
+            return default
+        return n
+
     def to_dict(self):
         return {
             "group": self.group,
@@ -145,13 +205,19 @@ class Settings:
             "help_url": self.help_url,
             "debug_mode": self.debug_mode,
             "repeat": self.repeat,
+            "friendly_name": self.friendly_name,
+            "pair_win_s": self.pair_win_s,
+            "led_power": self.led_power,
+            "strip_chain": self.strip_chain,
+            "strip_group_size": self.strip_group_size,
         }
 
     @classmethod
     def from_dict(cls, d):
         # Old on-disk settings that carry a `calm_mode` key are loaded
         # cleanly: d.get() ignores unknown keys, the field simply
-        # disappears from the in-memory Settings (Epic 19).
+        # disappears from the in-memory Settings (Epic 19). Missing
+        # BLE fields fall back to constructor defaults (Epic 20 B5).
         if not isinstance(d, dict):
             return cls()
         return cls(
@@ -162,6 +228,11 @@ class Settings:
             help_url=d.get("help_url", DEFAULT_HELP_URL),
             debug_mode=d.get("debug_mode", False),
             repeat=d.get("repeat", "OFF"),
+            friendly_name=d.get("friendly_name", ""),
+            pair_win_s=d.get("pair_win_s", 30),
+            led_power=d.get("led_power", 100),
+            strip_chain=d.get("strip_chain", 12),
+            strip_group_size=d.get("strip_group_size", 12),
         )
 
     def save(self, path=DEFAULT_PATH):
@@ -209,12 +280,19 @@ class Settings:
             and self.help_url == other.help_url
             and self.debug_mode == other.debug_mode
             and self.repeat == other.repeat
+            and self.friendly_name == other.friendly_name
+            and self.pair_win_s == other.pair_win_s
+            and self.led_power == other.led_power
+            and self.strip_chain == other.strip_chain
+            and self.strip_group_size == other.strip_group_size
         )
 
     def __repr__(self):
         return (
             "Settings(group=%r, channel=%r, active_show=%r, "
-            "mode=%r, help_url=%r, debug_mode=%r, repeat=%r)"
+            "mode=%r, help_url=%r, debug_mode=%r, repeat=%r, "
+            "friendly_name=%r, pair_win_s=%r, led_power=%r, "
+            "strip_chain=%r, strip_group_size=%r)"
             % (
                 self.group,
                 self.channel,
@@ -223,5 +301,10 @@ class Settings:
                 self.help_url,
                 self.debug_mode,
                 self.repeat,
+                self.friendly_name,
+                self.pair_win_s,
+                self.led_power,
+                self.strip_chain,
+                self.strip_group_size,
             )
         )
