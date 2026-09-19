@@ -444,6 +444,16 @@ class NocturNationApp(app.App):
         self._lume_text_renderer = None
         self._settings_open = False
         self._settings_menu = None
+        # Epic 20 B6: BLE pairing screen state. `_ble_pair_open` is a
+        # top-level UI mode (like `_settings_open` / `_help_open`); when
+        # set, update() drives the pairing state machine and draw()
+        # renders the countdown / success / timeout screen.
+        self._ble_pair_open = False
+        self._ble_service = None
+        self._ble_pair_return_after_ms = 0
+        # Terminal state waiting to be shown: 0 = still open (countdown),
+        # 1 = success, 2 = timeout, 3 = sleeping.
+        self._ble_pair_terminal = 0
         # App role: "idle" (no radio, WiFi up), "lume" (receive), or
         # "director" (Show + IMU + TX). Launch straight into Lume; F
         # (CANCEL) in Lume calls _stop_to_idle.
@@ -665,6 +675,23 @@ class NocturNationApp(app.App):
         # (the whole idle/settings/help/lume state machine reads it).
         if not self._lume_stack_loaded:
             return
+        # Epic 20 B6: BLE pairing screen takes priority. update() is
+        # the only place polling the pairing state machine; missing
+        # ticks would leave the countdown frozen.
+        if self._ble_pair_open:
+            now_ms = time.ticks_ms() if time is not None else 0
+            self._tick_ble_pair(now_ms)
+            # Honour F (CANCEL) as an escape hatch — the badge SDK
+            # routes button state through Buttons.get_pressed(); we
+            # reuse the same idiom the rest of app.py uses.
+            try:
+                from tildagon import Buttons
+                if Buttons.get_pressed(Buttons.BUTTON_TYPES["CANCEL"]):
+                    self._close_ble_pair()
+            except Exception:
+                pass
+            return
+
         if self._settings_open and self._settings_menu is not None:
             self._settings_menu.update(delta)
             return
@@ -959,6 +986,7 @@ class NocturNationApp(app.App):
             "Debug: %s" % ("ON" if self._settings.debug_mode else "OFF"),
             "Repeat: %s" % self._settings.repeat,
             "Rescan",
+            "BLE Pair",   # Epic 20 B6
             "Back",
         ]
 
@@ -1006,6 +1034,13 @@ class NocturNationApp(app.App):
             self._close_settings()
             return
         elif idx == 5:
+            # Epic 20 B6: enter BLE pairing screen. Closes the settings
+            # menu (releases the badge SDK's menu grab), starts the BLE
+            # service; update() drives the pairing state machine.
+            self._close_settings()
+            self._open_ble_pair()
+            return
+        elif idx == 6:
             self._close_settings()
             return
         # If save fails we keep the in-memory change so the UI is
@@ -1022,6 +1057,133 @@ class NocturNationApp(app.App):
             # Switching into Full mode - clear the LCD wash so it starts
             # from black at the next dispatch rather than holding stale.
             self._lcd_renderer.clear()
+
+    # ------------------------------------------------------------------
+    # Epic 20 B6: BLE pairing screen
+    # ------------------------------------------------------------------
+
+    def _open_ble_pair(self) -> None:
+        """Enter the BLE pairing screen.
+
+        Constructs the BleService lazily (first-use) so a Tildagon that
+        never opens the pairing menu never imports aioble - useful for
+        deployments where the operator wants the radio strictly
+        ESP-NOW-only. Sets _ble_pair_open so update() and draw() route
+        to the pairing state machine and screen.
+        """
+        # Lazy import so a Tildagon that never opens pairing doesn't
+        # cost aioble RAM.
+        try:
+            from .nocturnation.ble_service import BleService
+        except Exception as exc:
+            print("[nocturnation] BLE unavailable: %s" % exc)
+            return
+
+        if self._ble_service is None:
+            self._ble_service = BleService()
+
+        now_ms = time.ticks_ms() if time is not None else 0
+        # Perimeter runs at 100% currently (Epic 19) and the strip
+        # topology is fixed 12 pixels for the perimeter; surface those
+        # values as-is via the config bag.
+        started = self._ble_service.start(
+            self._settings,
+            brightness_pct=self._settings.led_power,
+            chain_size=self._settings.strip_chain,
+            group_size=self._settings.strip_group_size,
+            pair_win_s=self._settings.pair_win_s,
+            now_ms=now_ms,
+        )
+        if not started:
+            # Fall back to a brief "unavailable" screen; the countdown
+            # loop will time out immediately.
+            self._ble_pair_terminal = 2
+            self._ble_pair_return_after_ms = now_ms + 1500
+        else:
+            self._ble_pair_terminal = 0
+            self._ble_pair_return_after_ms = 0
+        self._ble_pair_open = True
+
+    def _close_ble_pair(self) -> None:
+        if self._ble_service is not None:
+            try:
+                self._ble_service.stop()
+            except Exception as exc:
+                print("[nocturnation] BLE stop error: %s" % exc)
+        self._ble_pair_open = False
+        self._ble_pair_terminal = 0
+        self._ble_pair_return_after_ms = 0
+
+    def _tick_ble_pair(self, now_ms) -> None:
+        """Called each update() while the pairing screen is open."""
+        if self._ble_pair_return_after_ms and now_ms >= self._ble_pair_return_after_ms:
+            self._close_ble_pair()
+            return
+
+        if self._ble_pair_terminal == 0 and self._ble_service is not None:
+            try:
+                state = self._ble_service.tick(now_ms)
+            except Exception:
+                state = 4  # STATE_ABORTED - be defensive on stray exceptions
+            # State enum values from ble_service.STATE_*.
+            if state == 2:      # STATE_COMMITTED
+                self._ble_pair_terminal = 1
+                self._ble_pair_return_after_ms = now_ms + 1500
+                # Persist any config the phone wrote.
+                try:
+                    self._settings.save()
+                except Exception as exc:
+                    print("[nocturnation] settings save failed: %s" % exc)
+            elif state == 3:    # STATE_SLEEPING
+                self._ble_pair_terminal = 3
+                self._ble_pair_return_after_ms = now_ms + 1500
+                try:
+                    self._settings.save()
+                except Exception as exc:
+                    print("[nocturnation] settings save failed: %s" % exc)
+            elif state == 4:    # STATE_ABORTED
+                self._ble_pair_terminal = 2
+                self._ble_pair_return_after_ms = now_ms + 1500
+
+    def _draw_ble_pair(self, ctx) -> None:
+        """Render the pairing screen: title, advertising name, countdown
+        (or terminal-state label). Uses the canvas coordinate system the
+        rest of the app draws in (-120 to +120)."""
+        if clear_background is not None:
+            clear_background(ctx)
+        else:
+            ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
+
+        # Title.
+        ctx.rgb(0.4, 0.6, 1.0).move_to(-100, -80).text("BLE Pair")
+
+        # Advertising name (friendly_name override, else NCTN-Lume-XXXXXX).
+        try:
+            from .nocturnation.ble_service import compose_advertising_name
+            name = compose_advertising_name(b"\x00" * 6,
+                                            self._settings.friendly_name)
+        except Exception:
+            name = "NCTN-Lume-??????"
+        ctx.rgb(1.0, 1.0, 1.0).move_to(-100, -30).text(name)
+
+        # State-appropriate body text.
+        if self._ble_pair_terminal == 1:
+            ctx.rgb(0.2, 1.0, 0.2).move_to(-100, 10).text("Paired!")
+        elif self._ble_pair_terminal == 2:
+            ctx.rgb(1.0, 0.3, 0.3).move_to(-100, 10).text("Timeout")
+        elif self._ble_pair_terminal == 3:
+            ctx.rgb(0.2, 1.0, 0.2).move_to(-100, 10).text("Paired - sleeping")
+        else:
+            # Open state - show seconds remaining.
+            if self._ble_service is not None:
+                now_ms = time.ticks_ms() if time is not None else 0
+                secs = self._ble_service.seconds_remaining(now_ms)
+            else:
+                secs = 0
+            ctx.rgb(1.0, 1.0, 1.0).move_to(-100, 10).text("Time: %ds" % secs)
+            ctx.rgb(0.7, 0.7, 0.7).move_to(-100, 50).text("Open your app")
+
+        ctx.rgb(0.6, 0.6, 0.6).move_to(-100, 100).text("F: cancel")
 
     def _start_repeater(self) -> None:
         """Instantiate the dynamic-repeater FSM if Repeat=AUTO. No-op
@@ -1174,6 +1336,13 @@ class NocturNationApp(app.App):
             else:
                 self._draw_splash(ctx)
                 return
+
+        # Epic 20 B6: BLE pairing screen wins over every other draw
+        # path — it's the operator's only feedback that the pairing
+        # window is live.
+        if self._ble_pair_open:
+            self._draw_ble_pair(ctx)
+            return
 
         if self._settings_open and self._settings_menu is not None:
             if clear_background is not None:
