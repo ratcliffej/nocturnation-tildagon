@@ -393,11 +393,15 @@ class BleService:
         # picks either operation (NimBLE's writeValue has both; the
         # StickC's Config Lumes path uses write-with-response by
         # default) reaches .written() the same way.
-        # max_len = 240 — aioble's default is 20 (the pre-MTU-exchange
-        # ATT payload), which silently rejects a full ~89-byte config
-        # bag before it reaches .written(). Set to 240 to accept any
-        # reasonable property-bag payload.
-        self._chr_config = aioble.Characteristic(
+        #
+        # BufferedCharacteristic (max_len=240) instead of Characteristic:
+        # aioble's base Characteristic doesn't accept max_len and sizes
+        # the GATT value buffer to the default 20 bytes - any write
+        # larger than that is silently rejected before reaching
+        # .written(). A full config bag is ~89 bytes. BufferedChar is
+        # the aioble-provided subclass that calls gatts_set_buffer with
+        # a larger size, so writes up to max_len land.
+        self._chr_config = aioble.BufferedCharacteristic(
             svc, UUID(CHAR_CONFIG), read=True, write=True,
             write_no_response=True, capture=True, max_len=240,
             initial=build_lume_config_bag(
@@ -410,9 +414,9 @@ class BleService:
         self._chr_pair_ctrl = aioble.Characteristic(
             svc, UUID(CHAR_PAIRING_CONTROL), write=True,
             write_no_response=True, capture=True)
-        # show_pt reserved for later LIGHT_* passthrough bursts; bump
-        # max_len for the same reason as config.
-        self._chr_show_pt = aioble.Characteristic(
+        # show_pt reserved for later LIGHT_* passthrough bursts; same
+        # BufferedCharacteristic max_len=240 story as config.
+        self._chr_show_pt = aioble.BufferedCharacteristic(
             svc, UUID(CHAR_SHOW_PASSTHROUGH), read=True, write=True,
             write_no_response=True, capture=True, max_len=240,
             initial=pb.encode([("reserved", pb.TYPE_U8, pb.u8(0x01))]))

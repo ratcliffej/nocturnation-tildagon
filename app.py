@@ -1000,7 +1000,6 @@ class NocturNationApp(app.App):
             "Channel: %s" % self._settings.channel,
             "Debug: %s" % ("ON" if self._settings.debug_mode else "OFF"),
             "Repeat: %s" % self._settings.repeat,
-            "Rescan",
             "BLE Pair",   # Epic 20 B6
             "Back",
         ]
@@ -1041,22 +1040,18 @@ class NocturNationApp(app.App):
             # a mid-session toggle does not tear down an active FSM here.
             self._settings.repeat = "OFF" if self._settings.repeat == "AUTO" else "AUTO"
         elif idx == 4:
-            # Rescan: TOFU-only reset. The Tildagon's radio doesn't
-            # reliably support channel re-scanning post-boot (Q6), so the
-            # channel stays the same.
-            self._tofu.clear()
-            print("[nocturnation] TOFU lock cleared by operator")
-            self._close_settings()
-            return
-        elif idx == 5:
             # Epic 20 B6: enter BLE pairing screen. Closes the settings
             # menu (releases the badge SDK's menu grab), starts the BLE
             # service; update() drives the pairing state machine.
+            # Rescan (TOFU-clear) retired 2026-10-21 - radio doesn't
+            # reliably rescan post-boot on Tildagon so the entry didn't
+            # do anything useful; operators reach for Group/Channel
+            # changes or a reboot instead.
             print("[nocturnation] Settings: BLE Pair selected")
             self._close_settings()
             self._open_ble_pair()
             return
-        elif idx == 6:
+        elif idx == 5:
             self._close_settings()
             return
         # If save fails we keep the in-memory change so the UI is
