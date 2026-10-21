@@ -38,7 +38,9 @@ Persisted as JSON at DEFAULT_PATH (outside the apps directory so the
 app's deploy.sh wipe-and-copy doesn't clobber operator preferences).
 """
 
+import binascii
 import json
+import os
 
 
 # Outside /apps/ so the app's wipe-and-redeploy cycle doesn't clobber
@@ -53,13 +55,107 @@ _VALID_MODES = ("lume", "director")
 _VALID_REPEAT = ("AUTO", "OFF")
 
 
+# ---------------------------------------------------------------------------
+# Epic 21 identity helpers.
+#
+# `compute_uid_from_mac(mac)` is a pure function: given the 6-byte
+# ESP32 STA MAC, return the 4-byte UID as an unsigned int (little-
+# endian on the wire, host-int here). The derivation uses CRC32 with
+# the reflected polynomial 0xEDB88320 (zlib-compatible), which both
+# MicroPython and CPython expose via `binascii.crc32`. Deterministic
+# so re-generating on first boot after a settings-file wipe yields
+# the same UID.
+#
+# `ensure_identity(settings, mac_bytes, path=None)` is the first-boot
+# gate: it generates UID + secret if missing and persists. Call ONCE
+# during app bootstrap, AFTER WiFi has been brought up so os.urandom
+# draws from the ESP32 hardware RNG rather than the weakly-seeded
+# pre-radio PRNG. See [[project-device-uid-design]].
+# ---------------------------------------------------------------------------
+
+def compute_uid_from_mac(mac_bytes):
+    """CRC32(STA_MAC) under the reflected 0xEDB88320 polynomial.
+
+    Returns a 32-bit unsigned int. `mac_bytes` must be 6 bytes.
+    """
+    if len(mac_bytes) != 6:
+        raise ValueError("mac_bytes must be 6 bytes")
+    # binascii.crc32 returns the full 32-bit value on both backends.
+    # Mask explicitly to keep the sign promotion predictable on
+    # MicroPython (older versions have returned signed ints).
+    return binascii.crc32(bytes(mac_bytes)) & 0xFFFFFFFF
+
+
+def ensure_identity(settings, mac_bytes, path=None):
+    """Populate `settings.dev_uid` + `settings.dev_secret` if they
+    aren't set, and persist via `settings.save(path)`.
+
+    Returns True if anything was generated (the caller may log a
+    boot banner); False on no-op.
+
+    `mac_bytes` is the host's 6-byte STA MAC. On a Tildagon this is
+    `network.WLAN(network.STA_IF).config('mac')`; a native test
+    harness passes any 6-byte value.
+
+    No-op on subsequent boots once both fields are populated.
+    """
+    changed = False
+    if settings.dev_uid == 0:
+        settings.dev_uid = compute_uid_from_mac(mac_bytes)
+        changed = True
+    if not settings.dev_secret:
+        # 16 random bytes from the hardware RNG once wifi has booted.
+        secret = os.urandom(16)
+        settings.dev_secret = binascii.hexlify(secret).decode("ascii")
+        changed = True
+    if changed:
+        try:
+            if path is not None:
+                settings.save(path)
+            else:
+                settings.save()
+        except OSError:
+            # Non-fatal: next successful save() picks up the identity.
+            # First-boot CONFIG_WRITE won't verify until that happens,
+            # but the badge functions as a Lume regardless.
+            pass
+    return changed
+
+
 class Settings:
     __slots__ = ("group", "channel", "active_show", "mode",
-                 "help_url", "debug_mode", "repeat")
+                 "help_url", "debug_mode", "repeat",
+                 # Epic 20 B5: BLE-writable fields. `friendly_name`
+                 # overrides the MAC-derived advertising name;
+                 # `pair_win_s` controls the pairing-window duration.
+                 # Both persist in the same JSON as everything else.
+                 "friendly_name", "pair_win_s",
+                 # Accepted-and-remembered for cross-host consistency
+                 # with the property bag, even though Tildagon has a
+                 # fixed 12-pixel perimeter. Values written via BLE
+                 # are stored so the phone's view of the fleet stays
+                 # coherent; rendering ignores them in v0x01.
+                 "led_power", "strip_chain", "strip_group_size",
+                 # Epic 21 authenticated config channel identity.
+                 # `dev_uid`: 4-byte CRC32(STA_MAC); stable address.
+                 # `dev_secret`: 16-byte random, hex-encoded on disk
+                 #   (JSON doesn't carry raw bytes cleanly). Gated
+                 #   on the BLE pairing window - the GATT read for
+                 #   it refuses outside Open state.
+                 # `cfg_numonce`: 64-bit monotonic counter. The
+                 #   Tildagon is Lume-first so it rarely sends
+                 #   CONFIG_WRITE frames itself, but if a future
+                 #   Director capability lands it will need this.
+                 # All three are populated by ensure_identity() at
+                 # first boot and persist thereafter.
+                 "dev_uid", "dev_secret", "cfg_numonce")
 
     def __init__(self, group=0, channel="auto", active_show="",
                  mode="lume", help_url=DEFAULT_HELP_URL, debug_mode=False,
-                 repeat="OFF"):
+                 repeat="OFF",
+                 friendly_name="", pair_win_s=30,
+                 led_power=100, strip_chain=12, strip_group_size=12,
+                 dev_uid=0, dev_secret="", cfg_numonce=0):
         self.group = self._coerce_group(group)
         self.channel = self._coerce_channel(channel)
         self.active_show = self._coerce_active_show(active_show)
@@ -82,6 +178,19 @@ class Settings:
         # cover the venue; opt INTO AUTO from Settings when running a
         # coverage-marginal deployment without engineered repeaters.
         self.repeat = self._coerce_repeat(repeat)
+        # Epic 20 B5: BLE-writable fields.
+        self.friendly_name = self._coerce_friendly_name(friendly_name)
+        self.pair_win_s = self._coerce_pair_win_s(pair_win_s)
+        self.led_power = self._coerce_u8(led_power, 100)
+        self.strip_chain = self._coerce_u16(strip_chain, 12)
+        self.strip_group_size = self._coerce_u8(strip_group_size, 12)
+        # Epic 21 identity. 0 / "" / 0 are the "not yet generated"
+        # sentinels; ensure_identity() populates them on first boot
+        # AFTER wifi init so hashlib + os.urandom draw from the ESP32
+        # hardware RNG rather than the weakly-seeded pre-radio PRNG.
+        self.dev_uid     = self._coerce_u32(dev_uid, 0)
+        self.dev_secret  = self._coerce_secret_hex(dev_secret)
+        self.cfg_numonce = self._coerce_u64(cfg_numonce, 0)
 
     @staticmethod
     def _coerce_group(g):
@@ -136,6 +245,84 @@ class Settings:
             return r
         return "OFF"
 
+    @staticmethod
+    def _coerce_friendly_name(n):
+        """Non-string / non-str-coercible falls back to empty. Clipped
+        to 20 bytes (matches spec section 5.1)."""
+        if not isinstance(n, str):
+            return ""
+        return n[:20]
+
+    @staticmethod
+    def _coerce_pair_win_s(v):
+        """Clamp to [5, 255]; non-int falls back to 30 (spec default)."""
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return 30
+        if n < 5:
+            return 5
+        if n > 255:
+            return 255
+        return n
+
+    @staticmethod
+    def _coerce_u8(v, default):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return default
+        if n < 0 or n > 255:
+            return default
+        return n
+
+    @staticmethod
+    def _coerce_u16(v, default):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return default
+        if n < 0 or n > 65535:
+            return default
+        return n
+
+    @staticmethod
+    def _coerce_u32(v, default):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return default
+        if n < 0 or n > 0xFFFFFFFF:
+            return default
+        return n
+
+    @staticmethod
+    def _coerce_u64(v, default):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return default
+        if n < 0 or n > 0xFFFFFFFFFFFFFFFF:
+            return default
+        return n
+
+    @staticmethod
+    def _coerce_secret_hex(s):
+        """Expect a 32-char lowercase hex string (16 bytes). Anything
+        else coerces to "" (= "not yet generated"). Keeps a corrupted
+        settings file from crashing - ensure_identity() will regenerate
+        on next boot.
+        """
+        if not isinstance(s, str):
+            return ""
+        if len(s) != 32:
+            return ""
+        try:
+            int(s, 16)
+        except ValueError:
+            return ""
+        return s.lower()
+
     def to_dict(self):
         return {
             "group": self.group,
@@ -145,13 +332,24 @@ class Settings:
             "help_url": self.help_url,
             "debug_mode": self.debug_mode,
             "repeat": self.repeat,
+            "friendly_name": self.friendly_name,
+            "pair_win_s": self.pair_win_s,
+            "led_power": self.led_power,
+            "strip_chain": self.strip_chain,
+            "strip_group_size": self.strip_group_size,
+            "dev_uid": self.dev_uid,
+            "dev_secret": self.dev_secret,
+            "cfg_numonce": self.cfg_numonce,
         }
 
     @classmethod
     def from_dict(cls, d):
         # Old on-disk settings that carry a `calm_mode` key are loaded
         # cleanly: d.get() ignores unknown keys, the field simply
-        # disappears from the in-memory Settings (Epic 19).
+        # disappears from the in-memory Settings (Epic 19). Missing
+        # BLE fields fall back to constructor defaults (Epic 20 B5).
+        # Missing Epic 21 identity falls back to 0/"" and is
+        # regenerated on next ensure_identity() call.
         if not isinstance(d, dict):
             return cls()
         return cls(
@@ -162,7 +360,51 @@ class Settings:
             help_url=d.get("help_url", DEFAULT_HELP_URL),
             debug_mode=d.get("debug_mode", False),
             repeat=d.get("repeat", "OFF"),
+            friendly_name=d.get("friendly_name", ""),
+            pair_win_s=d.get("pair_win_s", 30),
+            led_power=d.get("led_power", 100),
+            strip_chain=d.get("strip_chain", 12),
+            strip_group_size=d.get("strip_group_size", 12),
+            dev_uid=d.get("dev_uid", 0),
+            dev_secret=d.get("dev_secret", ""),
+            cfg_numonce=d.get("cfg_numonce", 0),
         )
+
+    # ------------------------------------------------------------------
+    # Epic 21 identity helpers.
+    # ------------------------------------------------------------------
+
+    def dev_secret_bytes(self):
+        """Return the 16-byte secret as bytes, or 16 zero bytes if
+        the secret hasn't been generated yet.
+        """
+        if not self.dev_secret:
+            return b"\x00" * 16
+        try:
+            return bytes.fromhex(self.dev_secret)
+        except (ValueError, TypeError):
+            return b"\x00" * 16
+
+    def next_cfg_numonce(self, path=None):
+        """Increment the Director-side CONFIG_WRITE counter and persist.
+
+        Returns the new value. 0 is the reserved sentinel (never
+        transmitted); first call returns 1. Persistence happens inline
+        because losing the counter would permit a stale-numonce replay
+        on reboot - callers accept the ~ms NVS write cost.
+
+        Writes failures are tolerated (same policy as save()): the
+        in-memory counter still advances, and the next successful
+        save() will catch up. A sender that reboots mid-flight after
+        a failed write MIGHT reuse a numonce, which the receiver
+        rejects - safe fail mode.
+        """
+        self.cfg_numonce += 1
+        try:
+            self.save(path) if path is not None else self.save()
+        except OSError:
+            pass
+        return self.cfg_numonce
 
     def save(self, path=DEFAULT_PATH):
         with open(path, "w") as f:
@@ -209,12 +451,19 @@ class Settings:
             and self.help_url == other.help_url
             and self.debug_mode == other.debug_mode
             and self.repeat == other.repeat
+            and self.friendly_name == other.friendly_name
+            and self.pair_win_s == other.pair_win_s
+            and self.led_power == other.led_power
+            and self.strip_chain == other.strip_chain
+            and self.strip_group_size == other.strip_group_size
         )
 
     def __repr__(self):
         return (
             "Settings(group=%r, channel=%r, active_show=%r, "
-            "mode=%r, help_url=%r, debug_mode=%r, repeat=%r)"
+            "mode=%r, help_url=%r, debug_mode=%r, repeat=%r, "
+            "friendly_name=%r, pair_win_s=%r, led_power=%r, "
+            "strip_chain=%r, strip_group_size=%r)"
             % (
                 self.group,
                 self.channel,
@@ -223,5 +472,10 @@ class Settings:
                 self.help_url,
                 self.debug_mode,
                 self.repeat,
+                self.friendly_name,
+                self.pair_win_s,
+                self.led_power,
+                self.strip_chain,
+                self.strip_group_size,
             )
         )

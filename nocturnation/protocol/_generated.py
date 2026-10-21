@@ -40,6 +40,12 @@ class MessageType:
     BITMAP_HEADER    = 0x0A
     BITMAP_PLANE     = 0x0B
     CLEAR_SCREEN     = 0x0C
+    # Epic 21 authenticated config channel (post-EMF). Backward-
+    # compatible with the wire-spec freeze: deployed Lumes without
+    # Epic 21 firmware silently drop these as unknown types.
+    UID_ANNOUNCE     = 0x0E   # Lume -> Director in operator capture window
+    CONFIG_WRITE     = 0x0F   # Director -> UID, HMAC-SHA256 authenticated
+    CONFIG_ACK       = 0x10   # Lume -> Director best-effort apply ack
     EXTENSION        = 0xFF
 
 

@@ -4,6 +4,43 @@ Notable changes to the NocturNation Tildagon receiver app. Versioning
 matches `tildagon.toml`'s integer `version` field, which the EMF app
 store treats monotonically rather than as semver.
 
+## 2026-09-19 — v1.0.22: Epic 20 B5/B6 — BLE pairing service + screen
+
+Adds Bluetooth Low-Energy pairing support so operators can configure a
+Tildagon Lume from a phone (nRF Connect for the manual case; a future
+NocturNation mobile app for a friendlier UX). The badge advertises the
+NocturNation GATT service defined in the sibling docs repo's
+`ble-service.md` v0x01 — the same service any StickC / Atom Lite Lume
+exposes, so one client codebase talks to every device in the fleet.
+
+Behaviour:
+- **Settings > BLE Pair** — new menu entry. Opens a 30-second pairing
+  window (`pair_win_s`, configurable via BLE) and shows the advertised
+  name + seconds remaining on the LCD.
+- Phone connects → reads `device_info` / `config` → writes a property
+  bag with any of `group / led_power / channel_pref / strip_chain /
+  strip_group_size / friendly_name / pair_win_s` → writes
+  `pairing_control::commit`. LCD flashes "Paired!" and returns to the
+  Lume view; `nocturnation_settings.json` is persisted before the
+  return.
+- **F (CANCEL)** during pairing tears the BLE stack down and exits.
+- Auto-timeout to "Timeout" flash + return-to-Lume if no `commit` is
+  received before the window closes.
+
+New Settings fields (all optional in `nocturnation_settings.json`; old
+files load cleanly):
+- `friendly_name` (utf8, ≤20 bytes) — overrides the MAC-derived
+  advertising name.
+- `pair_win_s` (int 5..255, default 30) — pairing-window duration.
+- `led_power` / `strip_chain` / `strip_group_size` — accepted-and-
+  remembered for cross-host property-bag consistency; Tildagon renders
+  the fixed 12-pixel perimeter at 100 % regardless in v0x01.
+
+Coexistence: BLE and ESP-NOW share the 2.4 GHz radio, so pairing is
+only accessible from the Settings menu (not while Lume Mode is
+receiving). Opening the pairing screen implicitly exits any active
+show state.
+
 ## 2026-09-16 — v1.0.21: Epic 19 B3 — remove Lume-side calm mode
 
 Calm mode is now a Director-side attribute (Epic 19 B1 in the StickC

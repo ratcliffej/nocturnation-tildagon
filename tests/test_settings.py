@@ -77,6 +77,20 @@ class TestDictRoundTrip:
             "help_url": "http://example.com",
             "debug_mode": True,
             "repeat": "OFF",
+            # Epic 20 B5: BLE-writable fields default to
+            # (empty, 30 s pairing window, 100 % LED, 12-pixel
+            # perimeter, 12 pixels/group).
+            "friendly_name": "",
+            "pair_win_s": 30,
+            "led_power": 100,
+            "strip_chain": 12,
+            "strip_group_size": 12,
+            # Epic 21: identity + numonce counter. Sentinels (0/"")
+            # until ensure_identity() populates on first boot after
+            # wifi init.
+            "dev_uid": 0,
+            "dev_secret": "",
+            "cfg_numonce": 0,
         }
 
     def test_debug_mode_defaults_off(self):
