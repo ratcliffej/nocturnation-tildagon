@@ -1140,8 +1140,8 @@ class NocturNationApp(app.App):
         # misleading.
         if started:
             try:
-                self._renderer.set_pairing_indicator(True)
-                print("[nocturnation] BLE pair: pairing_indicator ON (blue)")
+                self._renderer.set_pairing_indicator("advertising")
+                print("[nocturnation] BLE pair: pairing_indicator ON (pulse blue)")
             except AttributeError:
                 pass   # older renderer without the hook
             except Exception as exc:
@@ -1169,6 +1169,22 @@ class NocturNationApp(app.App):
         if self._ble_pair_return_after_ms and now_ms >= self._ble_pair_return_after_ms:
             self._close_ble_pair()
             return
+
+        # Flip the perimeter indicator between pulse (advertising) and
+        # solid (connected) based on client state. Covers the user-
+        # visible BLE idiom: pulse while discoverable, solid when
+        # attached.
+        if (self._ble_pair_terminal == 0
+                and self._ble_service is not None
+                and self._renderer is not None):
+            try:
+                mode = ("connected" if self._ble_service.is_client_connected()
+                        else "advertising")
+                self._renderer.set_pairing_indicator(mode)
+            except AttributeError:
+                pass
+            except Exception as exc:
+                print("[nocturnation] BLE pair: indicator update failed: %s" % exc)
 
         if self._ble_pair_terminal == 0 and self._ble_service is not None:
             try:
@@ -1204,36 +1220,61 @@ class NocturNationApp(app.App):
         else:
             ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
 
+        # Centre-align everything so text fits inside the 240 px round
+        # display. The previous left-aligned at x=-100 version let
+        # longer strings ("Paired - sleeping", "NCTN-Lume-XXXXXX")
+        # clip the right edge of the circle.
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+
         # Title.
-        ctx.rgb(0.4, 0.6, 1.0).move_to(-100, -80).text("BLE Pair")
+        ctx.font_size = 18
+        ctx.rgb(0.4, 0.6, 1.0).move_to(0, -75).text("BLE Pair")
 
         # Advertising name (friendly_name override, else NCTN-Lume-XXXXXX).
+        # Read the real BT MAC from the BLE service so the on-screen
+        # name matches what the phone sees. Previous version passed a
+        # zero MAC placeholder and always showed NCTN-Lume-000000.
         try:
             from .nocturnation.ble_service import compose_advertising_name
-            name = compose_advertising_name(b"\x00" * 6,
+            bt_mac = (self._ble_service._bt_mac if self._ble_service is not None
+                      else b"\x00" * 6)
+            name = compose_advertising_name(bt_mac,
                                             self._settings.friendly_name)
         except Exception:
             name = "NCTN-Lume-??????"
-        ctx.rgb(1.0, 1.0, 1.0).move_to(-100, -30).text(name)
+        ctx.font_size = 14
+        ctx.rgb(1.0, 1.0, 1.0).move_to(0, -40).text(name)
 
         # State-appropriate body text.
+        ctx.font_size = 16
         if self._ble_pair_terminal == 1:
-            ctx.rgb(0.2, 1.0, 0.2).move_to(-100, 10).text("Paired!")
+            ctx.rgb(0.2, 1.0, 0.2).move_to(0, 10).text("Paired!")
         elif self._ble_pair_terminal == 2:
-            ctx.rgb(1.0, 0.3, 0.3).move_to(-100, 10).text("Timeout")
+            ctx.rgb(1.0, 0.3, 0.3).move_to(0, 10).text("Timeout")
         elif self._ble_pair_terminal == 3:
-            ctx.rgb(0.2, 1.0, 0.2).move_to(-100, 10).text("Paired - sleeping")
+            ctx.rgb(0.2, 1.0, 0.2).move_to(0, 0).text("Paired")
+            ctx.font_size = 12
+            ctx.rgb(0.2, 1.0, 0.2).move_to(0, 20).text("sleeping")
         else:
-            # Open state - show seconds remaining.
-            if self._ble_service is not None:
-                now_ms = time.ticks_ms() if time is not None else 0
-                secs = self._ble_service.seconds_remaining(now_ms)
+            # Open state. Pulse "Connected" if a client is attached,
+            # else "Time: Ns".
+            connected = (self._ble_service is not None
+                          and self._ble_service.is_client_connected())
+            if connected:
+                ctx.rgb(0.2, 1.0, 0.2).move_to(0, 10).text("Connected")
             else:
-                secs = 0
-            ctx.rgb(1.0, 1.0, 1.0).move_to(-100, 10).text("Time: %ds" % secs)
-            ctx.rgb(0.7, 0.7, 0.7).move_to(-100, 50).text("Open your app")
+                if self._ble_service is not None:
+                    now_ms = time.ticks_ms() if time is not None else 0
+                    secs = self._ble_service.seconds_remaining(now_ms)
+                else:
+                    secs = 0
+                ctx.rgb(1.0, 1.0, 1.0).move_to(0, 10).text("Time: %ds" % secs)
+            ctx.font_size = 12
+            ctx.rgb(0.7, 0.7, 0.7).move_to(0, 40).text("Open your app")
 
-        ctx.rgb(0.6, 0.6, 0.6).move_to(-100, 100).text("F: cancel")
+        ctx.font_size = 12
+        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 85).text("F: cancel")
 
     def _start_repeater(self) -> None:
         """Instantiate the dynamic-repeater FSM if Repeat=AUTO. No-op

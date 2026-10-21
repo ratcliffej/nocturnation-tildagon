@@ -127,11 +127,14 @@ class PerimeterRenderer:
         # wash + pulse state so a confirmation is visible even during
         # an active show.
         self._ack_flash_until = 0
-        # BLE Pair indicator: all 12 pixels solid blue while True.
-        # Overrides wash + pulse + ACK flash so the operator sees a
-        # steady visual confirmation of pairing-mode independent of
-        # serial debug output.
-        self._pairing_indicator = False
+        # BLE Pair indicator state. One of:
+        #   "off"         - no override, show normal content
+        #   "advertising" - pulse blue ~1 Hz (de-facto BLE pairing idiom)
+        #   "connected"   - solid blue (client attached)
+        # Overrides wash + pulse + ACK flash in both pulse modes so
+        # the operator sees unambiguous visual feedback independent
+        # of serial debug.
+        self._pairing_indicator = "off"
         self._wash          = None
 
     # ------------------------------------------------------------------
@@ -420,20 +423,40 @@ class PerimeterRenderer:
                 r = g = b = 0xFF
             # Epic 20 follow-up: BLE Pair indicator forces every pixel
             # to blue regardless of wash/pulse state.
-            if self._pairing_indicator:
+            if self._pairing_indicator == "connected":
                 r, g, b = 0, 0, 0xFF
+            elif self._pairing_indicator == "advertising":
+                # ~1 Hz triangle pulse 0..0xFF -> 0xFF..0 across each
+                # second. No sin() to keep this MicroPython-light.
+                phase = (now_ms % 1000) / 500.0   # 0..2
+                if phase > 1.0:
+                    phase = 2.0 - phase            # fold back to 0..1
+                r = g = 0
+                b = int(phase * 255)
+                if b < 0:   b = 0
+                if b > 255: b = 255
             self._last_rendered[i] = (r, g, b)
             set_led(i, r, g, b)
 
-    def set_pairing_indicator(self, active):
-        """Force every pixel to solid blue while `active` is True.
+    def set_pairing_indicator(self, state):
+        """Set the BLE-pair indicator mode.
 
-        Caller sets this on BLE pair-screen entry and clears it on
-        exit, giving the operator a steady visual confirmation that
-        BLE pairing is live - useful on bench when serial isn't
-        connected.
+        state is one of:
+          False / "off"  - no override, normal content shows through
+          True / "advertising" - ~1 Hz blue pulse (default BLE idiom)
+          "connected"    - solid blue (client attached)
+
+        True kept as a legacy alias for "advertising" so older callers
+        that haven't been updated to the string API still work.
         """
-        self._pairing_indicator = bool(active)
+        if state is False or state == "off":
+            self._pairing_indicator = "off"
+        elif state is True or state == "advertising":
+            self._pairing_indicator = "advertising"
+        elif state == "connected":
+            self._pairing_indicator = "connected"
+        else:
+            self._pairing_indicator = "off"
 
     def set_ack_flash_until(self, until_ms):
         """Hold pixel 0 white until `until_ms`. 0 (or past) = inactive.

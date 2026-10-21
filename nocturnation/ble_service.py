@@ -269,6 +269,13 @@ class BleService:
     def state(self):
         return self._state
 
+    def is_client_connected(self):
+        """True while a BLE client is attached. Caller uses this to
+        pick between the 'advertising' pulse and the 'connected' solid
+        on the perimeter indicator.
+        """
+        return self._client_connected
+
     def seconds_remaining(self, now_ms):
         if not self._active or self._state != STATE_OPEN:
             return 0
@@ -447,6 +454,7 @@ class BleService:
         """Read pending characteristic writes while the client is
         connected."""
         import uasyncio as asyncio
+        print("[ble] _service_client loop entered")
         try:
             while self._active and self._state == STATE_OPEN:
                 # aioble's `capture=True` characteristics deliver writes
@@ -455,16 +463,28 @@ class BleService:
                     _, cfg_data = await asyncio.wait_for(
                         self._chr_config.written(), 0.1)
                     if cfg_data is not None:
-                        status = apply_config_bag(cfg_data, self._settings)
-                        print("[ble] config write status=0x%02X" % status)
+                        print("[ble] config write received: %d bytes"
+                              % len(cfg_data))
+                        try:
+                            status = apply_config_bag(cfg_data, self._settings)
+                            print("[ble] config write status=0x%02X" % status)
+                        except Exception as apply_exc:
+                            print("[ble] apply_config_bag raised: %s" % apply_exc)
                 except asyncio.TimeoutError:
                     pass
+                except Exception as cfg_exc:
+                    print("[ble] config .written() raised: %s" % cfg_exc)
                 try:
                     _, ctrl_data = await asyncio.wait_for(
                         self._chr_pair_ctrl.written(), 0.01)
                     if ctrl_data and len(ctrl_data) >= 1:
+                        print("[ble] pairing_control write: 0x%02X" % ctrl_data[0])
                         self.notify_pairing_control(ctrl_data[0])
                 except asyncio.TimeoutError:
                     pass
+                except Exception as ctrl_exc:
+                    print("[ble] pair_ctrl .written() raised: %s" % ctrl_exc)
         except Exception as exc:
             print("[ble] client loop error: %s" % exc)
+        print("[ble] _service_client loop exited (active=%s state=%d)"
+              % (self._active, self._state))
