@@ -614,6 +614,16 @@ class NocturNationApp(app.App):
         self._display = CtxDisplay()
         self._signal_tracker = SignalTracker()
         self._tofu = TofuLock()
+        # Epic 21: per-sender numonce replay guard for CONFIG_WRITE.
+        # Lazy-imported so native builds that don't exercise the config
+        # channel don't pay the import cost.
+        from .nocturnation.protocol.numonce_lru import NumonceLru
+        self._numonce_lru = NumonceLru()
+        # Pixel-0 white flash on successful CONFIG_WRITE apply.
+        # Timestamp of flash expiry (0 = inactive). Perimeter renderer
+        # checks this each tick and overlays a white pixel until the
+        # timestamp passes.
+        self._config_ack_flash_until_ms = 0
         await asyncio.sleep_ms(0)
 
         # Deferred out of __init__ so the splash isn't blocked by the
@@ -681,6 +691,11 @@ class NocturNationApp(app.App):
         if self._ble_pair_open:
             now_ms = time.ticks_ms() if time is not None else 0
             self._tick_ble_pair(now_ms)
+            # Drive the perimeter so the pairing_indicator blue is
+            # actually written to the LEDs. Without this call, update()
+            # returns early and _render_perimeter never fires - the
+            # pixels stay whatever the last show-tick wrote.
+            self._render_perimeter()
             # Honour F (CANCEL) as an escape hatch — the badge SDK
             # routes button state through Buttons.get_pressed(); we
             # reuse the same idiom the rest of app.py uses.
@@ -1037,6 +1052,7 @@ class NocturNationApp(app.App):
             # Epic 20 B6: enter BLE pairing screen. Closes the settings
             # menu (releases the badge SDK's menu grab), starts the BLE
             # service; update() drives the pairing state machine.
+            print("[nocturnation] Settings: BLE Pair selected")
             self._close_settings()
             self._open_ble_pair()
             return
@@ -1071,29 +1087,42 @@ class NocturNationApp(app.App):
         ESP-NOW-only. Sets _ble_pair_open so update() and draw() route
         to the pairing state machine and screen.
         """
+        print("[nocturnation] BLE pair: open requested")
         # Lazy import so a Tildagon that never opens pairing doesn't
         # cost aioble RAM.
         try:
             from .nocturnation.ble_service import BleService
+            print("[nocturnation] BLE pair: BleService imported")
         except Exception as exc:
-            print("[nocturnation] BLE unavailable: %s" % exc)
+            print("[nocturnation] BLE pair: import failed: %s" % exc)
             return
 
-        if self._ble_service is None:
-            self._ble_service = BleService()
+        try:
+            if self._ble_service is None:
+                self._ble_service = BleService()
+                print("[nocturnation] BLE pair: BleService constructed")
+        except Exception as exc:
+            print("[nocturnation] BLE pair: construct failed: %s" % exc)
+            return
 
         now_ms = time.ticks_ms() if time is not None else 0
+        print("[nocturnation] BLE pair: calling start()")
         # Perimeter runs at 100% currently (Epic 19) and the strip
         # topology is fixed 12 pixels for the perimeter; surface those
         # values as-is via the config bag.
-        started = self._ble_service.start(
-            self._settings,
-            brightness_pct=self._settings.led_power,
-            chain_size=self._settings.strip_chain,
-            group_size=self._settings.strip_group_size,
-            pair_win_s=self._settings.pair_win_s,
-            now_ms=now_ms,
-        )
+        try:
+            started = self._ble_service.start(
+                self._settings,
+                brightness_pct=self._settings.led_power,
+                chain_size=self._settings.strip_chain,
+                group_size=self._settings.strip_group_size,
+                pair_win_s=self._settings.pair_win_s,
+                now_ms=now_ms,
+            )
+            print("[nocturnation] BLE pair: start() returned %s" % started)
+        except Exception as exc:
+            print("[nocturnation] BLE pair: start() raised: %s" % exc)
+            started = False
         if not started:
             # Fall back to a brief "unavailable" screen; the countdown
             # loop will time out immediately.
@@ -1103,6 +1132,20 @@ class NocturNationApp(app.App):
             self._ble_pair_terminal = 0
             self._ble_pair_return_after_ms = 0
         self._ble_pair_open = True
+        # BLE Pair indicator: perimeter LEDs go solid blue so the
+        # operator has visual confirmation BLE is live even if serial
+        # isn't connected. Only light up on actual success - a start()
+        # failure routes through the terminal-screen path and bounces
+        # back out in ~1.5 s; lighting the indicator there would be
+        # misleading.
+        if started:
+            try:
+                self._renderer.set_pairing_indicator("advertising")
+                print("[nocturnation] BLE pair: pairing_indicator ON (pulse blue)")
+            except AttributeError:
+                pass   # older renderer without the hook
+            except Exception as exc:
+                print("[nocturnation] BLE pair: indicator failed: %s" % exc)
 
     def _close_ble_pair(self) -> None:
         if self._ble_service is not None:
@@ -1113,12 +1156,35 @@ class NocturNationApp(app.App):
         self._ble_pair_open = False
         self._ble_pair_terminal = 0
         self._ble_pair_return_after_ms = 0
+        # Clear BLE Pair indicator.
+        try:
+            self._renderer.set_pairing_indicator(False)
+        except AttributeError:
+            pass
+        except Exception as exc:
+            print("[nocturnation] BLE pair: indicator clear failed: %s" % exc)
 
     def _tick_ble_pair(self, now_ms) -> None:
         """Called each update() while the pairing screen is open."""
         if self._ble_pair_return_after_ms and now_ms >= self._ble_pair_return_after_ms:
             self._close_ble_pair()
             return
+
+        # Flip the perimeter indicator between pulse (advertising) and
+        # solid (connected) based on client state. Covers the user-
+        # visible BLE idiom: pulse while discoverable, solid when
+        # attached.
+        if (self._ble_pair_terminal == 0
+                and self._ble_service is not None
+                and self._renderer is not None):
+            try:
+                mode = ("connected" if self._ble_service.is_client_connected()
+                        else "advertising")
+                self._renderer.set_pairing_indicator(mode)
+            except AttributeError:
+                pass
+            except Exception as exc:
+                print("[nocturnation] BLE pair: indicator update failed: %s" % exc)
 
         if self._ble_pair_terminal == 0 and self._ble_service is not None:
             try:
@@ -1154,36 +1220,61 @@ class NocturNationApp(app.App):
         else:
             ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
 
+        # Centre-align everything so text fits inside the 240 px round
+        # display. The previous left-aligned at x=-100 version let
+        # longer strings ("Paired - sleeping", "NCTN-Lume-XXXXXX")
+        # clip the right edge of the circle.
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+
         # Title.
-        ctx.rgb(0.4, 0.6, 1.0).move_to(-100, -80).text("BLE Pair")
+        ctx.font_size = 18
+        ctx.rgb(0.4, 0.6, 1.0).move_to(0, -75).text("BLE Pair")
 
         # Advertising name (friendly_name override, else NCTN-Lume-XXXXXX).
+        # Read the real BT MAC from the BLE service so the on-screen
+        # name matches what the phone sees. Previous version passed a
+        # zero MAC placeholder and always showed NCTN-Lume-000000.
         try:
             from .nocturnation.ble_service import compose_advertising_name
-            name = compose_advertising_name(b"\x00" * 6,
+            bt_mac = (self._ble_service._bt_mac if self._ble_service is not None
+                      else b"\x00" * 6)
+            name = compose_advertising_name(bt_mac,
                                             self._settings.friendly_name)
         except Exception:
             name = "NCTN-Lume-??????"
-        ctx.rgb(1.0, 1.0, 1.0).move_to(-100, -30).text(name)
+        ctx.font_size = 14
+        ctx.rgb(1.0, 1.0, 1.0).move_to(0, -40).text(name)
 
         # State-appropriate body text.
+        ctx.font_size = 16
         if self._ble_pair_terminal == 1:
-            ctx.rgb(0.2, 1.0, 0.2).move_to(-100, 10).text("Paired!")
+            ctx.rgb(0.2, 1.0, 0.2).move_to(0, 10).text("Paired!")
         elif self._ble_pair_terminal == 2:
-            ctx.rgb(1.0, 0.3, 0.3).move_to(-100, 10).text("Timeout")
+            ctx.rgb(1.0, 0.3, 0.3).move_to(0, 10).text("Timeout")
         elif self._ble_pair_terminal == 3:
-            ctx.rgb(0.2, 1.0, 0.2).move_to(-100, 10).text("Paired - sleeping")
+            ctx.rgb(0.2, 1.0, 0.2).move_to(0, 0).text("Paired")
+            ctx.font_size = 12
+            ctx.rgb(0.2, 1.0, 0.2).move_to(0, 20).text("sleeping")
         else:
-            # Open state - show seconds remaining.
-            if self._ble_service is not None:
-                now_ms = time.ticks_ms() if time is not None else 0
-                secs = self._ble_service.seconds_remaining(now_ms)
+            # Open state. Pulse "Connected" if a client is attached,
+            # else "Time: Ns".
+            connected = (self._ble_service is not None
+                          and self._ble_service.is_client_connected())
+            if connected:
+                ctx.rgb(0.2, 1.0, 0.2).move_to(0, 10).text("Connected")
             else:
-                secs = 0
-            ctx.rgb(1.0, 1.0, 1.0).move_to(-100, 10).text("Time: %ds" % secs)
-            ctx.rgb(0.7, 0.7, 0.7).move_to(-100, 50).text("Open your app")
+                if self._ble_service is not None:
+                    now_ms = time.ticks_ms() if time is not None else 0
+                    secs = self._ble_service.seconds_remaining(now_ms)
+                else:
+                    secs = 0
+                ctx.rgb(1.0, 1.0, 1.0).move_to(0, 10).text("Time: %ds" % secs)
+            ctx.font_size = 12
+            ctx.rgb(0.7, 0.7, 0.7).move_to(0, 40).text("Open your app")
 
-        ctx.rgb(0.6, 0.6, 0.6).move_to(-100, 100).text("F: cancel")
+        ctx.font_size = 12
+        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 85).text("F: cancel")
 
     def _start_repeater(self) -> None:
         """Instantiate the dynamic-repeater FSM if Repeat=AUTO. No-op
@@ -1734,6 +1825,19 @@ class NocturNationApp(app.App):
                 self._wlan.config(pm=network.WLAN.PM_NONE)
             except Exception as exc:
                 print("[nocturnation] wlan.config(pm=PM_NONE) failed: %s" % exc)
+            # Epic 21: generate dev_uid + dev_secret on first boot now
+            # that the hardware RNG is seeded (wlan.active triggered the
+            # radio bring-up). Idempotent on subsequent boots.
+            try:
+                from .nocturnation.settings import ensure_identity
+                mac_bytes = self._wlan.config('mac')
+                if ensure_identity(self._settings, mac_bytes):
+                    print("[nocturnation] boot uid=%08X (first-boot identity generated)"
+                          % self._settings.dev_uid)
+                else:
+                    print("[nocturnation] boot uid=%08X" % self._settings.dev_uid)
+            except Exception as exc:
+                print("[nocturnation] ensure_identity failed: %s" % exc)
             if self._esp is None:
                 self._esp = espnow.ESPNow()
             # Default rxbuf ~526 B (~13 msg) is too small: high-rate
@@ -2335,6 +2439,14 @@ class NocturNationApp(app.App):
                     break
                 frame = parse_admittable(buf)
                 now_ms = time.ticks_ms() if time is not None else 0
+                # Epic 21: CONFIG_WRITE / UID_ANNOUNCE / CONFIG_ACK sit
+                # outside TOFU + dedup - they're authenticated per-frame
+                # by HMAC and addressed by UID, not by source lock. Route
+                # before admit so a receive on a non-locked channel is
+                # still honoured (operator could be mid-reconfigure
+                # from a Director that isn't the show source).
+                if frame is not None and self._maybe_handle_epic21_frame(frame, buf):
+                    continue
                 admitted = (frame is not None
                             and self._tofu.admit(frame, self._receive_channel, now_ms))
                 self._dbg_frame("rx", buf, frame, admitted)
@@ -2483,6 +2595,88 @@ class NocturNationApp(app.App):
                 and age > FALLBACK_FADE_START_MS):
             self._fallback_faded = True
             self._emit_fallback_wash_fade(now_ms)
+
+    # ------------------------------------------------------------------
+    # Epic 21: authenticated config channel.
+    #
+    # The Tildagon has BLE silicon, so initial pairing goes through
+    # the Epic 20 BLE path (Settings > BLE Pair). This module handles
+    # the receive side only: already-paired Directors push updates
+    # via CONFIG_WRITE and the Tildagon applies them without needing
+    # another BLE round-trip. UID_ANNOUNCE emit is reserved for
+    # future Tier-1 Lumes (ESP32-S2 class, no BLE silicon); see
+    # [[project-device-tier-model]].
+    # ------------------------------------------------------------------
+
+    def _maybe_handle_epic21_frame(self, frame, raw_buf) -> bool:
+        """Handle CONFIG_WRITE / UID_ANNOUNCE / CONFIG_ACK frames.
+
+        Returns True iff the frame was consumed here (caller skips
+        TOFU + dedup + show dispatch). CONFIG_WRITE is the main case;
+        UID_ANNOUNCE on a Lume is only interesting if we grow a
+        "scan for peers" diagnostic (not shipped). CONFIG_ACK on a
+        Lume is a no-op (we don't send CONFIG_WRITE; we answer them).
+        """
+        if frame.message_type != MessageType.CONFIG_WRITE:
+            # UID_ANNOUNCE + CONFIG_ACK consumed-but-ignored so they
+            # don't trip the LIGHT_* dispatch gate upstream.
+            if frame.message_type in (MessageType.UID_ANNOUNCE,
+                                       MessageType.CONFIG_ACK):
+                return True
+            return False
+        # Lazy import so the symbol cost is paid only on the first
+        # CONFIG_WRITE arrival. config_rx + the ack/announce encoders
+        # pull in ~2 KB of code we don't need on a receive-only Lume.
+        from .nocturnation.config_rx import process_config_write
+        from .nocturnation.protocol.config_frames import (
+            ConfigAckPayload, encode_config_ack, AckStatus,
+        )
+        result = process_config_write(frame, raw_buf,
+                                       self._settings, self._numonce_lru)
+        if not result.ok:
+            # Silent drop. Diagnostic-only trace at debug level - the
+            # frame is unauthenticated-or-not-ours, don't emit anything
+            # over the wire.
+            if _DEBUG:
+                print("[nocturnation] CONFIG_WRITE drop: %s" % result.reason)
+            return True
+        # Persist the applied bag. apply_config_bag mutated the Settings
+        # in-memory; flush to disk so a reboot keeps the changes.
+        try:
+            self._settings.save()
+        except OSError as exc:
+            print("[nocturnation] settings save failed after CONFIG_WRITE: %s" % exc)
+        # Visible confirmation (independent of CONFIG_ACK which might
+        # not come back): short pixel-0 white flash. ~500 ms.
+        now_ms = time.ticks_ms() if time is not None else 0
+        self._config_ack_flash_until_ms = now_ms + 500
+        try:
+            self._renderer.set_ack_flash_until(self._config_ack_flash_until_ms)
+        except AttributeError:
+            pass   # defensive: older renderer without the hook
+        # Emit CONFIG_ACK best-effort. If send_broadcast fails, the
+        # Director's wait_for_ack path surfaces "no confirmation"
+        # (amber UX, not red) - operator checks the visible flash on
+        # the device itself for ground truth.
+        try:
+            ack_src = self._settings.dev_uid & 0xFFFF
+            # AckStatus::OK on apply - partial-apply surfacing can
+            # land in a follow-up once Settings._coerce_* grows the
+            # "some entries clamped" return value.
+            payload = ConfigAckPayload(
+                responder_uid=self._settings.dev_uid,
+                responder_numonce=result.numonce,
+                status=AckStatus.OK if result.status == 0 else AckStatus.APPLIED_PARTIAL,
+                applied_keys=result.applied_keys,
+            )
+            ack_buf = encode_config_ack(ack_src, 1, 0, payload)
+            if self._esp is not None:
+                self._esp.send(_broadcast_mac_bytes, ack_buf)
+        except Exception as exc:
+            print("[nocturnation] CONFIG_ACK send failed: %s" % exc)
+        print("[nocturnation] CONFIG_WRITE applied: %d keys, numonce=%d"
+              % (result.applied_keys, result.numonce))
+        return True
 
     def _observe_frame(self, frame, is_duplicate=False, raw_buf=None,
                        arrival_ms=None) -> None:

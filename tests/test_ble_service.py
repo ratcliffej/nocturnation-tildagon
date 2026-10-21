@@ -73,6 +73,24 @@ class TestDeviceInfoLayout:
         # reserved 18..23
         assert bytes(out[18:24]) == b"\x00" * 6
 
+    def test_short_mac_is_left_zero_padded(self):
+        # Documents the manual-pad behaviour that replaced bytes.rjust()
+        # (MicroPython doesn't implement .rjust on bytes - see
+        # feedback-micropython-stdlib-gotchas memory). The pad goes on
+        # the left so the trailing bytes of the MAC land in the
+        # right-aligned slot.
+        out = bs.build_device_info(b"\xAA\xBB", 0)
+        assert bytes(out[8:14]) == b"\x00\x00\x00\x00\xAA\xBB"
+
+    def test_long_mac_is_truncated_from_the_right(self):
+        # 8-byte input - last two bytes dropped, first six written as-is.
+        out = bs.build_device_info(b"\x11\x22\x33\x44\x55\x66\x77\x88", 0)
+        assert bytes(out[8:14]) == b"\x11\x22\x33\x44\x55\x66"
+
+    def test_none_mac_renders_zeros(self):
+        out = bs.build_device_info(None, 0)
+        assert bytes(out[8:14]) == b"\x00" * 6
+
 
 class TestStatusLayout:
     def test_byte_layout(self):
@@ -161,6 +179,31 @@ class TestPairingStateMachine:
     def test_tick_at_timeout_transitions_to_aborted(self):
         svc = self._svc()
         assert svc.tick(30_000) == bs.STATE_ABORTED
+
+    def test_tick_pauses_countdown_while_client_connected(self):
+        """A connected client extends the pairing window indefinitely.
+        Without this, a slow pairing session (operator reading + writing
+        config over the GATT char) gets booted off mid-flow.
+        """
+        svc = self._svc()
+        svc._client_connected = True
+        # Well past the 30 s window; stays OPEN because client is live.
+        assert svc.tick(60_000) == bs.STATE_OPEN
+        assert svc.tick(120_000) == bs.STATE_OPEN
+
+    def test_tick_restarts_window_after_disconnect(self):
+        """When the client disconnects, the countdown restarts from the
+        current tick - giving a predictable "stay open N seconds after
+        the last client leaves" UX.
+        """
+        svc = self._svc()
+        svc._client_connected = True
+        svc.tick(60_000)         # pauses, resets start_ms to 60_000
+        svc._client_connected = False
+        # Not yet past the window from 60_000; still OPEN.
+        assert svc.tick(80_000) == bs.STATE_OPEN
+        # 90_000 - 60_000 = 30_000, hits the window.
+        assert svc.tick(90_000) == bs.STATE_ABORTED
 
     def test_commit_action_transitions_to_committed(self):
         svc = self._svc()

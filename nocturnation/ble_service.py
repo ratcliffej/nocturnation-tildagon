@@ -99,7 +99,12 @@ def build_device_info(bt_mac, uptime_s):
     if bt_mac is None:
         bt_mac = b"\x00" * 6
     else:
-        bt_mac = bytes(bt_mac)[:6].rjust(6, b"\x00")
+        # MicroPython bytes has no .rjust() method (CPython does); pad
+        # manually so this works on both host tests and the badge.
+        # See [[feedback-micropython-stdlib-gotchas]].
+        bt_mac = bytes(bt_mac)[:6]
+        if len(bt_mac) < 6:
+            bt_mac = b"\x00" * (6 - len(bt_mac)) + bt_mac
     out = bytearray(24)
     out[0] = SERVICE_VERSION
     out[1] = ROLE_LUME
@@ -248,6 +253,13 @@ class BleService:
         self._window_ms = 30000
         self._bt_mac = b"\x00" * 6
         self._task = None
+        # True while a BLE client is connected. tick() pauses the
+        # pairing-window countdown while this is set, so a client that
+        # takes longer than 30 s to read + write config doesn't get
+        # kicked out mid-session. Flipped on in _serve() when a
+        # connection yields; flipped off when _service_client returns
+        # (disconnect, abort, or stop).
+        self._client_connected = False
 
     # ---------- Lifecycle ------------------------------------------------
 
@@ -256,6 +268,13 @@ class BleService:
 
     def state(self):
         return self._state
+
+    def is_client_connected(self):
+        """True while a BLE client is attached. Caller uses this to
+        pick between the 'advertising' pulse and the 'connected' solid
+        on the perimeter indicator.
+        """
+        return self._client_connected
 
     def seconds_remaining(self, now_ms):
         if not self._active or self._state != STATE_OPEN:
@@ -268,9 +287,19 @@ class BleService:
     def tick(self, now_ms):
         """Called by app.py's update() loop; drives the auto-timeout to
         STATE_ABORTED. Returns the current state so the caller can
-        react without a second call."""
+        react without a second call.
+
+        While a client is connected, the countdown pauses - the window
+        is to protect against a Lume being left announcing with no one
+        there, not against a slow client. The countdown restarts if
+        the client disconnects (clears _client_connected).
+        """
         if self._active and self._state == STATE_OPEN:
-            if now_ms - self._start_ms >= self._window_ms:
+            if self._client_connected:
+                # Reset the start reference so the window re-begins
+                # when the client eventually disconnects.
+                self._start_ms = now_ms
+            elif now_ms - self._start_ms >= self._window_ms:
                 self._state = STATE_ABORTED
         return self._state
 
@@ -287,7 +316,26 @@ class BleService:
         self._window_ms = int(pair_win_s) * 1000
         self._start_ms = now_ms
         self._state = STATE_OPEN
+        self._client_connected = False
         try:
+            # Read the actual Bluetooth MAC so the advertising name is
+            # unique instead of the all-zero default. MicroPython ESP32
+            # exposes it via bluetooth.BLE().config('mac'); the call
+            # also implicitly activates the BLE radio which aioble will
+            # pick up when it starts advertising.
+            try:
+                _, bluetooth = _import_aioble()
+                ble = bluetooth.BLE()
+                ble.active(True)
+                mac = ble.config('mac')
+                # config('mac') returns (addr_type, mac_bytes).
+                if isinstance(mac, tuple) and len(mac) == 2:
+                    self._bt_mac = bytes(mac[1])
+                else:
+                    self._bt_mac = bytes(mac)
+                print("[ble] bt_mac=%s" % ":".join("%02X" % b for b in self._bt_mac))
+            except Exception as exc:
+                print("[ble] bt_mac read failed: %s" % exc)
             self._register_service(brightness_pct, chain_size, group_size)
             self._active = True
             return True
@@ -341,8 +389,13 @@ class BleService:
         self._chr_device_info = aioble.Characteristic(
             svc, UUID(CHAR_DEVICE_INFO), read=True,
             initial=build_device_info(self._bt_mac, 0))
+        # write + write_no_response both enabled so a central that
+        # picks either operation (NimBLE's writeValue has both; the
+        # StickC's Config Lumes path uses write-with-response by
+        # default) reaches .written() the same way.
         self._chr_config = aioble.Characteristic(
-            svc, UUID(CHAR_CONFIG), read=True, write=True, capture=True,
+            svc, UUID(CHAR_CONFIG), read=True, write=True,
+            write_no_response=True, capture=True,
             initial=build_lume_config_bag(
                 self._settings, brightness_pct, chain_size, group_size))
         self._chr_status = aioble.Characteristic(
@@ -385,7 +438,16 @@ class BleService:
                     services=[self._service_uuid_bytes()],
                 ) as connection:
                     print("[ble] client connected: %s" % connection.device)
-                    await self._service_client(connection)
+                    # Pause the pairing-window countdown while a client
+                    # is connected (tick() watches this flag). Cleared
+                    # in the finally so an abrupt disconnect still
+                    # releases the window.
+                    self._client_connected = True
+                    try:
+                        await self._service_client(connection)
+                    finally:
+                        self._client_connected = False
+                        print("[ble] client disconnected")
         except Exception as exc:
             print("[ble] serve error: %s" % exc)
 
@@ -397,6 +459,18 @@ class BleService:
         """Read pending characteristic writes while the client is
         connected."""
         import uasyncio as asyncio
+        print("[ble] _service_client loop entered")
+        # MTU diagnostic: aioble defaults to 23 B. A full config bag is
+        # ~89 B; central-side long-write (Prepare+Execute) is required.
+        # Request a larger MTU so a one-shot write fits. Not every
+        # aioble build exposes exchange_mtu as callable - try, log, carry on.
+        try:
+            mtu = await connection.exchange_mtu(247)
+            print("[ble] negotiated MTU = %d" % mtu)
+        except AttributeError:
+            print("[ble] exchange_mtu unavailable; staying at default MTU")
+        except Exception as mtu_exc:
+            print("[ble] exchange_mtu failed: %s" % mtu_exc)
         try:
             while self._active and self._state == STATE_OPEN:
                 # aioble's `capture=True` characteristics deliver writes
@@ -405,16 +479,28 @@ class BleService:
                     _, cfg_data = await asyncio.wait_for(
                         self._chr_config.written(), 0.1)
                     if cfg_data is not None:
-                        status = apply_config_bag(cfg_data, self._settings)
-                        print("[ble] config write status=0x%02X" % status)
+                        print("[ble] config write received: %d bytes"
+                              % len(cfg_data))
+                        try:
+                            status = apply_config_bag(cfg_data, self._settings)
+                            print("[ble] config write status=0x%02X" % status)
+                        except Exception as apply_exc:
+                            print("[ble] apply_config_bag raised: %s" % apply_exc)
                 except asyncio.TimeoutError:
                     pass
+                except Exception as cfg_exc:
+                    print("[ble] config .written() raised: %s" % cfg_exc)
                 try:
                     _, ctrl_data = await asyncio.wait_for(
                         self._chr_pair_ctrl.written(), 0.01)
                     if ctrl_data and len(ctrl_data) >= 1:
+                        print("[ble] pairing_control write: 0x%02X" % ctrl_data[0])
                         self.notify_pairing_control(ctrl_data[0])
                 except asyncio.TimeoutError:
                     pass
+                except Exception as ctrl_exc:
+                    print("[ble] pair_ctrl .written() raised: %s" % ctrl_exc)
         except Exception as exc:
             print("[ble] client loop error: %s" % exc)
+        print("[ble] _service_client loop exited (active=%s state=%d)"
+              % (self._active, self._state))

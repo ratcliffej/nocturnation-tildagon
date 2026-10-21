@@ -109,6 +109,8 @@ class PerimeterRenderer:
         "_last_rendered",
         "_wash",
         "_rng",
+        "_ack_flash_until",   # Epic 21
+        "_pairing_indicator", # Epic 20 follow-up: solid blue in BLE Pair mode
     )
 
     def __init__(self, rng=None):
@@ -120,6 +122,19 @@ class PerimeterRenderer:
         # Index 0 unused so LED index 1..12 maps in directly.
         self._envelopes        = [None] * (LED_MAX_INDEX + 1)
         self._last_rendered = [(0, 0, 0)] * (LED_MAX_INDEX + 1)
+        # Epic 21: CONFIG_WRITE apply confirmation. Pixel LED_MIN_INDEX
+        # flashes white when now_ms < _ack_flash_until. Independent of
+        # wash + pulse state so a confirmation is visible even during
+        # an active show.
+        self._ack_flash_until = 0
+        # BLE Pair indicator state. One of:
+        #   "off"         - no override, show normal content
+        #   "advertising" - pulse blue ~1 Hz (de-facto BLE pairing idiom)
+        #   "connected"   - solid blue (client attached)
+        # Overrides wash + pulse + ACK flash in both pulse modes so
+        # the operator sees unambiguous visual feedback independent
+        # of serial debug.
+        self._pairing_indicator = "off"
         self._wash          = None
 
     # ------------------------------------------------------------------
@@ -401,8 +416,56 @@ class PerimeterRenderer:
                     pr, pg, pb = self._pulse_color_at(env, elapsed, base)
                     r, g, b = pr, pg, pb
 
+            # Epic 21: ACK-flash overrides pixel 0 (= LED_MIN_INDEX)
+            # while active, giving the operator a visible "write
+            # landed" indication independent of CONFIG_ACK delivery.
+            if i == LED_MIN_INDEX and now_ms < self._ack_flash_until:
+                r = g = b = 0xFF
+            # Epic 20 follow-up: BLE Pair indicator forces every pixel
+            # to blue regardless of wash/pulse state.
+            if self._pairing_indicator == "connected":
+                r, g, b = 0, 0, 0xFF
+            elif self._pairing_indicator == "advertising":
+                # ~1 Hz triangle pulse 0..0xFF -> 0xFF..0 across each
+                # second. No sin() to keep this MicroPython-light.
+                phase = (now_ms % 1000) / 500.0   # 0..2
+                if phase > 1.0:
+                    phase = 2.0 - phase            # fold back to 0..1
+                r = g = 0
+                b = int(phase * 255)
+                if b < 0:   b = 0
+                if b > 255: b = 255
             self._last_rendered[i] = (r, g, b)
             set_led(i, r, g, b)
+
+    def set_pairing_indicator(self, state):
+        """Set the BLE-pair indicator mode.
+
+        state is one of:
+          False / "off"  - no override, normal content shows through
+          True / "advertising" - ~1 Hz blue pulse (default BLE idiom)
+          "connected"    - solid blue (client attached)
+
+        True kept as a legacy alias for "advertising" so older callers
+        that haven't been updated to the string API still work.
+        """
+        if state is False or state == "off":
+            self._pairing_indicator = "off"
+        elif state is True or state == "advertising":
+            self._pairing_indicator = "advertising"
+        elif state == "connected":
+            self._pairing_indicator = "connected"
+        else:
+            self._pairing_indicator = "off"
+
+    def set_ack_flash_until(self, until_ms):
+        """Hold pixel 0 white until `until_ms`. 0 (or past) = inactive.
+
+        Caller sets this on successful CONFIG_WRITE apply so the
+        operator sees ground-truth confirmation on the device itself,
+        independent of CONFIG_ACK reaching back to the Director.
+        """
+        self._ack_flash_until = until_ms
 
     def _pulse_color_at(self, env, elapsed, baseline):
         # Release falls back to baseline so a wash-active LED fades
