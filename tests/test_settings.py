@@ -85,6 +85,12 @@ class TestDictRoundTrip:
             "led_power": 100,
             "strip_chain": 12,
             "strip_group_size": 12,
+            # Epic 21: identity + numonce counter. Sentinels (0/"")
+            # until ensure_identity() populates on first boot after
+            # wifi init.
+            "dev_uid": 0,
+            "dev_secret": "",
+            "cfg_numonce": 0,
         }
 
     def test_debug_mode_defaults_off(self):
