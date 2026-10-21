@@ -652,3 +652,51 @@ class TestLedAddressingResponsiveness:
             "500 host ticks with 12 active envelopes took %.3f s; " \
             "expected < 1.0 s. Per-LED envelope work may have regressed." \
             % elapsed
+
+
+class TestEpic21AckFlash:
+    """set_ack_flash_until forces pixel 1 (LED_MIN_INDEX) white while
+    the deadline hasn't passed, independent of wash + pulse state."""
+
+    def _pixel(self, captured, index):
+        """Return the (r, g, b) tuple captured for LED `index` on the
+        most recent tick. make_capture appends (i, r, g, b) rows; pick
+        the matching index.
+        """
+        for i, r, g, b in captured:
+            if i == index:
+                return (r, g, b)
+        return None
+
+    def test_ack_flash_overrides_pixel_1(self):
+        r = PerimeterRenderer()
+        r.set_ack_flash_until(500)
+        captured, set_led = make_capture()
+        r.tick(now_ms=0, set_led=set_led)
+        assert self._pixel(captured, 1) == (0xFF, 0xFF, 0xFF)
+        for i in range(2, 13):
+            assert self._pixel(captured, i) == (0, 0, 0), \
+                "pixel %d should be black" % i
+
+    def test_ack_flash_expires(self):
+        r = PerimeterRenderer()
+        r.set_ack_flash_until(500)
+        captured, set_led = make_capture()
+        r.tick(now_ms=600, set_led=set_led)
+        assert self._pixel(captured, 1) == (0, 0, 0)
+
+    def test_ack_flash_overlays_active_pulse(self):
+        r = PerimeterRenderer(rng=always_pass_rng)
+        r.dispatch(FakeFrame(r=0xFF, g=0, b=0,
+                             attack=Time.T_192_MS, sustain=Time.T_192_MS,
+                             release=Time.T_192_MS,
+                             chance=Chance.CHANCE_100), now_ms=0)
+        r.set_ack_flash_until(1000)
+        captured, set_led = make_capture()
+        r.tick(now_ms=300, set_led=set_led)
+        # Pixel 1 is white (overridden by ack flash).
+        assert self._pixel(captured, 1) == (0xFF, 0xFF, 0xFF)
+        # Some other pixel is non-zero red from the pulse (we don't
+        # care exactly which value - just that the pulse is active).
+        other = self._pixel(captured, 2)
+        assert other is not None and other[0] > 0

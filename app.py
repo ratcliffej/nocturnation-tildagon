@@ -614,6 +614,20 @@ class NocturNationApp(app.App):
         self._display = CtxDisplay()
         self._signal_tracker = SignalTracker()
         self._tofu = TofuLock()
+        # Epic 21: per-sender numonce replay guard for CONFIG_WRITE.
+        # Lazy-imported so native builds that don't exercise the config
+        # channel don't pay the import cost.
+        from .nocturnation.protocol.numonce_lru import NumonceLru
+        self._numonce_lru = NumonceLru()
+        # Pixel-0 white flash on successful CONFIG_WRITE apply.
+        # Timestamp of flash expiry (0 = inactive). Perimeter renderer
+        # checks this each tick and overlays a white pixel until the
+        # timestamp passes.
+        self._config_ack_flash_until_ms = 0
+        # Pairing-burst state (operator-triggered UID_ANNOUNCE flood).
+        # Non-zero expiry means an announce is active.
+        self._pair_burst_until_ms = 0
+        self._pair_burst_last_tx_ms = 0
         await asyncio.sleep_ms(0)
 
         # Deferred out of __init__ so the splash isn't blocked by the
@@ -986,7 +1000,8 @@ class NocturNationApp(app.App):
             "Debug: %s" % ("ON" if self._settings.debug_mode else "OFF"),
             "Repeat: %s" % self._settings.repeat,
             "Rescan",
-            "BLE Pair",   # Epic 20 B6
+            "BLE Pair",       # Epic 20 B6
+            "ESP-NOW Pair",   # Epic 21: UID_ANNOUNCE burst for ~10 s
             "Back",
         ]
 
@@ -1041,6 +1056,15 @@ class NocturNationApp(app.App):
             self._open_ble_pair()
             return
         elif idx == 6:
+            # Epic 21: ESP-NOW UID_ANNOUNCE burst. Operator-triggered
+            # pairing-replacement for Lumes without BLE silicon; also
+            # useful on the Tildagon when a nearby Director is in
+            # capture mode and the operator wants to add the badge
+            # to the register without reaching for a phone.
+            self._close_settings()
+            self._start_pair_burst()
+            return
+        elif idx == 7:
             self._close_settings()
             return
         # If save fails we keep the in-memory change so the UI is
@@ -1734,6 +1758,19 @@ class NocturNationApp(app.App):
                 self._wlan.config(pm=network.WLAN.PM_NONE)
             except Exception as exc:
                 print("[nocturnation] wlan.config(pm=PM_NONE) failed: %s" % exc)
+            # Epic 21: generate dev_uid + dev_secret on first boot now
+            # that the hardware RNG is seeded (wlan.active triggered the
+            # radio bring-up). Idempotent on subsequent boots.
+            try:
+                from .nocturnation.settings import ensure_identity
+                mac_bytes = self._wlan.config('mac')
+                if ensure_identity(self._settings, mac_bytes):
+                    print("[nocturnation] boot uid=%08X (first-boot identity generated)"
+                          % self._settings.dev_uid)
+                else:
+                    print("[nocturnation] boot uid=%08X" % self._settings.dev_uid)
+            except Exception as exc:
+                print("[nocturnation] ensure_identity failed: %s" % exc)
             if self._esp is None:
                 self._esp = espnow.ESPNow()
             # Default rxbuf ~526 B (~13 msg) is too small: high-rate
@@ -2325,6 +2362,9 @@ class NocturNationApp(app.App):
                     print("[BENCH-GAP] ticks=%d gap_ms=%d"
                           % (now_poll, gap))
                 last_poll_ms = now_poll
+            # Epic 21: fire the next UID_ANNOUNCE burst frame if the
+            # operator opened the pairing window. No-op outside it.
+            self._tick_pair_burst()
             # Drain up to N frames per iteration - a single-drain path
             # backs the rxbuf up under high-rate effects. Cap at 16 so a
             # broken sender can't starve the render/asyncio path.
@@ -2335,6 +2375,14 @@ class NocturNationApp(app.App):
                     break
                 frame = parse_admittable(buf)
                 now_ms = time.ticks_ms() if time is not None else 0
+                # Epic 21: CONFIG_WRITE / UID_ANNOUNCE / CONFIG_ACK sit
+                # outside TOFU + dedup - they're authenticated per-frame
+                # by HMAC and addressed by UID, not by source lock. Route
+                # before admit so a receive on a non-locked channel is
+                # still honoured (operator could be mid-reconfigure
+                # from a Director that isn't the show source).
+                if frame is not None and self._maybe_handle_epic21_frame(frame, buf):
+                    continue
                 admitted = (frame is not None
                             and self._tofu.admit(frame, self._receive_channel, now_ms))
                 self._dbg_frame("rx", buf, frame, admitted)
@@ -2483,6 +2531,141 @@ class NocturNationApp(app.App):
                 and age > FALLBACK_FADE_START_MS):
             self._fallback_faded = True
             self._emit_fallback_wash_fade(now_ms)
+
+    # ------------------------------------------------------------------
+    # Epic 21: authenticated config channel.
+    # ------------------------------------------------------------------
+
+    _PAIR_BURST_WINDOW_MS = 10000
+    _PAIR_BURST_PERIOD_MS = 500
+
+    def _start_pair_burst(self) -> None:
+        """Enter the ESP-NOW UID_ANNOUNCE burst window.
+
+        Transmits UID_ANNOUNCE every ~500 ms for ~10 seconds on the
+        currently-locked receive channel. The announce leaks the
+        16-byte secret in the clear; trust model is "operator intent
+        gated the window" so this is called ONLY from the Settings
+        menu, never automatically. _tick_pair_burst drives the
+        emission from the main receive loop.
+        """
+        if time is None:
+            print("[nocturnation] pair-burst: time module missing")
+            return
+        now_ms = time.ticks_ms()
+        self._pair_burst_until_ms   = now_ms + self._PAIR_BURST_WINDOW_MS
+        self._pair_burst_last_tx_ms = 0   # fire immediately on next tick
+        print("[nocturnation] pair-burst start uid=%08X (10 s)" % self._settings.dev_uid)
+
+    def _tick_pair_burst(self) -> None:
+        """Called from the receive loop. Transmits one UID_ANNOUNCE if
+        we're in the window and the inter-frame period has elapsed.
+        No-op outside the window.
+        """
+        if self._pair_burst_until_ms == 0 or time is None:
+            return
+        now_ms = time.ticks_ms()
+        if ticks_diff(now_ms, self._pair_burst_until_ms) >= 0:
+            print("[nocturnation] pair-burst end")
+            self._pair_burst_until_ms = 0
+            return
+        if (self._pair_burst_last_tx_ms != 0
+                and ticks_diff(now_ms, self._pair_burst_last_tx_ms)
+                    < self._PAIR_BURST_PERIOD_MS):
+            return
+        self._pair_burst_last_tx_ms = now_ms
+        # Build + broadcast one UID_ANNOUNCE. Lazy import so the
+        # encoder cost is paid only when the operator triggers.
+        try:
+            from .nocturnation.protocol.config_frames import (
+                Host, Role, UidAnnouncePayload, encode_uid_announce,
+            )
+            payload = UidAnnouncePayload(
+                uid=self._settings.dev_uid,
+                secret=self._settings.dev_secret_bytes(),
+                role=Role.LUME,
+                host=Host.TILDAGON,
+                friendly_name=self._settings.friendly_name or "",
+            )
+            buf = encode_uid_announce(
+                source_id=self._settings.dev_uid & 0xFFFF,
+                sequence_number=1,
+                hop_count=0,
+                payload=payload)
+            if self._esp is not None:
+                self._esp.send(_broadcast_mac_bytes, buf)
+        except Exception as exc:
+            print("[nocturnation] UID_ANNOUNCE emit failed: %s" % exc)
+
+    def _maybe_handle_epic21_frame(self, frame, raw_buf) -> bool:
+        """Handle CONFIG_WRITE / UID_ANNOUNCE / CONFIG_ACK frames.
+
+        Returns True iff the frame was consumed here (caller skips
+        TOFU + dedup + show dispatch). CONFIG_WRITE is the main case;
+        UID_ANNOUNCE on a Lume is only interesting if we grow a
+        "scan for peers" diagnostic (not shipped). CONFIG_ACK on a
+        Lume is a no-op (we don't send CONFIG_WRITE; we answer them).
+        """
+        if frame.message_type != MessageType.CONFIG_WRITE:
+            # UID_ANNOUNCE + CONFIG_ACK consumed-but-ignored so they
+            # don't trip the LIGHT_* dispatch gate upstream.
+            if frame.message_type in (MessageType.UID_ANNOUNCE,
+                                       MessageType.CONFIG_ACK):
+                return True
+            return False
+        # Lazy import so the symbol cost is paid only on the first
+        # CONFIG_WRITE arrival. config_rx + the ack/announce encoders
+        # pull in ~2 KB of code we don't need on a receive-only Lume.
+        from .nocturnation.config_rx import process_config_write
+        from .nocturnation.protocol.config_frames import (
+            ConfigAckPayload, encode_config_ack, AckStatus,
+        )
+        result = process_config_write(frame, raw_buf,
+                                       self._settings, self._numonce_lru)
+        if not result.ok:
+            # Silent drop. Diagnostic-only trace at debug level - the
+            # frame is unauthenticated-or-not-ours, don't emit anything
+            # over the wire.
+            if _DEBUG:
+                print("[nocturnation] CONFIG_WRITE drop: %s" % result.reason)
+            return True
+        # Persist the applied bag. apply_config_bag mutated the Settings
+        # in-memory; flush to disk so a reboot keeps the changes.
+        try:
+            self._settings.save()
+        except OSError as exc:
+            print("[nocturnation] settings save failed after CONFIG_WRITE: %s" % exc)
+        # Visible confirmation (independent of CONFIG_ACK which might
+        # not come back): short pixel-0 white flash. ~500 ms.
+        now_ms = time.ticks_ms() if time is not None else 0
+        self._config_ack_flash_until_ms = now_ms + 500
+        try:
+            self._renderer.set_ack_flash_until(self._config_ack_flash_until_ms)
+        except AttributeError:
+            pass   # defensive: older renderer without the hook
+        # Emit CONFIG_ACK best-effort. If send_broadcast fails, the
+        # Director's wait_for_ack path surfaces "no confirmation"
+        # (amber UX, not red) - operator checks the visible flash on
+        # the device itself for ground truth.
+        try:
+            ack_src = self._settings.dev_uid & 0xFFFF
+            # AckStatus::OK on apply - partial-apply surfacing can
+            # land in a follow-up once Settings._coerce_* grows the
+            # "some entries clamped" return value.
+            payload = ConfigAckPayload(
+                responder_uid=self._settings.dev_uid,
+                responder_numonce=result.numonce,
+                status=AckStatus.OK if result.status == 0 else AckStatus.APPLIED_PARTIAL,
+                applied_keys=result.applied_keys,
+            )
+            ack_buf = encode_config_ack(ack_src, 1, 0, payload)
+            if self._esp is not None:
+                self._esp.send(_broadcast_mac_bytes, ack_buf)
+        except Exception as exc:
+            print("[nocturnation] CONFIG_ACK send failed: %s" % exc)
+        print("[nocturnation] CONFIG_WRITE applied: %d keys, numonce=%d"
+              % (result.applied_keys, result.numonce))
+        return True
 
     def _observe_frame(self, frame, is_duplicate=False, raw_buf=None,
                        arrival_ms=None) -> None:
