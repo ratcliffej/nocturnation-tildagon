@@ -401,11 +401,16 @@ class BleService:
         # .written(). A full config bag is ~89 bytes. BufferedChar is
         # the aioble-provided subclass that calls gatts_set_buffer with
         # a larger size, so writes up to max_len land.
+        #
+        # DO NOT pass initial= here: BufferedCharacteristic's _register
+        # calls super()._register(handle) first (which gatts_writes the
+        # initial value to the then-default-20-byte buffer, truncating
+        # it) and only then calls gatts_set_buffer(max_len). The initial
+        # has to be written AFTER register_services so the buffer is
+        # already sized up - see the explicit .write() calls below.
         self._chr_config = aioble.BufferedCharacteristic(
             svc, UUID(CHAR_CONFIG), read=True, write=True,
-            write_no_response=True, capture=True, max_len=240,
-            initial=build_lume_config_bag(
-                self._settings, brightness_pct, chain_size, group_size))
+            write_no_response=True, capture=True, max_len=240)
         self._chr_status = aioble.Characteristic(
             svc, UUID(CHAR_STATUS), read=True,
             initial=build_status(0x11, 0x00, 0xFFFF, 0xFF, 0xFF))
@@ -415,12 +420,20 @@ class BleService:
             svc, UUID(CHAR_PAIRING_CONTROL), write=True,
             write_no_response=True, capture=True)
         # show_pt reserved for later LIGHT_* passthrough bursts; same
-        # BufferedCharacteristic max_len=240 story as config.
+        # BufferedCharacteristic max_len=240 story as config. Same
+        # defer-initial-write pattern.
         self._chr_show_pt = aioble.BufferedCharacteristic(
             svc, UUID(CHAR_SHOW_PASSTHROUGH), read=True, write=True,
-            write_no_response=True, capture=True, max_len=240,
-            initial=pb.encode([("reserved", pb.TYPE_U8, pb.u8(0x01))]))
+            write_no_response=True, capture=True, max_len=240)
         aioble.register_services(svc)
+        # Buffers are now sized to max_len (gatts_set_buffer fired in
+        # BufferedCharacteristic._register). Safe to write the initial
+        # values at full size - a central-side read will get the whole
+        # bag back, not a 20-byte truncation.
+        self._chr_config.write(build_lume_config_bag(
+            self._settings, brightness_pct, chain_size, group_size))
+        self._chr_show_pt.write(
+            pb.encode([("reserved", pb.TYPE_U8, pb.u8(0x01))]))
 
         adv_name = compose_advertising_name(
             self._bt_mac,
