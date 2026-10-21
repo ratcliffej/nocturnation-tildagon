@@ -393,19 +393,28 @@ class BleService:
         # picks either operation (NimBLE's writeValue has both; the
         # StickC's Config Lumes path uses write-with-response by
         # default) reaches .written() the same way.
+        # max_len = 240 — aioble's default is 20 (the pre-MTU-exchange
+        # ATT payload), which silently rejects a full ~89-byte config
+        # bag before it reaches .written(). Set to 240 to accept any
+        # reasonable property-bag payload.
         self._chr_config = aioble.Characteristic(
             svc, UUID(CHAR_CONFIG), read=True, write=True,
-            write_no_response=True, capture=True,
+            write_no_response=True, capture=True, max_len=240,
             initial=build_lume_config_bag(
                 self._settings, brightness_pct, chain_size, group_size))
         self._chr_status = aioble.Characteristic(
             svc, UUID(CHAR_STATUS), read=True,
             initial=build_status(0x11, 0x00, 0xFFFF, 0xFF, 0xFF))
+        # pair_ctrl is 1 byte so default max_len is OK; still allow
+        # write_no_response for central-side symmetry with config.
         self._chr_pair_ctrl = aioble.Characteristic(
-            svc, UUID(CHAR_PAIRING_CONTROL), write=True, capture=True)
+            svc, UUID(CHAR_PAIRING_CONTROL), write=True,
+            write_no_response=True, capture=True)
+        # show_pt reserved for later LIGHT_* passthrough bursts; bump
+        # max_len for the same reason as config.
         self._chr_show_pt = aioble.Characteristic(
             svc, UUID(CHAR_SHOW_PASSTHROUGH), read=True, write=True,
-            capture=True,
+            write_no_response=True, capture=True, max_len=240,
             initial=pb.encode([("reserved", pb.TYPE_U8, pb.u8(0x01))]))
         aioble.register_services(svc)
 
@@ -460,15 +469,22 @@ class BleService:
         connected."""
         import uasyncio as asyncio
         print("[ble] _service_client loop entered")
-        # MTU diagnostic: aioble defaults to 23 B. A full config bag is
-        # ~89 B; central-side long-write (Prepare+Execute) is required.
-        # Request a larger MTU so a one-shot write fits. Not every
-        # aioble build exposes exchange_mtu as callable - try, log, carry on.
+        # MTU diagnostic. aioble defaults to 23 B but NimBLE centrals
+        # (StickC) typically negotiate up to 247 on connect; our side
+        # then sees EALREADY if we try again, which is fine. Log the
+        # outcome either way for diagnostics.
         try:
             mtu = await connection.exchange_mtu(247)
-            print("[ble] negotiated MTU = %d" % mtu)
+            print("[ble] MTU exchanged = %d" % mtu)
         except AttributeError:
-            print("[ble] exchange_mtu unavailable; staying at default MTU")
+            print("[ble] exchange_mtu unavailable; defaults in use")
+        except OSError as mtu_exc:
+            # EALREADY (120) is the "central already did it" case -
+            # benign, just means NimBLE negotiated for us.
+            if getattr(mtu_exc, "args", (None,))[0] == 120:
+                print("[ble] MTU already negotiated by central (OK)")
+            else:
+                print("[ble] exchange_mtu failed: %s" % mtu_exc)
         except Exception as mtu_exc:
             print("[ble] exchange_mtu failed: %s" % mtu_exc)
         try:
