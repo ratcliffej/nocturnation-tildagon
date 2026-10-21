@@ -624,10 +624,6 @@ class NocturNationApp(app.App):
         # checks this each tick and overlays a white pixel until the
         # timestamp passes.
         self._config_ack_flash_until_ms = 0
-        # Pairing-burst state (operator-triggered UID_ANNOUNCE flood).
-        # Non-zero expiry means an announce is active.
-        self._pair_burst_until_ms = 0
-        self._pair_burst_last_tx_ms = 0
         await asyncio.sleep_ms(0)
 
         # Deferred out of __init__ so the splash isn't blocked by the
@@ -1000,8 +996,7 @@ class NocturNationApp(app.App):
             "Debug: %s" % ("ON" if self._settings.debug_mode else "OFF"),
             "Repeat: %s" % self._settings.repeat,
             "Rescan",
-            "BLE Pair",       # Epic 20 B6
-            "ESP-NOW Pair",   # Epic 21: UID_ANNOUNCE burst for ~10 s
+            "BLE Pair",   # Epic 20 B6
             "Back",
         ]
 
@@ -1056,15 +1051,6 @@ class NocturNationApp(app.App):
             self._open_ble_pair()
             return
         elif idx == 6:
-            # Epic 21: ESP-NOW UID_ANNOUNCE burst. Operator-triggered
-            # pairing-replacement for Lumes without BLE silicon; also
-            # useful on the Tildagon when a nearby Director is in
-            # capture mode and the operator wants to add the badge
-            # to the register without reaching for a phone.
-            self._close_settings()
-            self._start_pair_burst()
-            return
-        elif idx == 7:
             self._close_settings()
             return
         # If save fails we keep the in-memory change so the UI is
@@ -2362,9 +2348,6 @@ class NocturNationApp(app.App):
                     print("[BENCH-GAP] ticks=%d gap_ms=%d"
                           % (now_poll, gap))
                 last_poll_ms = now_poll
-            # Epic 21: fire the next UID_ANNOUNCE burst frame if the
-            # operator opened the pairing window. No-op outside it.
-            self._tick_pair_burst()
             # Drain up to N frames per iteration - a single-drain path
             # backs the rxbuf up under high-rate effects. Cap at 16 so a
             # broken sender can't starve the render/asyncio path.
@@ -2534,68 +2517,15 @@ class NocturNationApp(app.App):
 
     # ------------------------------------------------------------------
     # Epic 21: authenticated config channel.
+    #
+    # The Tildagon has BLE silicon, so initial pairing goes through
+    # the Epic 20 BLE path (Settings > BLE Pair). This module handles
+    # the receive side only: already-paired Directors push updates
+    # via CONFIG_WRITE and the Tildagon applies them without needing
+    # another BLE round-trip. UID_ANNOUNCE emit is reserved for
+    # future Tier-1 Lumes (ESP32-S2 class, no BLE silicon); see
+    # [[project-device-tier-model]].
     # ------------------------------------------------------------------
-
-    _PAIR_BURST_WINDOW_MS = 10000
-    _PAIR_BURST_PERIOD_MS = 500
-
-    def _start_pair_burst(self) -> None:
-        """Enter the ESP-NOW UID_ANNOUNCE burst window.
-
-        Transmits UID_ANNOUNCE every ~500 ms for ~10 seconds on the
-        currently-locked receive channel. The announce leaks the
-        16-byte secret in the clear; trust model is "operator intent
-        gated the window" so this is called ONLY from the Settings
-        menu, never automatically. _tick_pair_burst drives the
-        emission from the main receive loop.
-        """
-        if time is None:
-            print("[nocturnation] pair-burst: time module missing")
-            return
-        now_ms = time.ticks_ms()
-        self._pair_burst_until_ms   = now_ms + self._PAIR_BURST_WINDOW_MS
-        self._pair_burst_last_tx_ms = 0   # fire immediately on next tick
-        print("[nocturnation] pair-burst start uid=%08X (10 s)" % self._settings.dev_uid)
-
-    def _tick_pair_burst(self) -> None:
-        """Called from the receive loop. Transmits one UID_ANNOUNCE if
-        we're in the window and the inter-frame period has elapsed.
-        No-op outside the window.
-        """
-        if self._pair_burst_until_ms == 0 or time is None:
-            return
-        now_ms = time.ticks_ms()
-        if ticks_diff(now_ms, self._pair_burst_until_ms) >= 0:
-            print("[nocturnation] pair-burst end")
-            self._pair_burst_until_ms = 0
-            return
-        if (self._pair_burst_last_tx_ms != 0
-                and ticks_diff(now_ms, self._pair_burst_last_tx_ms)
-                    < self._PAIR_BURST_PERIOD_MS):
-            return
-        self._pair_burst_last_tx_ms = now_ms
-        # Build + broadcast one UID_ANNOUNCE. Lazy import so the
-        # encoder cost is paid only when the operator triggers.
-        try:
-            from .nocturnation.protocol.config_frames import (
-                Host, Role, UidAnnouncePayload, encode_uid_announce,
-            )
-            payload = UidAnnouncePayload(
-                uid=self._settings.dev_uid,
-                secret=self._settings.dev_secret_bytes(),
-                role=Role.LUME,
-                host=Host.TILDAGON,
-                friendly_name=self._settings.friendly_name or "",
-            )
-            buf = encode_uid_announce(
-                source_id=self._settings.dev_uid & 0xFFFF,
-                sequence_number=1,
-                hop_count=0,
-                payload=payload)
-            if self._esp is not None:
-                self._esp.send(_broadcast_mac_bytes, buf)
-        except Exception as exc:
-            print("[nocturnation] UID_ANNOUNCE emit failed: %s" % exc)
 
     def _maybe_handle_epic21_frame(self, frame, raw_buf) -> bool:
         """Handle CONFIG_WRITE / UID_ANNOUNCE / CONFIG_ACK frames.
