@@ -1047,6 +1047,7 @@ class NocturNationApp(app.App):
             # Epic 20 B6: enter BLE pairing screen. Closes the settings
             # menu (releases the badge SDK's menu grab), starts the BLE
             # service; update() drives the pairing state machine.
+            print("[nocturnation] Settings: BLE Pair selected")
             self._close_settings()
             self._open_ble_pair()
             return
@@ -1081,29 +1082,42 @@ class NocturNationApp(app.App):
         ESP-NOW-only. Sets _ble_pair_open so update() and draw() route
         to the pairing state machine and screen.
         """
+        print("[nocturnation] BLE pair: open requested")
         # Lazy import so a Tildagon that never opens pairing doesn't
         # cost aioble RAM.
         try:
             from .nocturnation.ble_service import BleService
+            print("[nocturnation] BLE pair: BleService imported")
         except Exception as exc:
-            print("[nocturnation] BLE unavailable: %s" % exc)
+            print("[nocturnation] BLE pair: import failed: %s" % exc)
             return
 
-        if self._ble_service is None:
-            self._ble_service = BleService()
+        try:
+            if self._ble_service is None:
+                self._ble_service = BleService()
+                print("[nocturnation] BLE pair: BleService constructed")
+        except Exception as exc:
+            print("[nocturnation] BLE pair: construct failed: %s" % exc)
+            return
 
         now_ms = time.ticks_ms() if time is not None else 0
+        print("[nocturnation] BLE pair: calling start()")
         # Perimeter runs at 100% currently (Epic 19) and the strip
         # topology is fixed 12 pixels for the perimeter; surface those
         # values as-is via the config bag.
-        started = self._ble_service.start(
-            self._settings,
-            brightness_pct=self._settings.led_power,
-            chain_size=self._settings.strip_chain,
-            group_size=self._settings.strip_group_size,
-            pair_win_s=self._settings.pair_win_s,
-            now_ms=now_ms,
-        )
+        try:
+            started = self._ble_service.start(
+                self._settings,
+                brightness_pct=self._settings.led_power,
+                chain_size=self._settings.strip_chain,
+                group_size=self._settings.strip_group_size,
+                pair_win_s=self._settings.pair_win_s,
+                now_ms=now_ms,
+            )
+            print("[nocturnation] BLE pair: start() returned %s" % started)
+        except Exception as exc:
+            print("[nocturnation] BLE pair: start() raised: %s" % exc)
+            started = False
         if not started:
             # Fall back to a brief "unavailable" screen; the countdown
             # loop will time out immediately.
@@ -1113,6 +1127,16 @@ class NocturNationApp(app.App):
             self._ble_pair_terminal = 0
             self._ble_pair_return_after_ms = 0
         self._ble_pair_open = True
+        # BLE Pair indicator: perimeter LEDs go solid blue so the
+        # operator has visual confirmation BLE is live even if serial
+        # isn't connected.
+        try:
+            self._renderer.set_pairing_indicator(True)
+            print("[nocturnation] BLE pair: pairing_indicator ON (blue)")
+        except AttributeError:
+            pass   # older renderer without the hook
+        except Exception as exc:
+            print("[nocturnation] BLE pair: indicator failed: %s" % exc)
 
     def _close_ble_pair(self) -> None:
         if self._ble_service is not None:
@@ -1123,6 +1147,13 @@ class NocturNationApp(app.App):
         self._ble_pair_open = False
         self._ble_pair_terminal = 0
         self._ble_pair_return_after_ms = 0
+        # Clear BLE Pair indicator.
+        try:
+            self._renderer.set_pairing_indicator(False)
+        except AttributeError:
+            pass
+        except Exception as exc:
+            print("[nocturnation] BLE pair: indicator clear failed: %s" % exc)
 
     def _tick_ble_pair(self, now_ms) -> None:
         """Called each update() while the pairing screen is open."""

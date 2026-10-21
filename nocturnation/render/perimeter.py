@@ -110,6 +110,7 @@ class PerimeterRenderer:
         "_wash",
         "_rng",
         "_ack_flash_until",   # Epic 21
+        "_pairing_indicator", # Epic 20 follow-up: solid blue in BLE Pair mode
     )
 
     def __init__(self, rng=None):
@@ -126,6 +127,11 @@ class PerimeterRenderer:
         # wash + pulse state so a confirmation is visible even during
         # an active show.
         self._ack_flash_until = 0
+        # BLE Pair indicator: all 12 pixels solid blue while True.
+        # Overrides wash + pulse + ACK flash so the operator sees a
+        # steady visual confirmation of pairing-mode independent of
+        # serial debug output.
+        self._pairing_indicator = False
         self._wash          = None
 
     # ------------------------------------------------------------------
@@ -412,8 +418,22 @@ class PerimeterRenderer:
             # landed" indication independent of CONFIG_ACK delivery.
             if i == LED_MIN_INDEX and now_ms < self._ack_flash_until:
                 r = g = b = 0xFF
+            # Epic 20 follow-up: BLE Pair indicator forces every pixel
+            # to blue regardless of wash/pulse state.
+            if self._pairing_indicator:
+                r, g, b = 0, 0, 0xFF
             self._last_rendered[i] = (r, g, b)
             set_led(i, r, g, b)
+
+    def set_pairing_indicator(self, active):
+        """Force every pixel to solid blue while `active` is True.
+
+        Caller sets this on BLE pair-screen entry and clears it on
+        exit, giving the operator a steady visual confirmation that
+        BLE pairing is live - useful on bench when serial isn't
+        connected.
+        """
+        self._pairing_indicator = bool(active)
 
     def set_ack_flash_until(self, until_ms):
         """Hold pixel 0 white until `until_ms`. 0 (or past) = inactive.
