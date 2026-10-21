@@ -691,6 +691,11 @@ class NocturNationApp(app.App):
         if self._ble_pair_open:
             now_ms = time.ticks_ms() if time is not None else 0
             self._tick_ble_pair(now_ms)
+            # Drive the perimeter so the pairing_indicator blue is
+            # actually written to the LEDs. Without this call, update()
+            # returns early and _render_perimeter never fires - the
+            # pixels stay whatever the last show-tick wrote.
+            self._render_perimeter()
             # Honour F (CANCEL) as an escape hatch — the badge SDK
             # routes button state through Buttons.get_pressed(); we
             # reuse the same idiom the rest of app.py uses.

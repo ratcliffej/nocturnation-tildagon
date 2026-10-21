@@ -180,6 +180,31 @@ class TestPairingStateMachine:
         svc = self._svc()
         assert svc.tick(30_000) == bs.STATE_ABORTED
 
+    def test_tick_pauses_countdown_while_client_connected(self):
+        """A connected client extends the pairing window indefinitely.
+        Without this, a slow pairing session (operator reading + writing
+        config over the GATT char) gets booted off mid-flow.
+        """
+        svc = self._svc()
+        svc._client_connected = True
+        # Well past the 30 s window; stays OPEN because client is live.
+        assert svc.tick(60_000) == bs.STATE_OPEN
+        assert svc.tick(120_000) == bs.STATE_OPEN
+
+    def test_tick_restarts_window_after_disconnect(self):
+        """When the client disconnects, the countdown restarts from the
+        current tick - giving a predictable "stay open N seconds after
+        the last client leaves" UX.
+        """
+        svc = self._svc()
+        svc._client_connected = True
+        svc.tick(60_000)         # pauses, resets start_ms to 60_000
+        svc._client_connected = False
+        # Not yet past the window from 60_000; still OPEN.
+        assert svc.tick(80_000) == bs.STATE_OPEN
+        # 90_000 - 60_000 = 30_000, hits the window.
+        assert svc.tick(90_000) == bs.STATE_ABORTED
+
     def test_commit_action_transitions_to_committed(self):
         svc = self._svc()
         svc.notify_pairing_control(0x01)

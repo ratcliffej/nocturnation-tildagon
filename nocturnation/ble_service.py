@@ -253,6 +253,13 @@ class BleService:
         self._window_ms = 30000
         self._bt_mac = b"\x00" * 6
         self._task = None
+        # True while a BLE client is connected. tick() pauses the
+        # pairing-window countdown while this is set, so a client that
+        # takes longer than 30 s to read + write config doesn't get
+        # kicked out mid-session. Flipped on in _serve() when a
+        # connection yields; flipped off when _service_client returns
+        # (disconnect, abort, or stop).
+        self._client_connected = False
 
     # ---------- Lifecycle ------------------------------------------------
 
@@ -273,9 +280,19 @@ class BleService:
     def tick(self, now_ms):
         """Called by app.py's update() loop; drives the auto-timeout to
         STATE_ABORTED. Returns the current state so the caller can
-        react without a second call."""
+        react without a second call.
+
+        While a client is connected, the countdown pauses - the window
+        is to protect against a Lume being left announcing with no one
+        there, not against a slow client. The countdown restarts if
+        the client disconnects (clears _client_connected).
+        """
         if self._active and self._state == STATE_OPEN:
-            if now_ms - self._start_ms >= self._window_ms:
+            if self._client_connected:
+                # Reset the start reference so the window re-begins
+                # when the client eventually disconnects.
+                self._start_ms = now_ms
+            elif now_ms - self._start_ms >= self._window_ms:
                 self._state = STATE_ABORTED
         return self._state
 
@@ -292,7 +309,26 @@ class BleService:
         self._window_ms = int(pair_win_s) * 1000
         self._start_ms = now_ms
         self._state = STATE_OPEN
+        self._client_connected = False
         try:
+            # Read the actual Bluetooth MAC so the advertising name is
+            # unique instead of the all-zero default. MicroPython ESP32
+            # exposes it via bluetooth.BLE().config('mac'); the call
+            # also implicitly activates the BLE radio which aioble will
+            # pick up when it starts advertising.
+            try:
+                _, bluetooth = _import_aioble()
+                ble = bluetooth.BLE()
+                ble.active(True)
+                mac = ble.config('mac')
+                # config('mac') returns (addr_type, mac_bytes).
+                if isinstance(mac, tuple) and len(mac) == 2:
+                    self._bt_mac = bytes(mac[1])
+                else:
+                    self._bt_mac = bytes(mac)
+                print("[ble] bt_mac=%s" % ":".join("%02X" % b for b in self._bt_mac))
+            except Exception as exc:
+                print("[ble] bt_mac read failed: %s" % exc)
             self._register_service(brightness_pct, chain_size, group_size)
             self._active = True
             return True
@@ -390,7 +426,16 @@ class BleService:
                     services=[self._service_uuid_bytes()],
                 ) as connection:
                     print("[ble] client connected: %s" % connection.device)
-                    await self._service_client(connection)
+                    # Pause the pairing-window countdown while a client
+                    # is connected (tick() watches this flag). Cleared
+                    # in the finally so an abrupt disconnect still
+                    # releases the window.
+                    self._client_connected = True
+                    try:
+                        await self._service_client(connection)
+                    finally:
+                        self._client_connected = False
+                        print("[ble] client disconnected")
         except Exception as exc:
             print("[ble] serve error: %s" % exc)
 
