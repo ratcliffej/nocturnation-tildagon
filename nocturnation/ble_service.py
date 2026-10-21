@@ -389,8 +389,13 @@ class BleService:
         self._chr_device_info = aioble.Characteristic(
             svc, UUID(CHAR_DEVICE_INFO), read=True,
             initial=build_device_info(self._bt_mac, 0))
+        # write + write_no_response both enabled so a central that
+        # picks either operation (NimBLE's writeValue has both; the
+        # StickC's Config Lumes path uses write-with-response by
+        # default) reaches .written() the same way.
         self._chr_config = aioble.Characteristic(
-            svc, UUID(CHAR_CONFIG), read=True, write=True, capture=True,
+            svc, UUID(CHAR_CONFIG), read=True, write=True,
+            write_no_response=True, capture=True,
             initial=build_lume_config_bag(
                 self._settings, brightness_pct, chain_size, group_size))
         self._chr_status = aioble.Characteristic(
@@ -455,6 +460,17 @@ class BleService:
         connected."""
         import uasyncio as asyncio
         print("[ble] _service_client loop entered")
+        # MTU diagnostic: aioble defaults to 23 B. A full config bag is
+        # ~89 B; central-side long-write (Prepare+Execute) is required.
+        # Request a larger MTU so a one-shot write fits. Not every
+        # aioble build exposes exchange_mtu as callable - try, log, carry on.
+        try:
+            mtu = await connection.exchange_mtu(247)
+            print("[ble] negotiated MTU = %d" % mtu)
+        except AttributeError:
+            print("[ble] exchange_mtu unavailable; staying at default MTU")
+        except Exception as mtu_exc:
+            print("[ble] exchange_mtu failed: %s" % mtu_exc)
         try:
             while self._active and self._state == STATE_OPEN:
                 # aioble's `capture=True` characteristics deliver writes
