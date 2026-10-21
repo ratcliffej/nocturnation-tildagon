@@ -73,6 +73,24 @@ class TestDeviceInfoLayout:
         # reserved 18..23
         assert bytes(out[18:24]) == b"\x00" * 6
 
+    def test_short_mac_is_left_zero_padded(self):
+        # Documents the manual-pad behaviour that replaced bytes.rjust()
+        # (MicroPython doesn't implement .rjust on bytes - see
+        # feedback-micropython-stdlib-gotchas memory). The pad goes on
+        # the left so the trailing bytes of the MAC land in the
+        # right-aligned slot.
+        out = bs.build_device_info(b"\xAA\xBB", 0)
+        assert bytes(out[8:14]) == b"\x00\x00\x00\x00\xAA\xBB"
+
+    def test_long_mac_is_truncated_from_the_right(self):
+        # 8-byte input - last two bytes dropped, first six written as-is.
+        out = bs.build_device_info(b"\x11\x22\x33\x44\x55\x66\x77\x88", 0)
+        assert bytes(out[8:14]) == b"\x11\x22\x33\x44\x55\x66"
+
+    def test_none_mac_renders_zeros(self):
+        out = bs.build_device_info(None, 0)
+        assert bytes(out[8:14]) == b"\x00" * 6
+
 
 class TestStatusLayout:
     def test_byte_layout(self):

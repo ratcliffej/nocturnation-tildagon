@@ -1129,14 +1129,18 @@ class NocturNationApp(app.App):
         self._ble_pair_open = True
         # BLE Pair indicator: perimeter LEDs go solid blue so the
         # operator has visual confirmation BLE is live even if serial
-        # isn't connected.
-        try:
-            self._renderer.set_pairing_indicator(True)
-            print("[nocturnation] BLE pair: pairing_indicator ON (blue)")
-        except AttributeError:
-            pass   # older renderer without the hook
-        except Exception as exc:
-            print("[nocturnation] BLE pair: indicator failed: %s" % exc)
+        # isn't connected. Only light up on actual success - a start()
+        # failure routes through the terminal-screen path and bounces
+        # back out in ~1.5 s; lighting the indicator there would be
+        # misleading.
+        if started:
+            try:
+                self._renderer.set_pairing_indicator(True)
+                print("[nocturnation] BLE pair: pairing_indicator ON (blue)")
+            except AttributeError:
+                pass   # older renderer without the hook
+            except Exception as exc:
+                print("[nocturnation] BLE pair: indicator failed: %s" % exc)
 
     def _close_ble_pair(self) -> None:
         if self._ble_service is not None:

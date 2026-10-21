@@ -99,7 +99,12 @@ def build_device_info(bt_mac, uptime_s):
     if bt_mac is None:
         bt_mac = b"\x00" * 6
     else:
-        bt_mac = bytes(bt_mac)[:6].rjust(6, b"\x00")
+        # MicroPython bytes has no .rjust() method (CPython does); pad
+        # manually so this works on both host tests and the badge.
+        # See [[feedback-micropython-stdlib-gotchas]].
+        bt_mac = bytes(bt_mac)[:6]
+        if len(bt_mac) < 6:
+            bt_mac = b"\x00" * (6 - len(bt_mac)) + bt_mac
     out = bytearray(24)
     out[0] = SERVICE_VERSION
     out[1] = ROLE_LUME
