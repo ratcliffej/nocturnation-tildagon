@@ -696,15 +696,17 @@ class NocturNationApp(app.App):
             # returns early and _render_perimeter never fires - the
             # pixels stay whatever the last show-tick wrote.
             self._render_perimeter()
-            # Honour F (CANCEL) as an escape hatch — the badge SDK
-            # routes button state through Buttons.get_pressed(); we
-            # reuse the same idiom the rest of app.py uses.
-            try:
-                from tildagon import Buttons
-                if Buttons.get_pressed(Buttons.BUTTON_TYPES["CANCEL"]):
-                    self._close_ble_pair()
-            except Exception:
-                pass
+            # Honour F (CANCEL) or CONFIRM (A) as an escape hatch so
+            # the operator can bail out of a stuck BLE-connected state
+            # without waiting for the 30 s window. Uses the same
+            # self.button_states idiom every other screen uses - the
+            # earlier Buttons.get_pressed() path never fired on this
+            # badge SDK version.
+            if (self.button_states.get(BUTTON_TYPES["CANCEL"])
+                    or self.button_states.get(BUTTON_TYPES["CONFIRM"])):
+                print("[nocturnation] BLE pair: cancel pressed by operator")
+                self.button_states.clear()
+                self._close_ble_pair()
             return
 
         if self._settings_open and self._settings_menu is not None:
