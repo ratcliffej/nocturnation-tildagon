@@ -92,6 +92,51 @@ class TestDeviceInfoLayout:
         assert bytes(out[8:14]) == b"\x00" * 6
 
 
+class TestBagSizeCeiling:
+    """build_lume_config_bag enforces a hard ceiling on the encoded
+    output so a future key addition that tips the bag past the GATT
+    single-write window fails loudly at service-register time instead
+    of silently dropping over the air.
+    """
+
+    def _settings(self, friendly_name=""):
+        class _S:
+            pass
+        s = _S()
+        s.group = 3
+        s.channel = "11"
+        s.pair_win_s = 30
+        s.friendly_name = friendly_name
+        return s
+
+    def test_normal_bag_well_under_ceiling(self):
+        # Typical bag with no friendly_name is ~75 B.
+        out = bs.build_lume_config_bag(self._settings(), 100, 12, 12)
+        assert 0 < len(out) < bs._MAX_CONFIG_BAG_LEN
+
+    def test_long_friendly_name_still_fits(self):
+        # Max-length friendly_name (20 chars) brings the bag to
+        # ~98 B. Well under the ceiling.
+        out = bs.build_lume_config_bag(self._settings("x" * 20), 100, 12, 12)
+        assert len(out) < bs._MAX_CONFIG_BAG_LEN
+
+    def test_oversized_bag_raises(self):
+        # Monkeypatch the encoder to produce an over-ceiling bag so
+        # we can verify the guard fires without having to synthesise
+        # 400+ bytes of real settings.
+        from nocturnation.protocol import property_bag_tlv as pb
+        real_encode = pb.encode
+        try:
+            pb.encode = lambda entries: b"X" * (bs._MAX_CONFIG_BAG_LEN + 1)
+            try:
+                bs.build_lume_config_bag(self._settings(), 100, 12, 12)
+                raise AssertionError("expected ValueError")
+            except ValueError as exc:
+                assert "exceeds" in str(exc) or "exceed" in str(exc)
+        finally:
+            pb.encode = real_encode
+
+
 class TestStatusLayout:
     def test_byte_layout(self):
         out = bs.build_status(0x11, 0x01, 0x004A, 80, 92)

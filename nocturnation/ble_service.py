@@ -137,6 +137,16 @@ def build_status(running_mode, lock_state, source_id, battery_pct, signal_pct):
     return bytes(out)
 
 
+
+# Hard ceiling on the encoded property-bag size. 512-byte MTU on the
+# central gives a 509-byte ATT payload window per single Write Request;
+# keep a 29-byte safety margin for ATT framing / future-proofing.
+# Anything bigger must NOT ride GATT writes - BLE L2CAP CoC is the
+# correct primitive for bulk transfer (images, firmware OTA, cue files)
+# and will land as a separate epic. See 2026-10-22 design note.
+_MAX_CONFIG_BAG_LEN = 480
+
+
 def build_lume_config_bag(settings, brightness_pct, chain_size, group_size):
     """Serialise the current Lume-role config into a property bag.
 
@@ -144,6 +154,12 @@ def build_lume_config_bag(settings, brightness_pct, chain_size, group_size):
     brightness_pct / chain_size / group_size come from the renderers
     since Settings itself doesn't own them - they're derived state we
     surface for the app.
+
+    Raises ValueError if the encoded bag exceeds _MAX_CONFIG_BAG_LEN,
+    which signals "a new key tipped us past what GATT can carry in
+    one Write Request". Fail loud: a silent long-write-drop is far
+    harder to diagnose than this exception showing up in the serial
+    log at service-register time.
     """
     entries = [
         (pb.KEY_GROUP,            pb.TYPE_U8,  pb.u8(settings.group)),
@@ -156,7 +172,13 @@ def build_lume_config_bag(settings, brightness_pct, chain_size, group_size):
     fn = getattr(settings, "friendly_name", "")
     if fn:
         entries.append((pb.KEY_FRIENDLY_NAME, pb.TYPE_UTF8, pb.utf8(fn)))
-    return pb.encode(entries)
+    encoded = pb.encode(entries)
+    if len(encoded) > _MAX_CONFIG_BAG_LEN:
+        raise ValueError(
+            "config bag %d bytes exceeds GATT single-write ceiling %d; "
+            "use L2CAP CoC for payloads this size"
+            % (len(encoded), _MAX_CONFIG_BAG_LEN))
+    return encoded
 
 
 def _channel_pref_to_u8(channel):
