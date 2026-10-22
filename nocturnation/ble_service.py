@@ -528,6 +528,19 @@ class BleService:
             print("[ble] exchange_mtu failed: %s" % mtu_exc)
         try:
             while self._active and self._state == STATE_OPEN:
+                # Disconnect check first - aioble's .written() with a
+                # timeout returns asyncio.TimeoutError (not raises
+                # DeviceDisconnectedError) when the connection is gone,
+                # so without this check the loop spins forever on a
+                # dead connection and _serve never gets back to
+                # advertise() for the StickC's re-connect for the write
+                # phase. Confirmed via bench on 2026-10-22: StickC
+                # Config Lumes does scan+connect+read, disconnect,
+                # scan+connect+write - the second scan found no NTN-Lume
+                # advertiser because _serve was stuck.
+                if not connection.is_connected():
+                    print("[ble] client dropped (detected via is_connected)")
+                    break
                 # aioble's `capture=True` characteristics deliver writes
                 # via .written(); poll both in a select-shaped loop.
                 try:
